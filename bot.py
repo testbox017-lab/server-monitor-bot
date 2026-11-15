@@ -26,6 +26,7 @@ import actions
 import backups
 import checks
 import history
+import network
 import probes
 import security
 import updater
@@ -60,7 +61,8 @@ def kb(*rows) -> InlineKeyboardMarkup:
 
 def status_kb() -> InlineKeyboardMarkup:
     return kb([Btn("🔄 Обновить", callback_data="status"), Btn("📈 График", callback_data="chart:24h")],
-              [Btn("🔝 Процессы", callback_data="procs:cpu:10"), Btn("⚙️ Службы", callback_data="services")])
+              [Btn("🔝 Процессы", callback_data="procs:cpu:10"), Btn("⚙️ Службы", callback_data="services")],
+              [Btn("🌐 Сеть и диск", callback_data="net")])
 
 
 def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
@@ -116,6 +118,8 @@ def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMar
         fix = act_btn("♻️ Перезапустить", f"act:svc:{checks.key_label(key)}")
     elif key and key.startswith("disk:"):
         fix = act_btn("🧹 Очистить место", "act:clean")
+    elif key and key.startswith("brute:"):
+        fix = act_btn(f"🚫 Заблокировать {key[6:]}", f"act:ban:{key[6:]}")
     ack = None
     if ackable and key:
         ack = [Btn("✔️ Принял", callback_data=f"ack:{short_id(key)}"),
@@ -375,6 +379,7 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
             [Btn(f"{onoff(CFG.get('port_alerts', True))} Новые открытые порты", callback_data="sec:port_alerts")],
             [Btn(f"{onoff(CFG.get('update_alerts', True))} Обновления безопасности", callback_data="sec:update_alerts")],
             [Btn(f"🧽 Забыть известные IP ({len(STATE.known_ips)})", callback_data="secforget")],
+            [b for b in [act_btn("🚫 Заблокированные IP", "act:banned")] if b],
             [BACK]]
     hb = CFG.get("heartbeat_url")
     hb_text = ("не настроен" if not hb else
@@ -933,6 +938,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await asyncio.to_thread(backups.watched_status, None, True)
                 note = "Обновлено" if sub == "refresh" else "Сохранено"
                 await edit(update, *backup_view())
+        elif cmd == "net":
+            text = await asyncio.to_thread(network.net_text, CFG, HIST, ACT._helper)
+            if len(parts) > 1:
+                await edit(update, text, net_kb())
+            else:
+                await send(update, text, net_kb())
         elif cmd == "up":
             sub = parts[1]
             if sub == "check":
@@ -1042,10 +1053,70 @@ async def handle_act(update: Update, parts: list[str]) -> None:
                            "журнал systemd сократится до 200 МБ, очистится кэш apt. Контейнеры и их данные "
                            f"не трогаются.\n\nСколько можно освободить:\n<pre>{html.escape(est)}</pre>",
                    confirm_kb(token))
+    elif sub == "ban":
+        await ask_ban(update, ":".join(parts[2:]))
+    elif sub == "unban":
+        ip = ":".join(parts[2:])
+        token = ACT.ask("unban", ip, chat_id)
+        await send(update, f"Снять блокировку с <b>{html.escape(ip)}</b>?", confirm_kb(token))
+    elif sub == "banned":
+        ok, out = await asyncio.to_thread(ACT._helper, "banned-list")
+        try:
+            ips = json.loads(out) if ok else None
+        except ValueError:
+            ips = None
+        if ips is None:
+            await send(update, f"Не удалось получить список: {html.escape(out)}")
+        elif not ips:
+            await send(update, "🚫 Бот пока никого не блокировал.\nЗаблокировать вручную: <code>/ban IP</code>")
+        else:
+            btns = [[b] for b in (act_btn(f"✅ Разблокировать {ip}", f"act:unban:{ip}") for ip in ips) if b]
+            await send(update, "🚫 <b>Заблокированные ботом IP</b>\n" + "\n".join(html.escape(i) for i in ips),
+                       InlineKeyboardMarkup(btns) if btns else None)
     elif sub == "reboot":
         token = ACT.ask("reboot", "", chat_id)
         await send(update, "🔄 <b>Перезагрузить сервер?</b>\nСервер и все контейнеры будут недоступны 1–2 минуты.",
                    confirm_kb(token, "Да, перезагрузить"))
+
+
+async def ask_ban(update: Update, ip: str) -> None:
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        await send(update, f"Это не IP-адрес: {html.escape(ip)}")
+        return
+    if a.is_private or a.is_loopback:
+        await send(update, "Локальные адреса не блокирую")
+        return
+    note = ""
+    if ip in STATE.known_ips:
+        note = "\n⚠️ С этого IP раньше был успешный вход по SSH. Если это вы, не блокируйте."
+    token = ACT.ask("ban", ip, update.effective_chat.id)
+    await send(update, f"🚫 Заблокировать все входящие соединения с <b>{html.escape(ip)}</b> (ufw)?{note}\n"
+                       "IP с открытой сейчас SSH-сессией помощник не заблокирует, чтобы не отрезать вас.",
+               confirm_kb(token))
+
+
+async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if not actions_on():
+        await send(update, "Действия выключены (actions_enabled: false в config.yaml)")
+        return
+    if not ctx.args:
+        await send(update, "Формат: /ban 203.0.113.5. Список заблокированных — «Настройки → 🛡 Безопасность».")
+        return
+    await ask_ban(update, ctx.args[0])
+
+
+async def cmd_net(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await send(update, await asyncio.to_thread(network.net_text, CFG, HIST, ACT._helper), net_kb())
+
+
+def net_kb() -> InlineKeyboardMarkup:
+    return kb([Btn("🔄 Обновить", callback_data="net:r"), Btn("📈 График", callback_data="chart:24h")])
 
 
 async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
@@ -1110,7 +1181,7 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return
     for a in alerts:
-        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
+        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
 
 
@@ -1155,7 +1226,7 @@ def reschedule(app: Application) -> None:
 
 
 COMMANDS = [("status", "📊 Состояние сервера"), ("procs", "🔝 Процессы по CPU"), ("mem", "💾 Процессы по памяти"),
-            ("services", "⚙️ Службы и контейнеры"), ("alerts", "🚨 Активные алерты"), ("chart", "📈 График за сутки"),
+            ("services", "⚙️ Службы и контейнеры"), ("net", "🌐 Сеть и диск"), ("alerts", "🚨 Активные алерты"), ("chart", "📈 График за сутки"),
             ("logs", "📜 Логи контейнера"), ("probe", "🌐 Сайты и порты"), ("backup", "🗄 Резервные копии"),
             ("actions", "🧰 Действия с сервером"), ("settings", "🛠 Настройки"), ("mute", "🔕 Выключить уведомления на 1 ч"),
             ("unmute", "🔔 Включить уведомления"), ("start", "👋 Клавиатура и помощь")]
@@ -1185,7 +1256,7 @@ def build_app() -> Application:
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
-                     ("probe", cmd_probe), ("backup", cmd_backup),
+                     ("probe", cmd_probe), ("backup", cmd_backup), ("net", cmd_net), ("ban", cmd_ban),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

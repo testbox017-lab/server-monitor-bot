@@ -22,7 +22,8 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
 DEFAULTS = {
     "check_interval_sec": 60,
     "notify_on_start": True,
-    "thresholds": {"cpu": 90, "ram": 90, "swap": 80, "disk": 85, "temp": 85, "duration_sec": 300},
+    "thresholds": {"cpu": 90, "ram": 90, "swap": 80, "disk": 85, "temp": 85, "inode": 90,
+                   "duration_sec": 300},
     "disks": [],
     "services": [],
     "processes": [],

@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import platform
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import psutil
 
@@ -215,12 +219,122 @@ def services_text(cfg: dict) -> str:
     return "\n".join(lines)
 
 
+def running_services() -> list[str]:
+    """Имена работающих служб systemd (для меню «Добавить»)."""
+    if IS_WINDOWS or not shutil.which("systemctl"):
+        return []
+    r = subprocess.run(["systemctl", "list-units", "--type=service", "--state=running",
+                        "--no-legend", "--plain", "--no-pager"], capture_output=True, text=True)
+    names = []
+    for line in r.stdout.splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if unit.endswith(".service") and "@" not in unit:
+            names.append(unit[:-len(".service")])
+    return sorted(names)
+
+
+def oom_kills() -> int | None:
+    """Счётчик убитых OOM killer процессов с момента загрузки (Linux, /proc/vmstat)."""
+    try:
+        for line in Path("/proc/vmstat").read_text().splitlines():
+            if line.startswith("oom_kill "):
+                return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+def reboot_required() -> bool:
+    return Path("/var/run/reboot-required").exists()
+
+
+# ---------- Время ----------
+
+def tz(cfg: dict) -> ZoneInfo:
+    try:
+        return ZoneInfo(cfg.get("tz") or "Europe/Kyiv")
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _hm(s: str) -> dtime:
+    h, m = s.split(":")
+    return dtime(int(h), int(m))
+
+
+def in_quiet_hours(cfg: dict, now: float) -> bool:
+    q = cfg.get("quiet_hours")
+    if not q:
+        return False
+    t = datetime.fromtimestamp(now, tz(cfg)).time()
+    start, end = _hm(q["start"]), _hm(q["end"])
+    return start <= t < end if start < end else (t >= start or t < end)
+
+
+def next_morning(cfg: dict, now: float) -> float:
+    """Ближайший конец тихих часов (или 08:00, если они не заданы)."""
+    q = cfg.get("quiet_hours") or {"end": "08:00"}
+    local = datetime.fromtimestamp(now, tz(cfg))
+    target = local.replace(hour=_hm(q["end"]).hour, minute=_hm(q["end"]).minute, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
+def fmt_local(cfg: dict, ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz(cfg)).strftime("%H:%M")
+
+
 # ---------- Алерты ----------
+
+CRITICAL_PREFIXES = ("svc:", "proc:", "ctr:")
+
+
+def is_critical(key: str) -> bool:
+    """Критичные алерты приходят и в тихие часы."""
+    return key.startswith(CRITICAL_PREFIXES)
+
 
 @dataclass
 class AlertState:
-    since: dict[str, float] = field(default_factory=dict)   # когда условие впервые стало плохим
-    active: set[str] = field(default_factory=set)            # по каким ключам уже отправили алерт
+    since: dict[str, float] = field(default_factory=dict)      # когда условие впервые стало плохим
+    active: list[str] = field(default_factory=list)            # по каким ключам отправлен алерт
+    last_sent: dict[str, float] = field(default_factory=dict)  # когда последний раз писали по ключу
+    problems: dict[str, str] = field(default_factory=dict)     # текст проблемы по активному ключу
+    mute_until: float = 0.0
+    boot_time: float = 0.0
+    oom_kills: int | None = None
+    log: list[list] = field(default_factory=list)              # [ts, key] отправленных алертов, 48 ч
+
+    path: Path | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def load(cls, path: Path) -> "AlertState":
+        st = cls()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for k, v in data.items():
+                if k in cls.__dataclass_fields__ and k != "path":
+                    setattr(st, k, v)
+        except (OSError, ValueError):
+            pass
+        st.path = path
+        return st
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        data = {k: v for k, v in asdict(self).items() if k != "path"}
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def muted(self, now: float) -> bool:
+        return now < self.mute_until
+
+
+def key_label(key: str) -> str:
+    return key.split(":", 1)[-1]
 
 
 def evaluate(cfg: dict) -> dict[str, str | None]:
@@ -254,29 +368,109 @@ def evaluate(cfg: dict) -> dict[str, str | None]:
         for c in cfg["containers"]:
             st = container_state(c, states)
             res[f"ctr:{c}"] = None if st == "running" else f"❌ Контейнер {c} не работает ({st})"
+    res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None
     return res
 
 
 def instant_keys(key: str) -> bool:
     """Падение службы/процесса/контейнера сообщаем сразу, ресурсы только после duration."""
-    return key.startswith(("svc:", "proc:", "ctr:"))
+    return key.startswith(CRITICAL_PREFIXES) or key == "reboot_required"
 
 
-def step(cfg: dict, state: AlertState, now: float | None = None) -> list[str]:
-    """Одна итерация проверки. Возвращает сообщения для отправки."""
+@dataclass
+class Alert:
+    text: str
+    key: str | None = None   # ключ проблемы, для кнопок под сообщением
+    kind: str = "alert"      # alert / remind / recovered / event
+
+
+def step(cfg: dict, state: AlertState, now: float | None = None,
+         results: dict[str, str | None] | None = None) -> list[Alert]:
+    """Одна итерация проверки. Возвращает сообщения для отправки и сохраняет состояние."""
     now = now or time.time()
-    duration = cfg.get("thresholds", {}).get("duration_sec", 300)
-    messages = []
-    for key, problem in evaluate(cfg).items():
+    th = cfg.get("thresholds", {})
+    duration = th.get("duration_sec", 300)
+    remind = (cfg.get("remind_min") or 0) * 60
+    muted = state.muted(now)
+    quiet = in_quiet_hours(cfg, now)
+    out: list[Alert] = []
+    results = evaluate(cfg) if results is None else results
+
+    for key, problem in results.items():
         if problem:
             state.since.setdefault(key, now)
-            long_enough = instant_keys(key) or now - state.since[key] >= duration
-            if long_enough and key not in state.active:
-                state.active.add(key)
-                messages.append(f"🚨 {problem}")
+            if not (instant_keys(key) or now - state.since[key] >= duration):
+                continue
+            suppressed = muted or (quiet and not is_critical(key))
+            if suppressed:
+                continue  # отправим, когда тишина закончится, если проблема ещё есть
+            if key not in state.active:
+                state.active.append(key)
+                state.last_sent[key] = now
+                state.problems[key] = problem
+                state.log.append([now, key])
+                out.append(Alert(f"🚨 {problem}", key, "alert"))
+            elif remind and now - state.last_sent.get(key, now) >= remind:
+                state.last_sent[key] = now
+                state.problems[key] = problem
+                mins = int((now - state.since[key]) // 60)
+                out.append(Alert(f"⏰ Всё ещё не решено ({mins} мин): {problem}", key, "remind"))
         else:
             state.since.pop(key, None)
             if key in state.active:
-                state.active.discard(key)
-                messages.append(f"✅ Восстановлено: {key.split(':', 1)[-1]}")
-    return messages
+                state.active.remove(key)
+                state.last_sent.pop(key, None)
+                state.problems.pop(key, None)
+                if not muted:
+                    out.append(Alert(f"✅ Восстановлено: {key_label(key)}", key, "recovered"))
+
+    # Ключи, которых больше нет в проверке (убрали из настроек) — забываем молча
+    for key in list(state.active):
+        if key not in results:
+            state.active.remove(key)
+            state.problems.pop(key, None)
+            state.last_sent.pop(key, None)
+    for key in list(state.since):
+        if key not in results:
+            state.since.pop(key)
+
+    # OOM killer — событие, не состояние
+    n = oom_kills()
+    if n is not None:
+        if state.oom_kills is not None and n > state.oom_kills and not muted:
+            out.append(Alert(f"💥 OOM killer убил процесс(ы): {n - state.oom_kills}. "
+                             "Не хватило памяти (swap на сервере нет).", None, "event"))
+            state.log.append([now, "oom"])
+        state.oom_kills = n
+
+    state.log = [x for x in state.log if now - x[0] < 48 * 3600]
+    state.save()
+    return out
+
+
+def check_reboot(state: AlertState) -> str | None:
+    """Вызывается при старте бота: сообщение, если сервер перезагружался с прошлого запуска."""
+    boot = psutil.boot_time()
+    msg = None
+    if state.boot_time and abs(boot - state.boot_time) > 60:
+        msg = f"🔄 Сервер перезагружался, аптайм {fmt_duration(time.time() - boot)}"
+        state.oom_kills = None  # счётчик обнулился вместе с ядром
+    state.boot_time = boot
+    state.save()
+    return msg
+
+
+def summary_text(cfg: dict, state: AlertState, now: float | None = None) -> str:
+    now = now or time.time()
+    day = [x for x in state.log if now - x[0] < 24 * 3600]
+    lines = ["📋 <b>Сводка за сутки</b>", status_text(cfg), "",
+             f"Алертов за 24 ч: {len(day)}"]
+    if day:
+        counts: dict[str, int] = {}
+        for _, k in day:
+            counts[k] = counts.get(k, 0) + 1
+        for k, c in sorted(counts.items(), key=lambda x: -x[1])[:8]:
+            lines.append(f"  • {html.escape(key_label(k))}: {c}")
+    if state.active:
+        lines.append("Сейчас активны: " + ", ".join(html.escape(key_label(k)) for k in state.active))
+    return "\n".join(lines)

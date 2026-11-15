@@ -1790,5 +1790,99 @@ class WeeklyButtonsTest(unittest.TestCase):
         b.S.reset()
 
 
+class AutobanTest(unittest.TestCase):
+    """Этап 14: автобан при подборе пароля."""
+
+    def state(self, *fails):
+        st = checks.AlertState()
+        st.ssh_failed = [[T0 - 60, ip, n] for ip, n in fails]
+        return st
+
+    def test_candidates(self):
+        import security
+        cfg = {"autoban": True, "autoban_threshold": 10, "autoban_whitelist": ["45.155.205.9"]}
+        st = self.state(("185.220.101.5", 7), ("185.220.101.5", 5), ("91.240.118.7", 3),
+                        ("80.94.95.3", 50), ("45.155.205.9", 40), ("10.0.0.5", 99))
+        st.known_ips = ["80.94.95.3"]                       # с него уже входили — не трогаем
+        self.assertEqual(security.autoban_candidates(cfg, st, T0), [("185.220.101.5", 12)])
+        st.ssh_failed.append([T0 - 900, "93.184.216.34", 100])  # старше 10 минут
+        self.assertEqual(len(security.autoban_candidates(cfg, st, T0)), 1)
+        st.autoban_skip = {"185.220.101.5": T0 - 60}         # помощник недавно отказал
+        self.assertEqual(security.autoban_candidates(cfg, st, T0), [])
+        st.autoban_skip = {}
+        st.autobans = {"185.220.101.5": T0 + 100}            # уже заблокирован
+        self.assertEqual(security.autoban_candidates(cfg, st, T0), [])
+        st.autobans = {}
+        self.assertEqual(security.autoban_candidates(dict(cfg, autoban=False), st, T0), [])
+        st.autobans = {"1.1.1.1": T0 - 1, "2.2.2.2": 0, "3.3.3.3": T0 + 10}
+        self.assertEqual(security.expired_autobans(st, T0), ["1.1.1.1"])
+        self.assertEqual(security.ban_duration_text(0), "навсегда")
+        self.assertEqual(security.ban_duration_text(24), "на 24 ч")
+        self.assertEqual(security.ban_duration_text(168), "на 7 дн.")
+
+
+class AutobanBotTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def setUp(self):
+        b = self.bot
+        b.S.reset()
+        self.saved = (b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip)
+        b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip = [], [], {}, {}
+
+    def tearDown(self):
+        b = self.bot
+        b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip = self.saved
+        b.S.reset()
+
+    def test_step(self):
+        b = self.bot
+        now = time.time()
+        b.STATE.ssh_failed = [[now - 30, "185.220.101.5", 15], [now - 30, "91.240.118.7", 12],
+                              [now - 30, "80.94.95.3", 11]]
+        b.STATE.autobans = {"45.155.205.9": now - 5}
+
+        def helper(cmd, ip, timeout=0):
+            return {"185.220.101.5": (True, "banned 185.220.101.5"),
+                    "91.240.118.7": (True, "already banned 91.240.118.7"),
+                    "80.94.95.3": (False, "refused: this IP has an open SSH session"),
+                    "45.155.205.9": (True, "unbanned 45.155.205.9")}[ip]
+        with mock.patch.object(b.ACT, "_helper", side_effect=helper) as hp:
+            banned, lifted = b.autoban_step(now)
+        self.assertEqual(banned, [("185.220.101.5", 15)])
+        self.assertEqual(lifted, ["45.155.205.9"])
+        self.assertAlmostEqual(b.STATE.autobans["185.220.101.5"], now + 24 * 3600)
+        self.assertNotIn("91.240.118.7", b.STATE.autobans)      # ручной бан остаётся постоянным
+        self.assertIn("80.94.95.3", b.STATE.autoban_skip)
+        self.assertEqual([c.args[0] for c in hp.call_args_list].count("ban-ip"), 3)
+        with mock.patch.object(b.ACT, "_helper", side_effect=helper) as hp:
+            self.assertEqual(b.autoban_step(now + 60), ([], []))  # повторно не трогаем
+        hp.assert_not_called()
+
+    def test_forever_and_buttons(self):
+        b = self.bot
+        now = time.time()
+        b.S.set("autoban_hours", 0)
+        b.STATE.ssh_failed = [[now - 30, "185.220.101.5", 15]]
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, "banned")):
+            b.autoban_step(now)
+        self.assertEqual(b.STATE.autobans["185.220.101.5"], 0)
+        text, markup = b.security_view()
+        self.assertIn("навсегда", text)
+        cbs = [x.callback_data for row in markup.inline_keyboard for x in row]
+        for c in ("sec:autoban", "abthr:5", "abh:168", "abh:0"):
+            self.assertIn(c, cbs)
+        press = BotButtonsTest.press.__get__(self)
+        press("abthr:20")
+        self.assertEqual(b.CFG["autoban_threshold"], 20)
+        press("sec:autoban")
+        self.assertFalse(b.CFG["autoban"])
+        self.assertIn("Автобан: выкл", b.security_view()[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start",
             "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
             "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
+            "autoban", "autoban_threshold", "autoban_hours", "autoban_whitelist",
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
             "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
@@ -44,6 +45,10 @@ DEFAULTS = {
     "ssh_fail_threshold": 30,       # неудачных попыток за 10 мин для алерта (0 = выкл)
     "port_alerts": True,            # новый открытый наружу порт
     "update_alerts": True,          # обновления безопасности Ubuntu
+    "autoban": True,                # сам блокировать IP, который подбирает пароль SSH
+    "autoban_threshold": 10,        # неудачных попыток с одного IP за 10 мин
+    "autoban_hours": 24,            # на сколько (0 = навсегда)
+    "autoban_whitelist": [],        # эти IP не блокировать никогда (и IP, с которых уже входили)
     # Умные алерты
     "anomaly_alerts": True,         # «необычно для этого часа» по истории за 14 дней
     "ram_trend_alerts": True,       # память стабильно растёт и скоро закончится

@@ -383,9 +383,15 @@ def docker_view() -> tuple[str, InlineKeyboardMarkup]:
 
 def security_view() -> tuple[str, InlineKeyboardMarkup]:
     thr = CFG.get("ssh_fail_threshold", 30)
+    ab_thr = int(CFG.get("autoban_threshold") or 10)
+    ab_h = int(CFG.get("autoban_hours") if CFG.get("autoban_hours") is not None else 24)
     rows = [[Btn(f"{onoff(CFG.get('ssh_alerts', True))} Входы по SSH и подбор пароля", callback_data="sec:ssh_alerts")],
             [Btn(f"{onoff(CFG.get('ssh_alert_all_logins'))} Сообщать о каждом входе", callback_data="sec:ssh_alert_all_logins")],
             [Btn(("• " if thr == n else "") + f"≥{n} попыток", callback_data=f"secthr:{n}") for n in (30, 100, 300)],
+            [Btn(f"{onoff(CFG.get('autoban', True))} Автобан при подборе пароля", callback_data="sec:autoban")],
+            [Btn(("• " if ab_thr == n else "") + f"≥{n} с IP", callback_data=f"abthr:{n}") for n in (5, 10, 20)],
+            [Btn(("• " if ab_h == h else "") + security.ban_duration_text(h).removeprefix("на "),
+                 callback_data=f"abh:{h}") for h in (1, 24, 168, 0)],
             [Btn(f"{onoff(CFG.get('port_alerts', True))} Новые открытые порты", callback_data="sec:port_alerts")],
             [Btn(f"{onoff(CFG.get('update_alerts', True))} Обновления безопасности", callback_data="sec:update_alerts")],
             [Btn(f"🧽 Забыть известные IP ({len(STATE.known_ips)})", callback_data="secforget")],
@@ -398,7 +404,10 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
             f"Известные IP для входа по SSH: {html.escape(', '.join(STATE.known_ips) or 'пока нет')}\n"
             f"Открытые наружу порты: {html.escape(', '.join(STATE.known_ports) or 'ещё не проверены')}\n"
             f"Внешний контроль (heartbeat_url в config.yaml): {hb_text}\n"
-            "Подбор пароля: алерт, если неудачных попыток за 10 минут больше порога, не чаще раза в час.")
+            "Подбор пароля: алерт, если неудачных попыток за 10 минут больше порога, не чаще раза в час.\n"
+            + (f"Автобан: IP с {ab_thr} и больше неудачными попытками за 10 минут блокируется "
+               f"{security.ban_duration_text(ab_h)}. IP, с которых уже входили по SSH, и открытые сейчас "
+               "SSH-сессии не блокируются никогда." if CFG.get("autoban", True) else "Автобан: выкл"))
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -912,6 +921,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             default = key != "ssh_alert_all_logins"
             S.set(key, not CFG.get(key, default))
             await edit(update, *security_view())
+        elif cmd == "abthr":
+            S.set("autoban_threshold", int(parts[1]))
+            await edit(update, *security_view())
+        elif cmd == "abh":
+            S.set("autoban_hours", int(parts[1]))
+            await edit(update, *security_view())
         elif cmd == "secthr":
             S.set("ssh_fail_threshold", int(parts[1]))
             await edit(update, *security_view())
@@ -1062,7 +1077,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reschedule(ctx.application)
                 note = "Сохранено"
                 await edit(update, *summary_view())
-        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "sm", "bk") and note is None:
+        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "abthr", "abh", "sm", "bk") and note is None:
             note = "Сохранено"
     except Exception:
         log.exception("Ошибка кнопки %s", data)
@@ -1137,8 +1152,14 @@ async def handle_act(update: Update, parts: list[str]) -> None:
         elif not ips:
             await send(update, "🚫 Бот пока никого не блокировал.\nЗаблокировать вручную: <code>/ban IP</code>")
         else:
-            btns = [[b] for b in (act_btn(f"✅ Разблокировать {ip}", f"act:unban:{ip}") for ip in ips) if b]
-            await send(update, "🚫 <b>Заблокированные ботом IP</b>\n" + "\n".join(html.escape(i) for i in ips),
+            def note(ip: str) -> str:
+                if ip not in STATE.autobans:
+                    return ""
+                until = STATE.autobans[ip]
+                return " (автобан навсегда)" if not until else f" (автобан до {local_dt(until)})"
+            btns = [[b] for b in (act_btn(f"✅ Разблокировать {ip}", f"act:unban:{ip}") for ip in ips[:20]) if b]
+            await send(update, f"🚫 <b>Заблокированные ботом IP ({len(ips)})</b>\n"
+                       + "\n".join(html.escape(i + note(i)) for i in ips[:50]),
                        InlineKeyboardMarkup(btns) if btns else None)
     elif sub == "reboot":
         token = ACT.ask("reboot", "", chat_id)
@@ -1241,6 +1262,10 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
             STATE.heartbeat_ok = ok
     try:
+        await run_autoban(ctx.bot)
+    except Exception:
+        log.exception("Ошибка автобана")
+    try:
         await report_update(ctx.bot)
     except Exception:
         log.exception("Не удалось сообщить результат обновления")
@@ -1250,6 +1275,58 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for a in alerts:
         markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
+
+
+def ban_log(ip: str, kind: str, ok: bool, out: str) -> None:
+    ACT.log(actions.Pending(kind, ip), ok, out)
+
+
+def autoban_step(now: float) -> tuple[list[tuple[str, int]], list[str]]:
+    """Снять истёкшие автобаны и заблокировать новых подборщиков. ([(ip, попыток)], [снятые ip])."""
+    lifted = []
+    if not actions_on():
+        return [], lifted
+    for ip in security.expired_autobans(STATE, now):
+        ok, out = ACT._helper("unban-ip", ip, timeout=30)
+        ban_log(ip, "unban", ok, "автобан истёк: " + out)
+        STATE.autobans.pop(ip, None)
+        if ok:
+            lifted.append(ip)
+    banned = []
+    hours = CFG.get("autoban_hours")
+    hours = 24 if hours is None else int(hours)
+    for ip, n in security.autoban_candidates(CFG, STATE, now):
+        ok, out = ACT._helper("ban-ip", ip, timeout=30)
+        ban_log(ip, "ban", ok, f"автобан ({n} попыток): {out}")
+        if ok and not out.startswith("already banned"):  # ручной бан не превращаем во временный
+            STATE.autobans[ip] = now + hours * 3600 if hours else 0
+            banned.append((ip, n))
+        else:  # уже заблокирован вручную или помощник отказал — час не трогаем
+            STATE.autoban_skip[ip] = now
+            if not ok:
+                log.warning("Автобан %s не удался: %s", ip, out)
+    STATE.autoban_skip = {ip: ts for ip, ts in STATE.autoban_skip.items() if now - ts < security.AUTOBAN_RETRY}
+    if banned or lifted:
+        STATE.save()
+    return banned, lifted
+
+
+async def run_autoban(bot) -> None:
+    now = time.time()
+    banned, _ = await asyncio.to_thread(autoban_step, now)
+    if not banned:
+        return
+    hours = CFG.get("autoban_hours")
+    dur = security.ban_duration_text(24 if hours is None else int(hours))
+    text = "🚫 Автобан " + dur + ": " + ", ".join(f"{ip} ({n} попыток за 10 мин)" for ip, n in banned)
+    try:
+        await asyncio.to_thread(INC.event, "autoban", text, now)
+    except Exception:
+        log.exception("Журнал инцидентов: автобан")
+    if STATE.muted(now) or checks.in_quiet_hours(CFG, now):
+        return  # не критично: видно в журнале, в «Заблокированных IP» и в недельном отчёте
+    btns = [[b] for b in (act_btn(f"✅ Разблокировать {ip}", f"act:unban:{ip}") for ip, _ in banned[:5]) if b]
+    await broadcast(bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(text)}", InlineKeyboardMarkup(btns) if btns else None)
 
 
 async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:

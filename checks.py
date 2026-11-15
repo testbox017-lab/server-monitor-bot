@@ -112,6 +112,11 @@ def status_text(cfg: dict) -> str:
     for name, t in list(s["temps"].items())[:4]:
         lines.append(f"🌡 {name}: {t:.0f}°C")
     lines.append(f"🌐 Сеть: ↓ {fmt_bytes(s['net'].bytes_recv)} ↑ {fmt_bytes(s['net'].bytes_sent)}")
+    stats = container_stats()
+    if stats:
+        lines.append("🐳 Контейнеры:")
+        for name, cpu, mem in stats:
+            lines.append(f"  • {html.escape(name)}: CPU {html.escape(cpu)}, RAM {html.escape(mem)}")
     return "\n".join(lines)
 
 
@@ -198,7 +203,78 @@ def container_state(name: str, states: dict[str, str] | None) -> str:
     return states.get(name, "not found")
 
 
-def services_text(cfg: dict) -> str:
+def docker(*args: str, timeout: int = 15) -> subprocess.CompletedProcess | None:
+    if not shutil.which("docker"):
+        return None
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout,
+                              encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def container_info(names: list[str]) -> dict[str, dict]:
+    """{имя: {"restarts": int, "started": str, "health": str}} через docker inspect."""
+    if not names:
+        return {}
+    fmt = "{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+    r = docker("inspect", "--format", fmt, *names)
+    out: dict[str, dict] = {}
+    if r is None:
+        return out
+    for line in r.stdout.splitlines():  # для несуществующих имён docker пишет ошибку в stderr, остальные выводит
+        parts = line.split("\t")
+        if len(parts) == 4:
+            try:
+                restarts = int(parts[1])
+            except ValueError:
+                restarts = 0
+            out[parts[0].lstrip("/")] = {"restarts": restarts, "started": parts[2], "health": parts[3]}
+    return out
+
+
+def container_stats() -> list[tuple[str, str, str]]:
+    """[(имя, CPU%, память)] для работающих контейнеров."""
+    r = docker("stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", timeout=20)
+    if r is None or r.returncode != 0:
+        return []
+    rows = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            rows.append((parts[0], parts[1], parts[2].split(" / ")[0]))
+    return sorted(rows)
+
+
+def container_logs(name: str, tail: int = 30, since: int | None = None) -> str | None:
+    args = ["logs", "--tail", str(tail)] if since is None else ["logs", "--since", str(since)]
+    r = docker(*args, name, timeout=20)
+    if r is None or r.returncode != 0:
+        return None
+    return (r.stdout or "") + (r.stderr or "")  # docker отдаёт stderr контейнера в stderr
+
+
+def logs_text(name: str, tail: int = 30) -> str:
+    logs = container_logs(name, tail)
+    if logs is None:
+        return f"📜 Не удалось получить логи {html.escape(name)} (нет контейнера или доступа к docker)"
+    logs = logs.strip() or "(пусто)"
+    if len(logs) > 3500:
+        logs = "…" + logs[-3500:]
+    return f"📜 <b>{html.escape(name)}</b>, последние {tail} строк\n<pre>{html.escape(logs)}</pre>"
+
+
+def watched_containers(cfg: dict, state: "AlertState | None" = None) -> list[str]:
+    """Контейнеры из настроек плюс (в авто-режиме) все, которые бот когда-либо видел работающими."""
+    names = list(cfg.get("containers") or [])
+    if cfg.get("containers_auto") and state is not None:
+        for n in state.seen_containers:
+            if n not in names:
+                names.append(n)
+    return names
+
+
+def services_text(cfg: dict, state: "AlertState | None" = None) -> str:
     lines = ["⚙️ <b>Службы и процессы</b>"]
     for svc in cfg.get("services", []) or []:
         st = service_state(svc)
@@ -208,12 +284,21 @@ def services_text(cfg: dict) -> str:
         n = process_running(proc)
         icon = "✅" if n else "❌"
         lines.append(f"{icon} процесс {html.escape(proc)}: {'запущен (' + str(n) + ')' if n else 'не найден'}")
-    if cfg.get("containers"):
+    containers = watched_containers(cfg, state)
+    if containers:
         states = container_states()
-        for c in cfg["containers"]:
+        info = container_info(containers)
+        for c in containers:
             st = container_state(c, states)
-            icon = "✅" if st == "running" else "❌"
-            lines.append(f"{icon} контейнер {html.escape(c)}: {html.escape(st)}")
+            i = info.get(c, {})
+            extra = []
+            if i.get("health"):
+                extra.append(i["health"])
+            if i.get("restarts"):
+                extra.append(f"перезапусков: {i['restarts']}")
+            ok = st == "running" and i.get("health") != "unhealthy"
+            tail = f" ({', '.join(extra)})" if extra else ""
+            lines.append(f"{'✅' if ok else '❌'} контейнер {html.escape(c)}: {html.escape(st)}{html.escape(tail)}")
     if len(lines) == 1:
         lines.append("Список пуст. Добавьте services / processes в config.yaml.")
     return "\n".join(lines)
@@ -305,6 +390,11 @@ class AlertState:
     boot_time: float = 0.0
     oom_kills: int | None = None
     log: list[list] = field(default_factory=list)              # [ts, key] отправленных алертов, 48 ч
+    seen_containers: list[str] = field(default_factory=list)   # для авто-режима
+    ctr_started: dict[str, str] = field(default_factory=dict)  # StartedAt по контейнеру
+    ctr_restarts: dict[str, int] = field(default_factory=dict)
+    log_checked: dict[str, int] = field(default_factory=dict)  # до какого времени логи просмотрены
+    log_alert_at: dict[str, float] = field(default_factory=dict)
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -337,7 +427,7 @@ def key_label(key: str) -> str:
     return key.split(":", 1)[-1]
 
 
-def evaluate(cfg: dict) -> dict[str, str | None]:
+def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | None]:
     """Возвращает {ключ: описание проблемы или None, если всё в порядке}."""
     th = cfg.get("thresholds", {})
     s = collect(cfg)
@@ -363,11 +453,19 @@ def evaluate(cfg: dict) -> dict[str, str | None]:
         res[f"svc:{svc}"] = None if st == "running" else f"❌ Служба {svc} не работает ({st})"
     for proc in cfg.get("processes", []) or []:
         res[f"proc:{proc}"] = None if process_running(proc) else f"❌ Процесс {proc} не найден"
-    if cfg.get("containers"):
+    containers = watched_containers(cfg, state)
+    if containers:
         states = container_states()
-        for c in cfg["containers"]:
+        info = container_info(containers)
+        for c in containers:
             st = container_state(c, states)
-            res[f"ctr:{c}"] = None if st == "running" else f"❌ Контейнер {c} не работает ({st})"
+            health = info.get(c, {}).get("health")
+            if st != "running":
+                res[f"ctr:{c}"] = f"❌ Контейнер {c} не работает ({st})"
+            elif health == "unhealthy":
+                res[f"ctr:{c}"] = f"❌ Контейнер {c} работает, но healthcheck: unhealthy"
+            else:
+                res[f"ctr:{c}"] = None
     res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None
     return res
 
@@ -394,7 +492,11 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     muted = state.muted(now)
     quiet = in_quiet_hours(cfg, now)
     out: list[Alert] = []
-    results = evaluate(cfg) if results is None else results
+    real = results is None
+    if real:
+        update_seen_containers(state)
+    results = evaluate(cfg, state) if real else results
+    recovered: set[str] = set()
 
     for key, problem in results.items():
         if problem:
@@ -421,6 +523,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 state.active.remove(key)
                 state.last_sent.pop(key, None)
                 state.problems.pop(key, None)
+                recovered.add(key)
                 if not muted:
                     out.append(Alert(f"✅ Восстановлено: {key_label(key)}", key, "recovered"))
 
@@ -443,8 +546,74 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             state.log.append([now, "oom"])
         state.oom_kills = n
 
+    if real:
+        out += docker_events(cfg, state, now, recovered, muted, quiet)
+
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]
     state.save()
+    return out
+
+
+def update_seen_containers(state: AlertState) -> None:
+    states = container_states()
+    for name, st in (states or {}).items():
+        if st == "running" and name not in state.seen_containers:
+            state.seen_containers.append(name)
+
+
+DEFAULT_LOG_PATTERNS = ["Traceback", "ERROR", "CRITICAL", "Exception", "FATAL"]
+
+
+def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
+                  muted: bool, quiet: bool, info: dict | None = None,
+                  logs_fn=None) -> list[Alert]:
+    """Перезапуски контейнеров и ошибки в их логах."""
+    out: list[Alert] = []
+    names = watched_containers(cfg, state)
+    if not names:
+        return out
+    info = container_info(names) if info is None else info
+    logs_fn = logs_fn or (lambda n, since: container_logs(n, since=since))
+
+    for name in names:
+        i = info.get(name)
+        if not i:
+            continue
+        prev_started = state.ctr_started.get(name)
+        prev_restarts = state.ctr_restarts.get(name)
+        restarted = prev_started is not None and i["started"] != prev_started
+        state.ctr_started[name] = i["started"]
+        state.ctr_restarts[name] = i["restarts"]
+        # перезапуск, о котором уже сообщили как «упал → восстановлено», второй раз не дублируем
+        if restarted and f"ctr:{name}" not in recovered and not muted:
+            extra = ""
+            if prev_restarts is not None and i["restarts"] > prev_restarts:
+                extra = f" (автоперезапуск Docker, всего {i['restarts']})"
+            out.append(Alert(f"🔁 Контейнер {name} перезапустился{extra}", f"log:{name}", "event"))
+            state.log.append([now, f"restart:{name}"])
+
+    if not cfg.get("log_alerts", True):
+        return out
+    patterns = list(cfg.get("log_patterns") or DEFAULT_LOG_PATTERNS)  # с учётом регистра: ERROR, не «error»
+    every = (cfg.get("log_alert_min") or 15) * 60
+    for name in names:
+        if name not in info:
+            continue
+        since = state.log_checked.get(name)
+        state.log_checked[name] = int(now)
+        if since is None:
+            continue  # первый запуск: старые ошибки не присылаем
+        if muted or quiet or now - state.log_alert_at.get(name, 0) < every:
+            continue
+        logs = logs_fn(name, since)
+        if not logs:
+            continue
+        hits = [ln.strip() for ln in logs.splitlines() if any(p in ln for p in patterns)]
+        if hits:
+            state.log_alert_at[name] = now
+            state.log.append([now, f"logerr:{name}"])
+            sample = "\n".join(h[:200] for h in hits[:3])
+            out.append(Alert(f"⚠️ Ошибки в логах {name}: {len(hits)} строк\n{sample}", f"log:{name}", "event"))
     return out
 
 

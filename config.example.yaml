@@ -57,5 +57,13 @@ remind_min: 60
 # Ежедневная сводка в заданное время (null = выкл)
 daily_summary: null   # "09:00"
 
+# Docker: отслеживать все контейнеры, которые бот видел работающими (не только из списка containers)
+containers_auto: false
+# Алерт на ошибки в логах контейнеров, не чаще раза в log_alert_min минут
+log_alerts: true
+log_alert_min: 15
+# Что считать ошибкой (с учётом регистра). null = Traceback, ERROR, CRITICAL, Exception, FATAL
+log_patterns: null
+
 # Куда писать settings.json и state.json. Пусто = $STATE_DIRECTORY (systemd) или папка с config.yaml
 data_dir: null

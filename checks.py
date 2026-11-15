@@ -421,6 +421,8 @@ class AlertState:
     bak_events: list[str] = field(default_factory=list)
     update_reported: float | None = None                       # о каком обновлении уже сообщили
     verify_last: dict = field(default_factory=dict)            # последняя проверка копий: ts, results, err
+    autobans: dict[str, float] = field(default_factory=dict)   # автобан: IP → до какого времени (0 = навсегда)
+    autoban_skip: dict[str, float] = field(default_factory=dict)  # IP, которые помощник не дал заблокировать
 
     path: Path | None = field(default=None, repr=False, compare=False)
 

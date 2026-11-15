@@ -1,6 +1,7 @@
 """Безопасность: входы по SSH, открытые порты, обновления безопасности, сигнал «я жив» во внешний сервис."""
 from __future__ import annotations
 
+import ipaddress
 import re
 import shutil
 import subprocess
@@ -43,6 +44,48 @@ def parse_ssh(text: str) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
             ip = m.group(3)
             failed[ip] = failed.get(ip, 0) + 1
     return accepted, failed
+
+
+# ---------- Автобан ----------
+
+AUTOBAN_PER_CHECK = 10   # больше за одну проверку не блокируем
+AUTOBAN_RETRY = 3600     # если помощник отказал, повторяем не раньше чем через час
+
+
+def public_ip(ip: str) -> bool:
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local or a.is_multicast or a.is_unspecified
+                or a.is_reserved)
+
+
+def autoban_candidates(cfg: dict, state, now: float) -> list[tuple[str, int]]:
+    """[(ip, попыток за 10 мин)], которые пора заблокировать. Никогда — IP, с которых уже входили по SSH,
+    и IP из autoban_whitelist."""
+    if not cfg.get("autoban", True) or not cfg.get("ssh_alerts", True):
+        return []
+    thr = int(cfg.get("autoban_threshold") or 10)
+    by_ip: dict[str, int] = {}
+    for ts, ip, n in state.ssh_failed:
+        if now - ts < 600:
+            by_ip[ip] = by_ip.get(ip, 0) + n
+    skip = set(state.known_ips) | set(cfg.get("autoban_whitelist") or []) | set(state.autobans)
+    skip |= {ip for ip, ts in state.autoban_skip.items() if now - ts < AUTOBAN_RETRY}
+    out = [(ip, n) for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])
+           if n >= thr and ip not in skip and public_ip(ip)]
+    return out[:AUTOBAN_PER_CHECK]
+
+
+def expired_autobans(state, now: float) -> list[str]:
+    return [ip for ip, until in state.autobans.items() if until and until <= now]
+
+
+def ban_duration_text(hours: int) -> str:
+    if not hours:
+        return "навсегда"
+    return f"на {hours // 24} дн." if hours >= 48 else f"на {hours} ч"
 
 
 # ---------- Порты ----------

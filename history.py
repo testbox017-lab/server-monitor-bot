@@ -91,6 +91,49 @@ class History:
             return None
         return (100 - pts[-1][1]) / per_day
 
+    def hour_profile(self, now: float, tzinfo, days: int = 14, skip: int = 2 * 3600) -> dict:
+        """Норма для текущего часа суток: {"cpu": (среднее, разброс, дней), "ram": (...)}.
+        Берём те же часы за прошлые дни, без последних skip секунд."""
+        hour = datetime.fromtimestamp(now, tzinfo).hour
+        vals: dict[str, list[float]] = {"cpu": [], "ram": []}
+        day_set: set = set()
+        for r in self.rows(now - days * 86400, now - skip):
+            d = datetime.fromtimestamp(r[0], tzinfo)
+            if d.hour != hour:
+                continue
+            day_set.add(d.date())
+            if r[1] is not None:
+                vals["cpu"].append(r[1])
+            if r[2] is not None:
+                vals["ram"].append(r[2])
+        out = {}
+        for k, v in vals.items():
+            if len(v) < 10:
+                continue
+            mean = sum(v) / len(v)
+            std = (sum((x - mean) ** 2 for x in v) / len(v)) ** 0.5
+            out[k] = (mean, std, len(day_set))
+        return out
+
+    def trend(self, col: str, seconds: int, now: float | None = None) -> tuple[float, float, float] | None:
+        """Линейный тренд за seconds: (изменение в % за час, R², последнее значение)."""
+        now = now or time.time()
+        idx = {"cpu": 1, "ram": 2, "disk": 3}[col]
+        pts = [(r[0], r[idx]) for r in self.rows(now - seconds, now) if r[idx] is not None]
+        if len(pts) < 20 or pts[-1][0] - pts[0][0] < seconds * 0.8:
+            return None
+        n = len(pts)
+        mx = sum(p[0] for p in pts) / n
+        my = sum(p[1] for p in pts) / n
+        sxx = sum((p[0] - mx) ** 2 for p in pts)
+        syy = sum((p[1] - my) ** 2 for p in pts)
+        if sxx == 0 or syy == 0:
+            return None
+        sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+        slope = sxy / sxx
+        r2 = sxy * sxy / (sxx * syy)
+        return slope * 3600, r2, pts[-1][1]
+
 
 def _traffic(rows: list[tuple]) -> tuple[int, int]:
     """Сумма трафика за период; сбросы счётчика (перезагрузка) пропускаем."""

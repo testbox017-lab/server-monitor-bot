@@ -93,7 +93,15 @@ def services_kb() -> InlineKeyboardMarkup:
               [b for b in [act_btn("🧰 Действия", "act:menu")] if b])
 
 
-def alert_kb(key: str | None = None) -> InlineKeyboardMarkup:
+def short_id(text: str) -> str:
+    return hashlib.sha1(text.encode()).hexdigest()[:10]
+
+
+def active_key(kid: str) -> str | None:
+    return next((k for k in STATE.active if short_id(k) == kid), None)
+
+
+def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMarkup:
     extra = []
     fix = None
     if key and key.startswith(("ctr:", "log:")):
@@ -105,9 +113,27 @@ def alert_kb(key: str | None = None) -> InlineKeyboardMarkup:
         fix = act_btn("♻️ Перезапустить", f"act:svc:{checks.key_label(key)}")
     elif key and key.startswith("disk:"):
         fix = act_btn("🧹 Очистить место", "act:clean")
-    return kb([Btn("🔕 На 1 ч", callback_data="mute:3600:a"), Btn("🌙 До утра", callback_data="mute:morning:a")],
+    ack = None
+    if ackable and key:
+        ack = [Btn("✔️ Принял", callback_data=f"ack:{short_id(key)}"),
+               Btn("💤 Этот на 1 ч", callback_data=f"snz:{short_id(key)}")]
+    return kb(ack,
+              [Btn("🔕 Все на 1 ч", callback_data="mute:3600:a"), Btn("🌙 До утра", callback_data="mute:morning:a")],
               [Btn("📊 Статус сейчас", callback_data="status:new")] + extra,
               [fix] if fix else None)
+
+
+def group_text(alerts: list) -> str:
+    lines = [f"<b>{html.escape(HOST)}</b>", f"Сразу {len(alerts)} событий:"]
+    for a in alerts:
+        lines.append("• " + html.escape(a.text[:300]))
+    text = "\n".join(lines)
+    return text if len(text) < 3900 else text[:3900] + "\n…"
+
+
+def group_kb() -> InlineKeyboardMarkup:
+    return kb([Btn("✔️ Принять все", callback_data="ackall"), Btn("🔕 Все на 1 ч", callback_data="mute:3600:a")],
+              [Btn("🚨 Активные алерты", callback_data="alerts:new"), Btn("📊 Статус", callback_data="status:new")])
 
 
 def actions_menu() -> tuple[str, InlineKeyboardMarkup]:
@@ -188,7 +214,12 @@ def alerts_text() -> str:
         for k in STATE.active:
             since = STATE.since.get(k)
             mins = f" ({int((now - since) // 60)} мин)" if since else ""
-            lines.append(html.escape(STATE.problems.get(k, checks.key_label(k))) + mins)
+            mark = ""
+            if k in STATE.acked:
+                mark = " ✔️ принято"
+            elif STATE.snoozed.get(k, 0) > now:
+                mark = f" 💤 до {checks.fmt_local(CFG, STATE.snoozed[k])}"
+            lines.append(html.escape(STATE.problems.get(k, checks.key_label(k))) + mins + mark)
     else:
         lines.append("✅ Активных алертов нет")
     return "\n".join(lines)
@@ -228,6 +259,7 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
               [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
               [Btn("🛡 Безопасность", callback_data="set:sec"), Btn("🌐 Сайты и порты", callback_data="set:probes")],
+              [Btn("🧠 Умные алерты", callback_data="set:smart")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -350,8 +382,26 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(rows)
 
 
-def probe_id(raw: str) -> str:
-    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+probe_id = short_id
+
+
+def smart_view() -> tuple[str, InlineKeyboardMarkup]:
+    rows = [[Btn(f"{onoff(CFG.get('anomaly_alerts', True))} Необычная нагрузка для этого часа",
+                 callback_data="sm:anomaly_alerts")],
+            [Btn(f"{onoff(CFG.get('ram_trend_alerts', True))} Память растёт и скоро закончится",
+                 callback_data="sm:ram_trend_alerts")],
+            [Btn(f"{onoff(CFG.get('group_alerts', True))} Много алертов сразу — одним сообщением",
+                 callback_data="sm:group_alerts")],
+            [BACK]]
+    text = ("🧠 <b>Умные алерты</b>\n"
+            "Необычная нагрузка: бот знает, сколько CPU и RAM обычно бывает в этот час (по истории за 14 дней), "
+            "и пишет, если 15 минут подряд намного больше обычного, даже когда до порога далеко. "
+            "Начинает работать, когда накопится 3 дня истории.\n"
+            "Память растёт: если RAM ровно растёт 6 часов и при таком темпе закончится меньше чем через 12 часов "
+            "(похоже на утечку). Не чаще раза в 6 часов.\n"
+            "Под каждым алертом: «✔️ Принял» — без напоминаний, пока проблема не исчезнет; "
+            "«💤 Этот на 1 ч» — молчать только об этой проблеме.")
+    return text, InlineKeyboardMarkup(rows)
 
 
 PROBES_HELP = ("Добавить: <code>/probe https://site.ru</code>\n"
@@ -579,7 +629,38 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         elif cmd == "services":
             await edit(update, await asyncio.to_thread(checks.services_text, CFG, STATE), services_kb())
         elif cmd == "alerts":
-            await edit(update, alerts_text(), alerts_kb())
+            if len(parts) > 1:
+                await send(update, alerts_text(), alerts_kb())
+            else:
+                await edit(update, alerts_text(), alerts_kb())
+        elif cmd == "ack":
+            key = active_key(parts[1])
+            if key is None:
+                note = "Эта проблема уже решена"
+            else:
+                if key not in STATE.acked:
+                    STATE.acked.append(key)
+                    STATE.save()
+                note = "Принято: напоминаний не будет, пока проблема не исчезнет"
+                try:
+                    await q.edit_message_reply_markup(alert_kb(key))
+                except BadRequest:
+                    pass
+        elif cmd == "ackall":
+            STATE.acked = list(STATE.active)
+            STATE.save()
+            note = f"Принято: {len(STATE.acked)}" if STATE.acked else "Активных алертов нет"
+        elif cmd == "snz":
+            key = active_key(parts[1])
+            if key is None:
+                note = "Эта проблема уже решена"
+            else:
+                STATE.snoozed[key] = time.time() + 3600
+                STATE.save()
+                note = f"Об этой проблеме молчу до {checks.fmt_local(CFG, STATE.snoozed[key])}"
+        elif cmd == "sm":
+            S.set(parts[1], not CFG.get(parts[1], True))
+            await edit(update, *smart_view())
         elif cmd == "mute":
             arg = parts[1]
             if arg == "off":
@@ -604,7 +685,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
-                        "docker": docker_view, "sec": security_view, "probes": probes_view}[sub]
+                        "docker": docker_view, "sec": security_view, "probes": probes_view,
+                        "smart": smart_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -708,7 +790,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             S.set("daily_summary", None if parts[1] == "off" else ":".join(parts[1:]))
             reschedule(ctx.application)
             await edit(update, *summary_view())
-        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr") and note is None:
+        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "sm") and note is None:
             note = "Сохранено"
     except Exception:
         log.exception("Ошибка кнопки %s", data)
@@ -806,7 +888,7 @@ async def broadcast(bot, text: str, markup=None) -> None:
 
 async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        alerts = await asyncio.to_thread(checks.step, CFG, STATE)
+        alerts = await asyncio.to_thread(checks.step, CFG, STATE, None, None, HIST)
     except Exception:
         log.exception("Ошибка проверки")
         return
@@ -819,8 +901,11 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ok != STATE.heartbeat_ok:
             log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
             STATE.heartbeat_ok = ok
+    if CFG.get("group_alerts", True) and len(alerts) > 3:
+        await broadcast(ctx.bot, group_text(alerts), group_kb())
+        return
     for a in alerts:
-        markup = alert_kb(a.key) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
+        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
 
 

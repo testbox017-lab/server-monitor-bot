@@ -15,7 +15,8 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start",
             "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
             "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
-            "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days")
+            "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
+            "anomaly_alerts", "ram_trend_alerts", "group_alerts")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -39,6 +40,10 @@ DEFAULTS = {
     "ssh_fail_threshold": 30,       # неудачных попыток за 10 мин для алерта (0 = выкл)
     "port_alerts": True,            # новый открытый наружу порт
     "update_alerts": True,          # обновления безопасности Ubuntu
+    # Умные алерты
+    "anomaly_alerts": True,         # «необычно для этого часа» по истории за 14 дней
+    "ram_trend_alerts": True,       # память стабильно растёт и скоро закончится
+    "group_alerts": True,           # больше 3 алертов за раз — одним сообщением
     # Проверки снаружи
     "probes": [],                   # https://site.ru, https://site.ru/health | OK, tcp://host:5432, ping://host, dns://name
     "probe_timeout": 10,            # секунд на одну проверку

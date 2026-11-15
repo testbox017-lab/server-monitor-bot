@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import psutil
 
+import smart
+
 IS_WINDOWS = platform.system() == "Windows"
 LAST_SAMPLE: dict | None = None  # последний снимок из evaluate(), бот пишет его в историю
 
@@ -412,6 +414,9 @@ class AlertState:
     ssl_checked: dict[str, float] = field(default_factory=dict)
     ssl_days: dict[str, float] = field(default_factory=dict)
     ssl_alerted: dict[str, int] = field(default_factory=dict)  # последний порог, о котором писали
+    acked: list[str] = field(default_factory=list)             # «Принял»: без напоминаний до восстановления
+    snoozed: dict[str, float] = field(default_factory=dict)    # «Этот на 1 ч»: ключ → до какого времени молчим
+    ram_trend_at: float = 0.0
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -441,6 +446,8 @@ class AlertState:
 
 
 def key_label(key: str) -> str:
+    if key.startswith("anom:"):
+        return "необычная нагрузка " + smart.NAMES.get(key[5:], key[5:])
     return key.split(":", 1)[-1]
 
 
@@ -509,7 +516,7 @@ class Alert:
 
 
 def step(cfg: dict, state: AlertState, now: float | None = None,
-         results: dict[str, str | None] | None = None) -> list[Alert]:
+         results: dict[str, str | None] | None = None, hist=None) -> list[Alert]:
     """Одна итерация проверки. Возвращает сообщения для отправки и сохраняет состояние."""
     now = now or time.time()
     th = cfg.get("thresholds", {})
@@ -521,15 +528,24 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     real = results is None
     if real:
         update_seen_containers(state)
-    results = evaluate(cfg, state) if real else results
+    results = evaluate(cfg, state) if real else dict(results)
+    if real and hist is not None:
+        try:
+            results.update(smart.anomaly_results(cfg, LAST_SAMPLE, hist, now, tz(cfg)))
+        except Exception:
+            import logging
+            logging.getLogger("monitor_bot").exception("Ошибка расчёта нормы")
+    smart.clean(state, now)
     recovered: set[str] = set()
 
     for key, problem in results.items():
         if problem:
             state.since.setdefault(key, now)
-            if not (instant_keys(key) or now - state.since[key] >= duration):
+            need = smart.anomaly_duration(duration) if key.startswith("anom:") else duration
+            if not (instant_keys(key) or now - state.since[key] >= need):
                 continue
-            suppressed = muted or (quiet and not is_critical(key))
+            snoozed = state.snoozed.get(key, 0) > now
+            suppressed = muted or snoozed or (quiet and not is_critical(key))
             if suppressed:
                 continue  # отправим, когда тишина закончится, если проблема ещё есть
             if key not in state.active:
@@ -538,7 +554,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 state.problems[key] = problem
                 state.log.append([now, key])
                 out.append(Alert(f"🚨 {problem}", key, "alert"))
-            elif remind and now - state.last_sent.get(key, now) >= remind:
+            elif remind and key not in state.acked and now - state.last_sent.get(key, now) >= remind:
                 state.last_sent[key] = now
                 state.problems[key] = problem
                 mins = int((now - state.since[key]) // 60)
@@ -550,6 +566,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 state.last_sent.pop(key, None)
                 state.problems.pop(key, None)
                 recovered.add(key)
+                if key in state.acked:
+                    state.acked.remove(key)
                 if not muted:
                     out.append(Alert(f"✅ Восстановлено: {key_label(key)}", key, "recovered"))
 
@@ -562,6 +580,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     for key in list(state.since):
         if key not in results:
             state.since.pop(key)
+    state.acked = [k for k in state.acked if k in state.active]
 
     # OOM killer — событие, не состояние
     n = oom_kills()
@@ -586,6 +605,12 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:
             import logging
             logging.getLogger("monitor_bot").exception("Ошибка проверки SSL")
+        if hist is not None:
+            try:
+                out += smart.ram_trend_events(cfg, state, hist, now, muted, quiet)
+            except Exception:
+                import logging
+                logging.getLogger("monitor_bot").exception("Ошибка прогноза памяти")
 
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]
     state.save()

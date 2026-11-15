@@ -144,13 +144,20 @@ sudo install -D -o root -g root -m 644 deploy/backup-watch /etc/monitor-bot/back
    ```
    command="/usr/local/sbin/monitor-bot-action pull-stream",restrict ssh-ed25519 AAAA… monitor-bot-pull
    ```
-3. На ПК проверить и поставить задачу на каждый день в 05:00 (если ПК выключен, задача выполнится при включении):
+3. На ПК поставить задачу на каждый день в 05:00 (если ПК выключен, задача выполнится при включении)
+   и сразу проверить выгрузку:
    ```
-   powershell -ExecutionPolicy Bypass -File deploy\pc\pull-backups.ps1 -Server root@IP
    powershell -ExecutionPolicy Bypass -File deploy\pc\install-task.ps1 -Server root@IP
+   powershell -ExecutionPolicy Bypass -File deploy\pc\pull-backups.ps1
    ```
 
-Копии лягут в `D:\Backups\server\ГГГГ-ММ-ДД_ЧЧММ`, хранятся 30 последних, журнал в `pull.log`.
+Копии лягут в `Backups\server\ГГГГ-ММ-ДД_ЧЧММ` в корне проекта. Хранятся 30 последних, журнал в `pull.log`.
+Сервер и папка записаны в `deploy\pc\pull-backups.json`, он в `.gitignore`, как и папка `Backups/`.
+Поменять папку (`-Move` переносит уже скачанные копии), задачу пересоздавать не нужно:
+```
+powershell -ExecutionPolicy Bypass -File deploy\pc\set-backup-path.ps1 -Dest D:\другая\папка -Move
+powershell -ExecutionPolicy Bypass -File deploy\pc\set-backup-path.ps1        # показать текущую
+```
 Скрипт сверяет контрольные суммы, оборванная передача помечается папкой `-FAILED`.
 Сервер отмечает каждую выдачу в `/var/lib/monitor-bot-offsite/status.json`. Бот показывает это в `/backup`
 и пишет, если ПК не забирал копии дольше 3 дней (меняется кнопками: 2 дня, 3 дня, неделя, выкл).

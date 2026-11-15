@@ -1242,6 +1242,7 @@ class BotButtonsTest(unittest.TestCase):
         async def fake_broadcast(bot, text, markup=None):
             sent.append((text, markup))
         with mock.patch.object(checks, "step", return_value=alerts), \
+             mock.patch.object(updater, "last_result", return_value=None), \
              mock.patch.object(b, "broadcast", fake_broadcast), mock.patch.object(b.HIST, "record"):
             asyncio.run(b.monitor_job(mock.MagicMock()))
             self.assertEqual(len(sent), 1)

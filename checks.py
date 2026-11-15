@@ -302,6 +302,9 @@ def services_text(cfg: dict, state: "AlertState | None" = None) -> str:
             lines.append(f"{'✅' if ok else '❌'} контейнер {html.escape(c)}: {html.escape(st)}{html.escape(tail)}")
     if len(lines) == 1:
         lines.append("Список пуст. Добавьте services / processes в config.yaml.")
+    if state is not None and cfg.get("probes"):
+        import probes
+        lines += ["", probes.probes_text(cfg, state)]
     return "\n".join(lines)
 
 
@@ -373,7 +376,7 @@ def fmt_local(cfg: dict, ts: float) -> str:
 
 # ---------- Алерты ----------
 
-CRITICAL_PREFIXES = ("svc:", "proc:", "ctr:")
+CRITICAL_PREFIXES = ("svc:", "proc:", "ctr:", "web:")
 
 
 def is_critical(key: str) -> bool:
@@ -404,6 +407,11 @@ class AlertState:
     updates_checked: float = 0.0
     updates_alert_at: float = 0.0
     heartbeat_ok: bool | None = None
+    probe_fails: dict[str, int] = field(default_factory=dict)  # неудач подряд по цели
+    probe_last: dict[str, list] = field(default_factory=dict)  # [ok, текст, мс, ts]
+    ssl_checked: dict[str, float] = field(default_factory=dict)
+    ssl_days: dict[str, float] = field(default_factory=dict)
+    ssl_alerted: dict[str, int] = field(default_factory=dict)  # последний порог, о котором писали
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -478,6 +486,13 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             else:
                 res[f"ctr:{c}"] = None
     res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None
+    if state is not None and cfg.get("probes"):
+        import probes
+        try:
+            res.update(probes.evaluate(cfg, state, time.time()))
+        except Exception:  # внешние проверки не должны ломать основную
+            import logging
+            logging.getLogger("monitor_bot").exception("Ошибка внешних проверок")
     return res
 
 
@@ -565,6 +580,12 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:  # безопасность не должна ломать основную проверку
             import logging
             logging.getLogger("monitor_bot").exception("Ошибка проверки безопасности")
+        import probes
+        try:
+            out += probes.ssl_events(cfg, state, now, muted, quiet)
+        except Exception:
+            import logging
+            logging.getLogger("monitor_bot").exception("Ошибка проверки SSL")
 
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]
     state.save()

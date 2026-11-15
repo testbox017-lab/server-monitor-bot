@@ -18,6 +18,7 @@ CONF.write_text('token: "123456:' + "A" * 35 + '"\nallowed_chats: [42]\nservices
 
 import checks  # noqa: E402
 import history  # noqa: E402
+import probes  # noqa: E402
 from settings import Settings  # noqa: E402
 from types import SimpleNamespace as NS  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
@@ -468,6 +469,110 @@ class SecurityTest(unittest.TestCase):
             self.assertFalse(security.heartbeat("https://hc-ping.com/x"))
 
 
+class ProbesTest(unittest.TestCase):
+    def setUp(self):
+        self.st = checks.AlertState()
+        self.cfg = {"probes": ["https://site.ru", "tcp://db.local:5432"], "probe_fail_count": 2,
+                    "ssl_alerts": True, "ssl_warn_days": 14}
+        self.res = {}
+
+    def run_fn(self, raws, timeout):
+        return {r: self.res.get(r, (True, "HTTP 200", 50)) for r in raws}
+
+    def test_parse_and_normalize(self):
+        self.assertEqual(probes.normalize("site.ru"), "https://site.ru")
+        self.assertEqual(probes.normalize("db.local:5432"), "tcp://db.local:5432")
+        self.assertEqual(probes.normalize("https://site.ru/health | OK"), "https://site.ru/health | OK")
+        self.assertEqual(probes.normalize("ping://1.1.1.1"), "ping://1.1.1.1")
+        self.assertEqual(probes.parse("https://site.ru:8443").port, 8443)
+        for bad in ("", "ftp://x", "tcp://host", "dns://x.ru | OK", "a b c", "x" * 300, "https://"):
+            self.assertIsNone(probes.normalize(bad), bad)
+
+    def test_fail_needs_two_in_a_row(self):
+        self.res["https://site.ru"] = (False, "HTTP 502", 30)
+        r = probes.evaluate(self.cfg, self.st, T0, self.run_fn)
+        self.assertIsNone(r["web:https://site.ru"])          # одна неудача — ещё не падение
+        r = probes.evaluate(self.cfg, self.st, T0 + 60, self.run_fn)
+        self.assertIn("HTTP 502", r["web:https://site.ru"])
+        self.assertIsNone(r["web:tcp://db.local:5432"])
+        self.res.clear()
+        r = probes.evaluate(self.cfg, self.st, T0 + 120, self.run_fn)
+        self.assertIsNone(r["web:https://site.ru"])
+        self.assertEqual(self.st.probe_fails["https://site.ru"], 0)
+
+    def test_alert_via_step_is_critical(self):
+        self.assertTrue(checks.is_critical("web:https://site.ru"))
+        st = checks.AlertState()
+        cfg = {"thresholds": {"duration_sec": 300}, "remind_min": 0,
+               "quiet_hours": {"start": "00:00", "end": "23:59"}, "tz": "UTC"}
+        a = checks.step(cfg, st, T0, results(**{"web:https://site.ru": "🌐 Не отвечает https://site.ru: HTTP 502"}))
+        self.assertTrue(any("Не отвечает" in x.text for x in a))   # приходит и в тихие часы
+
+    def test_removed_target_forgotten(self):
+        self.res["https://site.ru"] = (False, "x", 0)
+        probes.evaluate(self.cfg, self.st, T0, self.run_fn)
+        self.cfg["probes"] = ["tcp://db.local:5432"]
+        probes.evaluate(self.cfg, self.st, T0 + 60, self.run_fn)
+        self.assertNotIn("https://site.ru", self.st.probe_fails)
+
+    def test_run_all_parallel_and_bad(self):
+        out = probes.run_all(["https://a.ru", "https://b.ru", "ftp://x"], 1,
+                             check_fn=lambda t, timeout: (True, t.host, 1))
+        self.assertEqual(out["https://a.ru"], (True, "a.ru", 1))
+        self.assertFalse(out["ftp://x"][0])
+
+    def test_http_check(self):
+        resp = mock.MagicMock(status=200)
+        resp.__enter__.return_value = resp
+        resp.read.return_value = b"status: OK"
+        t = probes.parse("https://site.ru | OK")
+        with mock.patch.object(probes.urllib.request, "urlopen", return_value=resp):
+            self.assertTrue(probes.check_http(t, 1)[0])
+            self.assertFalse(probes.check_http(probes.parse("https://site.ru | FINE"), 1)[0])
+        err = probes.urllib.error.HTTPError("https://site.ru", 503, "x", {}, None)
+        with mock.patch.object(probes.urllib.request, "urlopen", side_effect=err):
+            self.assertEqual(probes.check_http(t, 1), (False, "HTTP 503"))
+
+    def test_tcp_check_real_socket(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        self.assertTrue(probes.check_tcp(probes.parse(f"tcp://127.0.0.1:{port}"), 2)[0])
+        srv.close()
+        self.assertFalse(probes.check_tcp(probes.parse(f"tcp://127.0.0.1:{port}"), 2)[0])
+
+    def test_ssl_steps(self):
+        days = {"v": 30.0}
+        ev = lambda now, **kw: probes.ssl_events(self.cfg, self.st, now, kw.get("muted", False),
+                                                 kw.get("quiet", False), days_fn=lambda h, p: days["v"])
+        self.assertEqual(ev(T0), [])
+        days["v"] = 13.2
+        self.assertEqual(ev(T0 + 3600), [])                  # перепроверка раз в 6 часов
+        a = ev(T0 + 7 * 3600)
+        self.assertEqual(len(a), 1)
+        self.assertIn("через 13 дн", a[0].text)
+        self.assertEqual(ev(T0 + 14 * 3600), [])             # тот же порог — молчим
+        days["v"] = 6.5
+        self.assertEqual(ev(T0 + 21 * 3600, quiet=True), [])  # ночью ждём
+        self.assertEqual(len(ev(T0 + 22 * 3600)), 1)          # утром приходит
+        days["v"] = -0.5
+        self.assertIn("истёк", ev(T0 + 29 * 3600)[0].text)
+        days["v"] = 89
+        ev(T0 + 36 * 3600)
+        self.assertNotIn("site.ru", self.st.ssl_alerted)     # продлили — счётчик сброшен
+        self.cfg["probes"] = []
+        ev(T0 + 43 * 3600)
+        self.assertEqual(self.st.ssl_days, {})
+
+    def test_probes_text(self):
+        probes.evaluate(self.cfg, self.st, T0, self.run_fn)
+        self.st.ssl_days["site.ru"] = 40
+        text = probes.probes_text(self.cfg, self.st)
+        self.assertIn("✅ https://site.ru — HTTP 200, 50 мс, SSL ещё 40 дн.", text)
+
+
 class BotButtonsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -665,6 +770,36 @@ class BotButtonsTest(unittest.TestCase):
         self.assertEqual(b.STATE.known_ips, [])
         q, _ = self.press("set:sec")
         self.assertIn("Безопасность", q.edit_message_text.await_args.args[0])
+        b.S.reset()
+
+    def test_probe_command_and_buttons(self):
+        b = self.bot
+        b.S.reset()
+        upd = mock.MagicMock()
+        upd.effective_chat.id = 42
+        upd.effective_message.reply_text = mock.AsyncMock()
+        ctx = mock.MagicMock()
+        ctx.args = ["site.ru"]
+        with mock.patch.object(probes, "run_all", return_value={"https://site.ru": (True, "HTTP 200", 10)}), \
+             mock.patch.object(probes, "ssl_days_left", return_value=50.0):
+            asyncio.run(b.cmd_probe(upd, ctx))
+            self.assertEqual(b.CFG["probes"], ["https://site.ru"])
+            ctx.args = ["ftp://x"]
+            asyncio.run(b.cmd_probe(upd, ctx))
+            self.assertIn("Не понял", upd.effective_message.reply_text.await_args.args[0])
+            q, _ = self.press("set:probes")
+            text = q.edit_message_text.await_args.args[0]
+            self.assertIn("SSL ещё 50 дн.", text)
+            cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+            for d in cbs:
+                self.assertLessEqual(len(d.encode()), 64, d)
+            self.press("pr:run")
+            self.press("pr:fails:3")
+            self.assertEqual(b.CFG["probe_fail_count"], 3)
+            self.press("pr:ssl")
+            self.assertFalse(b.CFG["ssl_alerts"])
+            self.press([d for d in cbs if d.startswith("pr:del:")][0])
+            self.assertEqual(b.CFG["probes"], [])
         b.S.reset()
 
     def test_stranger_blocked(self):

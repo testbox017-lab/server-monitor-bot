@@ -1346,6 +1346,21 @@ class BotButtonsTest(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("обновлён до bbbbbbb", sent[0])
 
+    def test_menu_commands_registered(self):
+        b = self.bot
+        names = {n for n, _ in b.COMMANDS}
+        app = b.build_app()
+        handled = {c for h in app.handlers[0] for c in getattr(h, "commands", ())}
+        self.assertTrue(names <= handled, names - handled)
+        for n, d in b.COMMANDS:
+            self.assertTrue(1 <= len(d) <= 256 and n.islower(), n)
+        app2 = mock.MagicMock()
+        app2.bot.set_my_commands = mock.AsyncMock()
+        app2.bot.send_message = mock.AsyncMock()
+        with mock.patch.object(checks, "check_reboot", return_value=None):
+            asyncio.run(b.on_startup(app2))
+        self.assertEqual(len(app2.bot.set_my_commands.await_args.args[0]), len(b.COMMANDS))
+
     def test_stranger_blocked(self):
         b = self.bot
         b.S.reset()

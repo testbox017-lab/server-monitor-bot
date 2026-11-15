@@ -20,6 +20,7 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
+import actions
 import checks
 import history
 from settings import Settings
@@ -33,6 +34,7 @@ S = Settings(CONFIG_PATH)
 CFG = S.cfg  # общий словарь, обновляется на месте при изменении настроек
 STATE = checks.AlertState.load(S.dir / "state.json")
 HIST = history.History(S.dir / "metrics.db")
+ACT = actions.Actions(S.dir / "actions.log")
 HOST = checks.platform.node()
 
 # ---------- Клавиатуры ----------
@@ -59,7 +61,20 @@ def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
     other = "mem" if by == "cpu" else "cpu"
     return kb([Btn("🔄 Обновить", callback_data=f"procs:{by}:{n}"),
                Btn("По RAM" if other == "mem" else "По CPU", callback_data=f"procs:{other}:{n}")],
-              [Btn("Показать 20" if n == 10 else "Показать 10", callback_data=f"procs:{by}:{20 if n == 10 else 10}")])
+              [Btn("Показать 20" if n == 10 else "Показать 10", callback_data=f"procs:{by}:{20 if n == 10 else 10}")]
+              + ([Btn("⛔ Остановить…", callback_data="act:killmenu")] if actions_on() else []))
+
+
+def actions_on() -> bool:
+    return bool(CFG.get("actions_enabled", True))
+
+
+def action_services() -> list[str]:
+    return list(CFG.get("action_services") or [])
+
+
+def act_btn(label: str, data: str) -> Btn | None:
+    return Btn(label, callback_data=data) if actions_on() and len(data.encode()) <= 64 else None
 
 
 def logs_btn(name: str, label: str | None = None) -> Btn | None:
@@ -71,17 +86,55 @@ def services_kb() -> InlineKeyboardMarkup:
     logs = [b for b in (logs_btn(c) for c in checks.watched_containers(CFG, STATE)) if b]
     return kb([Btn("🔄 Обновить", callback_data="services"),
                Btn("✏️ Что отслеживать", callback_data="set:watch")],
-              *[logs[i:i + 2] for i in range(0, len(logs), 2)])
+              *[logs[i:i + 2] for i in range(0, len(logs), 2)],
+              [b for b in [act_btn("🧰 Действия", "act:menu")] if b])
 
 
 def alert_kb(key: str | None = None) -> InlineKeyboardMarkup:
     extra = []
+    fix = None
     if key and key.startswith(("ctr:", "log:")):
         b = logs_btn(checks.key_label(key), "📜 Логи")
         if b:
             extra.append(b)
+        fix = act_btn("♻️ Перезапустить", f"act:ctr:{checks.key_label(key)}")
+    elif key and key.startswith("svc:") and checks.key_label(key) in action_services():
+        fix = act_btn("♻️ Перезапустить", f"act:svc:{checks.key_label(key)}")
+    elif key and key.startswith("disk:"):
+        fix = act_btn("🧹 Очистить место", "act:clean")
     return kb([Btn("🔕 На 1 ч", callback_data="mute:3600:a"), Btn("🌙 До утра", callback_data="mute:morning:a")],
-              [Btn("📊 Статус сейчас", callback_data="status:new")] + extra)
+              [Btn("📊 Статус сейчас", callback_data="status:new")] + extra,
+              [fix] if fix else None)
+
+
+def actions_menu() -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    ctrs = [b for b in (act_btn(f"♻️ {c}", f"act:ctr:{c}") for c in checks.watched_containers(CFG, STATE)) if b]
+    svcs = [b for b in (act_btn(f"♻️ {s}", f"act:svc:{s}") for s in action_services()) if b]
+    rows += [ctrs[i:i + 2] for i in range(0, len(ctrs), 2)]
+    rows += [svcs[i:i + 3] for i in range(0, len(svcs), 3)]
+    rows.append([Btn("🧹 Очистить место", callback_data="act:clean"),
+                 Btn("⛔ Остановить процесс", callback_data="act:killmenu")])
+    rows.append([Btn("📜 Журнал действий", callback_data="act:log"),
+                 Btn("🔄 Перезагрузить сервер", callback_data="act:reboot")])
+    text = ("🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Контейнеры перезапускаются через docker, "
+            "службы — только из списка action_services в config.yaml.")
+    return text, InlineKeyboardMarkup(rows)
+
+
+def confirm_kb(token: str, yes: str = "✅ Да, выполнить") -> InlineKeyboardMarkup:
+    return kb([Btn(yes, callback_data=f"do:{token}"), Btn("✖️ Отмена", callback_data=f"no:{token}")])
+
+
+def actions_log_text() -> str:
+    rows = ACT.last(10)
+    if not rows:
+        return "📜 Журнал действий пуст"
+    lines = ["📜 <b>Последние действия</b>"]
+    for r in rows:
+        if len(r) >= 4:
+            lines.append(f"{'✅' if r[3] == 'ok' else '❌'} {html.escape(r[0][5:16])} {html.escape(r[2])}")
+    return "\n".join(lines)
 
 
 def chart_kb(period: str) -> InlineKeyboardMarkup:
@@ -300,7 +353,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "👋 Бот мониторинга сервера. Управляйте кнопками внизу или командами:\n"
-        "/status /procs /mem /services /alerts /settings /logs /chart\n"
+        "/status /procs /mem /services /alerts /settings /logs /chart /actions\n"
         "/mute 2h — выключить уведомления, /unmute — включить", reply_markup=MAIN_KB)
 
 
@@ -348,6 +401,15 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
         period = ctx.args[0] if ctx.args and ctx.args[0] in history.PERIODS else "24h"
         await send_chart(update, period)
+
+
+async def cmd_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if not actions_on():
+        await send(update, "Действия выключены (actions_enabled: false в config.yaml)")
+        return
+    await send(update, *actions_menu())
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -507,6 +569,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await edit(update, text, logs_kb(name, tail))
             else:
                 await send(update, text, logs_kb(name, tail))
+        elif cmd == "act":
+            if not actions_on():
+                note = "Действия выключены в config.yaml"
+            else:
+                await handle_act(update, parts)
+        elif cmd in ("do", "no"):
+            note = await handle_confirm(update, cmd, parts[1])
         elif cmd == "remind":
             S.set("remind_min", int(parts[1]))
             await edit(update, *remind_view())
@@ -520,6 +589,84 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Ошибка кнопки %s", data)
         note = "Ошибка, подробности в журнале бота"
     await q.answer(note or None)
+
+
+# ---------- Действия ----------
+
+async def handle_act(update: Update, parts: list[str]) -> None:
+    chat_id = update.effective_chat.id
+    sub = parts[1]
+    if sub == "menu":
+        await edit(update, *actions_menu())
+    elif sub == "log":
+        await send(update, actions_log_text())
+    elif sub == "killmenu":
+        rows = await asyncio.to_thread(actions.top_for_kill)
+        btns = []
+        for pid, name, cpu, _ in rows:
+            btns.append([Btn(f"⛔ {name[:20]} (PID {pid}, CPU {cpu:.0f}%)", callback_data=f"act:kill:{pid}")])
+        await send(update, "⛔ <b>Какой процесс остановить?</b> (SIGTERM, процесс может завершиться не сразу)",
+                   InlineKeyboardMarkup(btns) if btns else None)
+    elif sub == "ctr":
+        name = parts[2]
+        token = ACT.ask("ctr", name, chat_id)
+        await send(update, f"♻️ Перезапустить контейнер <b>{html.escape(name)}</b>?\n"
+                           "Бот внутри будет недоступен несколько секунд.", confirm_kb(token))
+    elif sub == "svc":
+        name = parts[2]
+        if name not in action_services():
+            await send(update, f"Служба {html.escape(name)} не входит в action_services в config.yaml")
+            return
+        token = ACT.ask("svc", name, chat_id)
+        await send(update, f"♻️ Перезапустить службу <b>{html.escape(name)}</b>?", confirm_kb(token))
+    elif sub == "kill":
+        pid = int(parts[2])
+        try:
+            p = await asyncio.to_thread(lambda: actions.psutil.Process(pid))
+            name, created = p.name(), p.create_time()
+            cmdline = " ".join(p.cmdline())[:150]
+        except Exception:
+            await send(update, "Процесс уже завершился")
+            return
+        token = ACT.ask("kill", str(pid), chat_id, name=name, created=created)
+        await send(update, f"⛔ Остановить процесс <b>{html.escape(name)}</b> (PID {pid})?\n"
+                           f"<code>{html.escape(cmdline)}</code>", confirm_kb(token))
+    elif sub == "clean":
+        est = await asyncio.to_thread(ACT.cleanup_estimate)
+        token = ACT.ask("clean", "", chat_id)
+        await send(update, "🧹 <b>Очистить место?</b>\nУдалятся неиспользуемые Docker-образы и кэш сборки, "
+                           "журнал systemd сократится до 200 МБ, очистится кэш apt. Контейнеры и их данные "
+                           f"не трогаются.\n\nСколько можно освободить:\n<pre>{html.escape(est)}</pre>",
+                   confirm_kb(token))
+    elif sub == "reboot":
+        token = ACT.ask("reboot", "", chat_id)
+        await send(update, "🔄 <b>Перезагрузить сервер?</b>\nСервер и все контейнеры будут недоступны 1–2 минуты.",
+                   confirm_kb(token, "Да, перезагрузить"))
+
+
+async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
+    chat_id = update.effective_chat.id
+    p = ACT.take(token, chat_id)
+    if p is None:
+        await edit(update, "⌛ Подтверждение устарело, начните заново")
+        return None
+    if cmd == "no":
+        ACT.drop(token)
+        await edit(update, f"✖️ Отменено: {actions.describe(p)}")
+        return "Отменено"
+    if p.kind == "reboot" and p.stage == 1:
+        p.stage = 2
+        p.expires = time.time() + 60
+        await edit(update, "⚠️ <b>Точно перезагрузить сервер?</b> Это второе и последнее подтверждение.",
+                   confirm_kb(token, "🔄 Перезагрузить сейчас"))
+        return None
+    ACT.drop(token)
+    await edit(update, f"⏳ Выполняю: {actions.describe(p)}…")
+    ok, out = await asyncio.to_thread(ACT.execute, p)
+    out = out.strip()[-1500:] or ("готово" if ok else "ошибка без вывода")
+    icon = "✅" if ok else "❌"
+    await edit(update, f"{icon} {html.escape(actions.describe(p))}\n<pre>{html.escape(out)}</pre>")
+    return None
 
 
 # ---------- Фоновые задачи ----------
@@ -584,7 +731,7 @@ def build_app() -> Application:
     app = Application.builder().token(CFG["token"]).post_init(on_startup).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
-                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart),
+                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

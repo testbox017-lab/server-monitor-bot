@@ -268,6 +268,111 @@ class HistoryTest(unittest.TestCase):
         self.assertIn("диск заполнится", t)
 
 
+import importlib.machinery  # noqa: E402
+import importlib.util  # noqa: E402
+import subprocess  # noqa: E402
+
+import actions  # noqa: E402
+
+
+def load_helper():
+    path = str(ROOT / "deploy" / "monitor-bot-action")
+    loader = importlib.machinery.SourceFileLoader("monitor_bot_action", path)
+    spec = importlib.util.spec_from_loader("monitor_bot_action", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class HelperScriptTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.h = load_helper()
+        allow = TMP / "allowed-services"
+        allow.write_text("# comment\ndocker\ncron\n")
+        cls.h.ALLOWED_FILE = str(allow)
+
+    def code(self, *argv):
+        with mock.patch("builtins.print"), self.assertRaises(SystemExit) as e:
+            self.h.main(list(argv))
+        return e.exception.code
+
+    def test_restart_service_allowlist(self):
+        with mock.patch.object(self.h, "run") as run:
+            self.assertEqual(self.code("restart-service", "ssh"), 2)
+            self.assertEqual(self.code("restart-service", "docker;rm -rf /"), 2)
+            run.assert_not_called()
+            run.return_value = mock.Mock(returncode=0, stdout="active", stderr="")
+            with mock.patch("builtins.print"):
+                self.h.main(["restart-service", "cron"])
+            self.assertEqual(run.call_args_list[0].args[0], ["systemctl", "restart", "cron"])
+
+    def test_kill_rules(self):
+        self.assertEqual(self.code("kill", "1"), 2)
+        self.assertEqual(self.code("kill", "-1"), 2)
+        self.assertEqual(self.code("kill", "abc"), 2)
+        self.assertEqual(self.code("kill", "2"), 2)
+        with mock.patch.object(self.h, "proc_name", return_value="sshd"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=b"/usr/sbin/sshd")):
+            self.assertEqual(self.code("kill", "12345"), 2)
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            with mock.patch("builtins.print"):
+                self.h.main(["kill", str(child.pid)])
+            self.assertEqual(child.wait(5), -15)
+        finally:
+            child.kill()
+
+    def test_unknown_and_extra_args(self):
+        self.assertEqual(self.code("rm", "-rf"), 2)
+        self.assertEqual(self.code("reboot", "now"), 2)
+        self.assertEqual(self.code("cleanup", "--all"), 2)
+
+
+class ActionsTest(unittest.TestCase):
+    def setUp(self):
+        self.a = actions.Actions(TMP / f"actions_{self._testMethodName}.log", helper="/nonexistent")
+
+    def test_confirmations(self):
+        t = self.a.ask("ctr", "w", 42)
+        self.assertIsNone(self.a.take(t, 7))          # чужой чат
+        self.assertIsNotNone(self.a.take(t, 42))
+        self.a.pending[t].expires = time.time() - 1
+        self.assertIsNone(self.a.take(t, 42))         # истекло
+        self.assertNotIn(t, self.a.pending)
+
+    def test_execute_and_log(self):
+        with mock.patch.object(actions.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="w\n", stderr="")) as run:
+            ok, _ = self.a.execute(actions.Pending("ctr", "w", 42))
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.args[0], ["docker", "restart", "w"])
+        with mock.patch.object(actions.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="",
+                                                      stderr="sudo: a password is required")) as run:
+            ok, out = self.a.execute(actions.Pending("svc", "cron", 42))
+        self.assertFalse(ok)
+        self.assertIn("нет прав", out)
+        self.assertEqual(run.call_args.args[0], ["sudo", "-n", "/nonexistent", "restart-service", "cron"])
+        log = self.a.last()
+        self.assertEqual(len(log), 2)
+        self.assertEqual(log[0][3], "error")
+        self.assertIn("cron", log[0][2])
+
+    def test_kill_pid_reuse(self):
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            p = actions.psutil.Process(child.pid)
+            ok, out = self.a.kill(child.pid, "other-name", p.create_time())
+            self.assertFalse(ok)
+            self.assertIn("PID занят", out)
+        finally:
+            child.kill()
+            child.wait()
+        ok, out = self.a.kill(child.pid, "sleep", 0)
+        self.assertFalse(ok)
+
+
 class BotButtonsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -384,6 +489,72 @@ class BotButtonsTest(unittest.TestCase):
             q, upd = self.press("chart:24h:e")
             q.edit_message_media.assert_awaited()
             self.assertEqual(q.answer.await_args.args, (None,))
+
+    def last_markup(self, upd):
+        return upd.effective_message.reply_text.await_args.kwargs.get("reply_markup") \
+            or upd.effective_message.reply_text.await_args.args[1]
+
+    def token_from(self, upd):
+        markup = upd.effective_message.reply_text.await_args.kwargs["reply_markup"]
+        return markup.inline_keyboard[0][0].callback_data.split(":")[1]
+
+    def test_action_restart_container_flow(self):
+        b = self.bot
+        q, upd = self.press("act:ctr:weather-bot")
+        token = self.token_from(upd)
+        with mock.patch.object(b.ACT, "restart_container", return_value=(True, "weather-bot")) as rc:
+            q, upd = self.press(f"do:{token}")
+        rc.assert_called_once_with("weather-bot")
+        self.assertIn("✅", q.edit_message_text.await_args.args[0])
+        q, upd = self.press(f"do:{token}")  # повторное нажатие не выполняет второй раз
+        self.assertIn("устарело", q.edit_message_text.await_args.args[0])
+
+    def test_action_reboot_needs_two_confirmations(self):
+        b = self.bot
+        q, upd = self.press("act:reboot")
+        token = self.token_from(upd)
+        with mock.patch.object(b.ACT, "reboot", return_value=(True, "rebooting")) as rb:
+            q, _ = self.press(f"do:{token}")
+            rb.assert_not_called()
+            self.assertIn("второе", q.edit_message_text.await_args.args[0])
+            q, _ = self.press(f"do:{token}", chat=7)  # чужой чат
+            rb.assert_not_called()
+            q, _ = self.press(f"do:{token}")
+            rb.assert_called_once()
+
+    def test_action_cancel_and_service_allowlist(self):
+        b = self.bot
+        b.CFG["action_services"] = ["cron"]
+        try:
+            q, upd = self.press("act:svc:ssh")
+            self.assertIn("не входит", upd.effective_message.reply_text.await_args.args[0])
+            q, upd = self.press("act:svc:cron")
+            token = self.token_from(upd)
+            with mock.patch.object(b.ACT, "restart_service") as rs:
+                q, _ = self.press(f"no:{token}")
+                rs.assert_not_called()
+            self.assertIn("Отменено", q.edit_message_text.await_args.args[0])
+            self.assertIn("act:svc:cron", self.all_callbacks(b.alert_kb("svc:cron")))
+            self.assertNotIn("act:svc:ssh", self.all_callbacks(b.alert_kb("svc:ssh")))
+            self.assertIn("act:ctr:weather-bot", self.all_callbacks(b.alert_kb("ctr:weather-bot")))
+            self.assertIn("act:clean", self.all_callbacks(b.alert_kb("disk:/")))
+        finally:
+            b.CFG["action_services"] = []
+
+    def test_actions_menu_and_disabled(self):
+        b = self.bot
+        with mock.patch.object(b.ACT, "cleanup_estimate", return_value="docker Images: 1GB"), \
+             mock.patch.object(actions, "top_for_kill", return_value=[(123, "python", 50.0, 1.0)]):
+            for d in ("act:menu", "act:clean", "act:killmenu", "act:log"):
+                q, upd = self.press(d)
+                self.assertNotEqual(q.answer.await_args.args, ("Ошибка, подробности в журнале бота",), d)
+        b.CFG["actions_enabled"] = False
+        try:
+            self.assertNotIn("act:ctr:weather-bot", self.all_callbacks(b.alert_kb("ctr:weather-bot")))
+            q, upd = self.press("act:reboot")
+            upd.effective_message.reply_text.assert_not_awaited()
+        finally:
+            b.CFG["actions_enabled"] = True
 
     def test_stranger_blocked(self):
         b = self.bot

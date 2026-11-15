@@ -57,6 +57,24 @@ Telegram-бот следит за CPU, RAM, swap, дисками, темпера
   `venv\Scripts\pythonw.exe bot.py config.yaml`, рабочая папка = папка бота,
   «Выполнять для всех пользователей». Либо служба через NSSM.
 
+## Действия из Telegram
+Кнопка «🧰 Действия» в «Службах» или `/actions`: перезапустить контейнер или службу, остановить процесс,
+очистить место (неиспользуемые Docker-образы, кэш сборки, журнал до 200 МБ, кэш apt), перезагрузить сервер.
+Кнопки «♻️ Перезапустить» и «🧹 Очистить место» есть и под соответствующими алертами.
+Каждое действие требует подтверждения, перезагрузка — двух. Всё пишется в `actions.log`, последние — «📜 Журнал действий».
+
+Контейнеры перезапускаются через docker (пользователь бота в группе `docker`). Для остального нужен root,
+и бот получает его только через помощник `deploy/monitor-bot-action`, который проверяет аргументы:
+службы — только из `/etc/monitor-bot/allowed-services`, процессы — не ядро и не системные.
+
+```
+sudo install -o root -g root -m 755 deploy/monitor-bot-action /usr/local/sbin/monitor-bot-action
+sudo install -o root -g root -m 440 deploy/sudoers-monitor-bot /etc/sudoers.d/monitor-bot
+sudo visudo -cf /etc/sudoers.d/monitor-bot
+sudo install -D -o root -g root -m 644 deploy/allowed-services /etc/monitor-bot/allowed-services
+```
+Отключить всё: `actions_enabled: false` в `config.yaml`.
+
 ## Тесты
 ```
 python -m unittest discover tests

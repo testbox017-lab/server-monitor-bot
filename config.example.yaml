@@ -72,6 +72,18 @@ ssh_fail_threshold: 30      # неудачных попыток за 10 мину
 port_alerts: true           # новый открытый наружу порт
 update_alerts: true         # обновления безопасности Ubuntu
 
+# Проверки снаружи (добавляются и командой /probe, меню «Настройки → 🌐 Сайты и порты»)
+probes: []
+#  - https://example.com              # сайт отвечает 2xx/3xx, плюс срок SSL-сертификата
+#  - "https://example.com/health | OK" # и на странице есть текст OK
+#  - tcp://db.example.com:5432        # порт открыт
+#  - ping://1.1.1.1
+#  - dns://example.com
+probe_timeout: 10           # секунд на одну проверку
+probe_fail_count: 2         # сколько неудач подряд считать падением
+ssl_alerts: true            # предупреждать за 14, 7, 3, 1 день до окончания SSL
+ssl_warn_days: 14
+
 # Внешний контроль: бот раз в проверку открывает этот URL. Если сервер или бот упадёт, пинги прекратятся,
 # и внешний сервис сообщит вам. Например, бесплатный https://healthchecks.io (Period 1 мин, Grace 5 мин).
 heartbeat_url: null         # "https://hc-ping.com/<ваш-uuid>"

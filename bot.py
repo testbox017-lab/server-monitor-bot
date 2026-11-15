@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import html
 import logging
 import sys
@@ -23,6 +24,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 import actions
 import checks
 import history
+import probes
 import security
 from settings import Settings
 
@@ -214,6 +216,8 @@ def settings_text() -> str:
         "Docker: " + ("все контейнеры" if CFG.get("containers_auto") else "только из списка")
         + (f", ошибки в логах не чаще раза в {CFG.get('log_alert_min') or 15} мин" if CFG.get("log_alerts", True)
            else ", ошибки в логах: выкл"),
+        f"Проверок снаружи: {len(CFG.get('probes') or [])}"
+        + (f", SSL предупреждать за {CFG.get('ssl_warn_days') or 14} дн." if CFG.get("ssl_alerts", True) else ""),
         f"Часовой пояс: {CFG.get('tz')}",
     ])
 
@@ -223,7 +227,7 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn("👁 Что отслеживать", callback_data="set:watch")],
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
               [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
-              [Btn("🛡 Безопасность", callback_data="set:sec")],
+              [Btn("🛡 Безопасность", callback_data="set:sec"), Btn("🌐 Сайты и порты", callback_data="set:probes")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -346,6 +350,48 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(rows)
 
 
+def probe_id(raw: str) -> str:
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
+PROBES_HELP = ("Добавить: <code>/probe https://site.ru</code>\n"
+               "Текст на странице: <code>/probe https://site.ru/health | OK</code>\n"
+               "Порт: <code>/probe tcp://host:5432</code>, ping: <code>/probe ping://1.1.1.1</code>, "
+               "DNS: <code>/probe dns://site.ru</code>")
+
+
+def probes_view() -> tuple[str, InlineKeyboardMarkup]:
+    raws = list(CFG.get("probes") or [])
+    fails = int(CFG.get("probe_fail_count") or 2)
+    ssl_on = CFG.get("ssl_alerts", True)
+    rows = [[Btn(f"🗑 {r[:40]}", callback_data=f"pr:del:{probe_id(r)}")] for r in raws]
+    if raws:
+        rows.append([Btn("▶️ Проверить сейчас", callback_data="pr:run")])
+    rows.append([Btn(("• " if fails == n else "") + f"алерт после {n} неудач", callback_data=f"pr:fails:{n}")
+                 for n in (1, 2, 3)])
+    rows.append([Btn(f"{onoff(ssl_on)} Предупреждать об окончании SSL", callback_data="pr:ssl")])
+    rows.append([BACK])
+    body = probes.probes_text(CFG, STATE) if raws else "🌐 <b>Проверки снаружи</b>\nПока ничего не проверяется."
+    text = (f"{body}\n\nБот проверяет цели каждые {CFG.get('check_interval_sec', 60)} с. Падение сайта приходит "
+            "и в тихие часы. SSL: предупреждения за 14, 7, 3 и 1 день до окончания.\n"
+            f"Нажмите на цель, чтобы удалить её.\n\n{PROBES_HELP}")
+    return text, InlineKeyboardMarkup(rows)
+
+
+def run_probes_now() -> None:
+    raws = list(CFG.get("probes") or [])
+    now = time.time()
+    for raw, (ok, detail, ms) in probes.run_all(raws, float(CFG.get("probe_timeout") or 10)).items():
+        STATE.probe_last[raw] = [ok, detail, ms, now]
+    for host, port in probes.https_hosts(raws):
+        days = probes.ssl_days_left(host, port)
+        if days is not None:
+            k = probes.host_key(host, port)
+            STATE.ssl_days[k] = days
+            STATE.ssl_checked[k] = now
+    STATE.save()
+
+
 # ---------- Доступ и отправка ----------
 
 def allowed(update: Update) -> bool:
@@ -375,7 +421,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "👋 Бот мониторинга сервера. Управляйте кнопками внизу или командами:\n"
-        "/status /procs /mem /services /alerts /settings /logs /chart /actions\n"
+        "/status /procs /mem /services /alerts /settings /logs /chart /actions /probe\n"
         "/mute 2h — выключить уведомления, /unmute — включить", reply_markup=MAIN_KB)
 
 
@@ -432,6 +478,30 @@ async def cmd_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, "Действия выключены (actions_enabled: false в config.yaml)")
         return
     await send(update, *actions_menu())
+
+
+async def cmd_probe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    arg = " ".join(ctx.args or []).strip()
+    if not arg:
+        await send(update, *probes_view())
+        return
+    norm = probes.normalize(arg)
+    if not norm:
+        await send(update, f"Не понял цель «{html.escape(arg)}».\n\n{PROBES_HELP}")
+        return
+    raws = list(CFG.get("probes") or [])
+    if norm in raws:
+        await send(update, f"Уже проверяю: {html.escape(norm)}", None)
+        return
+    if len(raws) >= 30:
+        await send(update, "Максимум 30 целей. Удалите лишние в /probe")
+        return
+    S.set("probes", raws + [norm])
+    await asyncio.to_thread(run_probes_now)
+    await send(update, f"➕ Добавлено: {html.escape(norm)}", None)
+    await send(update, *probes_view())
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -534,7 +604,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
-                        "docker": docker_view, "sec": security_view}[sub]
+                        "docker": docker_view, "sec": security_view, "probes": probes_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -604,6 +674,26 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             STATE.save()
             note = "Следующий вход с любого IP придёт как новый"
             await edit(update, *security_view())
+        elif cmd == "pr":
+            sub = parts[1]
+            if sub == "del":
+                raws = list(CFG.get("probes") or [])
+                gone = [r for r in raws if probe_id(r) == parts[2]]
+                if gone:
+                    S.set("probes", [r for r in raws if r not in gone])
+                    note = "Удалено: " + gone[0][:150]
+                else:
+                    note = "Уже удалено"
+            elif sub == "run":
+                await asyncio.to_thread(run_probes_now)
+                note = "Проверено"
+            elif sub == "fails":
+                S.set("probe_fail_count", int(parts[2]))
+                note = "Сохранено"
+            elif sub == "ssl":
+                S.set("ssl_alerts", not CFG.get("ssl_alerts", True))
+                note = "Сохранено"
+            await edit(update, *probes_view())
         elif cmd == "act":
             if not actions_on():
                 note = "Действия выключены в config.yaml"
@@ -772,6 +862,7 @@ def build_app() -> Application:
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
+                     ("probe", cmd_probe),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

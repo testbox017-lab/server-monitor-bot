@@ -217,22 +217,32 @@ def docker(*args: str, timeout: int = 15) -> subprocess.CompletedProcess | None:
 
 
 def container_info(names: list[str]) -> dict[str, dict]:
-    """{имя: {"restarts": int, "started": str, "health": str}} через docker inspect."""
+    """{имя: {"restarts": int, "started": str, "health": str, "reason": str}} через docker inspect.
+    reason — что написала последняя проверка healthcheck (если она есть)."""
     if not names:
         return {}
-    fmt = "{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+    fmt = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+           "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
     r = docker("inspect", "--format", fmt, *names)
     out: dict[str, dict] = {}
     if r is None:
         return out
     for line in r.stdout.splitlines():  # для несуществующих имён docker пишет ошибку в stderr, остальные выводит
         parts = line.split("\t")
-        if len(parts) == 4:
+        if len(parts) >= 4:
             try:
                 restarts = int(parts[1])
             except ValueError:
                 restarts = 0
-            out[parts[0].lstrip("/")] = {"restarts": restarts, "started": parts[2], "health": parts[3]}
+            reason = ""
+            try:
+                log = json.loads(parts[4]) if len(parts) > 4 and parts[4] else []
+                if log:
+                    reason = " ".join(str(log[-1].get("Output") or "").split())[:200]
+            except (ValueError, AttributeError, TypeError):
+                pass
+            out[parts[0].lstrip("/")] = {"restarts": restarts, "started": parts[2], "health": parts[3],
+                                         "reason": reason}
     return out
 
 
@@ -506,7 +516,9 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             if st != "running":
                 res[f"ctr:{c}"] = f"❌ Контейнер {c} не работает ({st})"
             elif health == "unhealthy":
-                res[f"ctr:{c}"] = f"❌ Контейнер {c} работает, но healthcheck: unhealthy"
+                why = info.get(c, {}).get("reason")
+                res[f"ctr:{c}"] = (f"❌ Контейнер {c} работает, но завис или не в порядке (healthcheck)"
+                                   + (f": {why}" if why else ""))
             else:
                 res[f"ctr:{c}"] = None
     res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None

@@ -205,15 +205,23 @@ class DockerEventsTest(unittest.TestCase):
         out = mock.Mock(stdout="/weather-bot\t2\t2026-11-15T07:00:00Z\thealthy\n/x\tbad\t\t\n")
         with mock.patch.object(checks, "docker", return_value=out):
             info = checks.container_info(["weather-bot", "x"])
-        self.assertEqual(info["weather-bot"], {"restarts": 2, "started": "2026-11-15T07:00:00Z", "health": "healthy"})
+        self.assertEqual(info["weather-bot"], {"restarts": 2, "started": "2026-11-15T07:00:00Z", "health": "healthy",
+                                               "reason": ""})
         self.assertEqual(info["x"]["restarts"], 0)
+        log = json.dumps([{"ExitCode": 0, "Output": "ok\n"}, {"ExitCode": 1, "Output": "метка не обновлялась 400 с: бот завис\n"}])
+        out = mock.Mock(stdout=f"/w\t0\t2026-11-15T07:00:00Z\tunhealthy\t{log}\n")
+        with mock.patch.object(checks, "docker", return_value=out):
+            self.assertEqual(checks.container_info(["w"])["w"]["reason"], "метка не обновлялась 400 с: бот завис")
 
     def test_unhealthy_is_problem(self):
         cfg = {"containers": ["w"], "thresholds": {}}
         with mock.patch.object(checks, "container_states", return_value={"w": "running"}), \
              mock.patch.object(checks, "container_info", return_value={"w": {"health": "unhealthy"}}):
             res = checks.evaluate(cfg)
-        self.assertIn("unhealthy", res["ctr:w"])
+        self.assertIn("завис или не в порядке", res["ctr:w"])
+        with mock.patch.object(checks, "container_states", return_value={"w": "running"}), \
+             mock.patch.object(checks, "container_info", return_value={"w": {"health": "unhealthy", "reason": "бот завис"}}):
+            self.assertTrue(checks.evaluate(cfg)["ctr:w"].endswith(": бот завис"))
 
 
 class HistoryTest(unittest.TestCase):

@@ -417,6 +417,8 @@ class AlertState:
     acked: list[str] = field(default_factory=list)             # «Принял»: без напоминаний до восстановления
     snoozed: dict[str, float] = field(default_factory=dict)    # «Этот на 1 ч»: ключ → до какого времени молчим
     ram_trend_at: float = 0.0
+    bak_small: dict[str, str] = field(default_factory=dict)    # о какой маленькой копии уже писали
+    bak_events: list[str] = field(default_factory=list)
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -493,6 +495,13 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             else:
                 res[f"ctr:{c}"] = None
     res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None
+    if state is not None:
+        import backups
+        try:
+            res.update(backups.evaluate(cfg, state, time.time(), state.path.parent if state.path else None))
+        except Exception:
+            import logging
+            logging.getLogger("monitor_bot").exception("Ошибка проверки бэкапов")
     if state is not None and cfg.get("probes"):
         import probes
         try:
@@ -605,6 +614,9 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:
             import logging
             logging.getLogger("monitor_bot").exception("Ошибка проверки SSL")
+        if state.bak_events and not muted:
+            out += [Alert(t, None, "event") for t in state.bak_events]
+        state.bak_events = []
         if hist is not None:
             try:
                 out += smart.ram_trend_events(cfg, state, hist, now, muted, quiet)

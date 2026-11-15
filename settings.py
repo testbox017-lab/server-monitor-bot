@@ -16,7 +16,8 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
             "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
-            "anomaly_alerts", "ram_trend_alerts", "group_alerts")
+            "anomaly_alerts", "ram_trend_alerts", "group_alerts",
+            "backup_time", "backup_keep", "backup_send_daily", "backup_alerts")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -44,6 +45,11 @@ DEFAULTS = {
     "anomaly_alerts": True,         # «необычно для этого часа» по истории за 14 дней
     "ram_trend_alerts": True,       # память стабильно растёт и скоро закончится
     "group_alerts": True,           # больше 3 алертов за раз — одним сообщением
+    # Резервные копии
+    "backup_time": "03:45",         # копия самого бота каждый день (None = выкл)
+    "backup_keep": 14,              # сколько копий бота хранить
+    "backup_send_daily": False,     # присылать копии в Telegram (копия бота содержит токен!)
+    "backup_alerts": True,          # алерт, если бэкап устарел или подозрительно маленький
     # Проверки снаружи
     "probes": [],                   # https://site.ru, https://site.ru/health | OK, tcp://host:5432, ping://host, dns://name
     "probe_timeout": 10,            # секунд на одну проверку

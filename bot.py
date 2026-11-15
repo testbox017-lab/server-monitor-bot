@@ -22,6 +22,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 import actions
+import backups
 import checks
 import history
 import probes
@@ -259,7 +260,7 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
               [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
               [Btn("🛡 Безопасность", callback_data="set:sec"), Btn("🌐 Сайты и порты", callback_data="set:probes")],
-              [Btn("🧠 Умные алерты", callback_data="set:smart")],
+              [Btn("🧠 Умные алерты", callback_data="set:smart"), Btn("💾 Бэкапы", callback_data="set:backup")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -384,6 +385,56 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
 
 probe_id = short_id
 
+BACKUP_TIMES = (None, "03:45", "05:00")
+
+
+def backup_kb() -> InlineKeyboardMarkup:
+    t = CFG.get("backup_time")
+    rows = [[Btn("💾 Сделать копию бота сейчас", callback_data="bk:make")],
+            [Btn("📤 Прислать копию бота", callback_data="bk:send:own")]]
+    for i, st in enumerate(backups.watched_status() or []):
+        name = Path(st["path"]).name or st["path"]
+        rows.append([Btn(f"📤 Прислать {name[:30]}", callback_data=f"bk:send:{i}")])
+    rows.append([Btn(("• " if t == o else "") + (o or "Не делать"), callback_data=f"bk:time:{o or 'off'}")
+                 for o in BACKUP_TIMES])
+    rows.append([Btn(f"{onoff(CFG.get('backup_send_daily'))} Каждый день присылать копии сюда",
+                     callback_data="bk:daily")])
+    rows.append([Btn(f"{onoff(CFG.get('backup_alerts', True))} Алерт, если бэкап устарел", callback_data="bk:alerts")])
+    rows.append([Btn("🔄 Обновить", callback_data="bk:refresh"), BACK])
+    return InlineKeyboardMarkup(rows)
+
+
+def backup_view() -> tuple[str, InlineKeyboardMarkup]:
+    text = backups.status_text(CFG, S.dir) + (
+        "\n\nКопия бота: config.yaml (с токеном), настройки, состояние алертов, история метрик. "
+        "Лежит на этом же сервере, поэтому полезно присылать её сюда. Не пересылайте её никому.")
+    return text, backup_kb()
+
+
+async def send_file(bot, chat_id: int, path: Path, caption: str) -> None:
+    with open(path, "rb") as f:
+        await bot.send_document(chat_id, document=f, filename=path.name, caption=caption)
+
+
+async def send_backups(bot, chat_ids: list[int], own: Path | None = None, watched: bool = True) -> list[str]:
+    """Отправить копию бота и последние чужие копии. Возвращает список ошибок."""
+    errors = []
+    if own is None:
+        files = backups.own_files(S.dir)
+        own = backups.own_dir(S.dir) / files[0][0] if files else None
+    if own is not None:
+        for c in chat_ids:
+            await send_file(bot, c, own, f"💾 Копия бота {HOST}. Внутри токен, не пересылайте.")
+    if watched:
+        for i, st in enumerate(await asyncio.to_thread(backups.watched_status) or []):
+            path, err = await asyncio.to_thread(backups.fetch, i)
+            if path is None:
+                errors.append(f"{st['path']}: {err}")
+                continue
+            for c in chat_ids:
+                await send_file(bot, c, path, f"💾 {st['path']} на {HOST}")
+    return errors
+
 
 def smart_view() -> tuple[str, InlineKeyboardMarkup]:
     rows = [[Btn(f"{onoff(CFG.get('anomaly_alerts', True))} Необычная нагрузка для этого часа",
@@ -471,7 +522,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "👋 Бот мониторинга сервера. Управляйте кнопками внизу или командами:\n"
-        "/status /procs /mem /services /alerts /settings /logs /chart /actions /probe\n"
+        "/status /procs /mem /services /alerts /settings /logs /chart /actions /probe /backup\n"
         "/mute 2h — выключить уведомления, /unmute — включить", reply_markup=MAIN_KB)
 
 
@@ -554,6 +605,11 @@ async def cmd_probe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await send(update, *probes_view())
 
 
+async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await send(update, *(await asyncio.to_thread(backup_view)))
+
+
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
         await send(update, settings_text(), settings_kb())
@@ -614,6 +670,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parts = data.split(":")
     cmd = parts[0]
     note = None
+    answered = False
     try:
         if cmd == "noop":
             pass
@@ -686,7 +743,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
                         "docker": docker_view, "sec": security_view, "probes": probes_view,
-                        "smart": smart_view}[sub]
+                        "smart": smart_view, "backup": backup_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -776,6 +833,45 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 S.set("ssl_alerts", not CFG.get("ssl_alerts", True))
                 note = "Сохранено"
             await edit(update, *probes_view())
+        elif cmd == "bk":
+            sub = parts[1]
+            if sub == "make":
+                await q.answer("Делаю копию…")
+                answered = True
+                path, size, removed = await asyncio.to_thread(
+                    backups.make_backup, CONFIG_PATH, S.dir, int(CFG.get("backup_keep") or 14))
+                await send(update, f"💾 Готово: {html.escape(path.name)}, {checks.fmt_bytes(size)}"
+                                   + (f", удалено старых: {removed}" if removed else ""))
+                await edit(update, *backup_view())
+            elif sub == "send":
+                await q.answer("Отправляю…")
+                answered = True
+                chat = [update.effective_chat.id]
+                if parts[2] == "own":
+                    files = backups.own_files(S.dir)
+                    if not files:
+                        await send(update, "Копий бота ещё нет. Нажмите «Сделать копию бота сейчас».")
+                    else:
+                        await send_backups(ctx.bot, chat, watched=False)
+                else:
+                    i = int(parts[2])
+                    path, err = await asyncio.to_thread(backups.fetch, i)
+                    if path is None:
+                        await send(update, f"Не удалось: {html.escape(err)}")
+                    else:
+                        await send_file(ctx.bot, chat[0], path, f"💾 {path.name} с {HOST}")
+            else:
+                if sub == "time":
+                    S.set("backup_time", None if parts[2] == "off" else ":".join(parts[2:]))
+                    reschedule(ctx.application)
+                elif sub == "daily":
+                    S.set("backup_send_daily", not CFG.get("backup_send_daily"))
+                elif sub == "alerts":
+                    S.set("backup_alerts", not CFG.get("backup_alerts", True))
+                elif sub == "refresh":
+                    await asyncio.to_thread(backups.watched_status, None, True)
+                note = "Обновлено" if sub == "refresh" else "Сохранено"
+                await edit(update, *backup_view())
         elif cmd == "act":
             if not actions_on():
                 note = "Действия выключены в config.yaml"
@@ -790,12 +886,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             S.set("daily_summary", None if parts[1] == "off" else ":".join(parts[1:]))
             reschedule(ctx.application)
             await edit(update, *summary_view())
-        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "sm") and note is None:
+        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "sm", "bk") and note is None:
             note = "Сохранено"
     except Exception:
         log.exception("Ошибка кнопки %s", data)
         note = "Ошибка, подробности в журнале бота"
-    await q.answer(note or None)
+        if answered:
+            await send(update, "❌ " + note)
+    if not answered:
+        await q.answer(note or None)
 
 
 # ---------- Действия ----------
@@ -909,6 +1008,25 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
 
 
+async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        path, size, _ = await asyncio.to_thread(backups.make_backup, CONFIG_PATH, S.dir,
+                                                int(CFG.get("backup_keep") or 14))
+        log.info("Копия бота: %s (%s байт)", path.name, size)
+    except Exception as e:
+        log.exception("Не удалось сделать копию бота")
+        await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n❌ Не удалось сделать копию бота: {html.escape(str(e))}")
+        return
+    if CFG.get("backup_send_daily"):
+        try:
+            errors = await send_backups(ctx.bot, CFG["allowed_chats"], own=path)
+        except Exception as e:
+            log.exception("Не удалось отправить копии")
+            errors = [str(e)]
+        if errors:
+            await broadcast(ctx.bot, "❌ Не все копии удалось отправить:\n" + html.escape("\n".join(errors)))
+
+
 async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = await asyncio.to_thread(checks.summary_text, CFG, STATE, None, HIST)
     await broadcast(ctx.bot, text, status_kb())
@@ -916,7 +1034,7 @@ async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def reschedule(app: Application) -> None:
     jq = app.job_queue
-    for name in ("monitor", "summary"):
+    for name in ("monitor", "summary", "backup"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
     interval = int(CFG.get("check_interval_sec", 60))
@@ -924,6 +1042,9 @@ def reschedule(app: Application) -> None:
     if CFG.get("daily_summary"):
         h, m = map(int, CFG["daily_summary"].split(":"))
         jq.run_daily(summary_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), name="summary")
+    if CFG.get("backup_time"):
+        h, m = map(int, CFG["backup_time"].split(":"))
+        jq.run_daily(backup_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), name="backup")
     log.info("Проверка каждые %s с, сводка: %s", interval, CFG.get("daily_summary") or "выкл")
 
 
@@ -947,7 +1068,7 @@ def build_app() -> Application:
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
-                     ("probe", cmd_probe),
+                     ("probe", cmd_probe), ("backup", cmd_backup),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

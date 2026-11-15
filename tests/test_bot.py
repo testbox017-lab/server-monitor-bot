@@ -1,6 +1,7 @@
 """Проверки логики без Telegram: python -m unittest discover tests"""
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import time
@@ -18,6 +19,7 @@ CONF.write_text('token: "123456:' + "A" * 35 + '"\nallowed_chats: [42]\nservices
 
 import checks  # noqa: E402
 import history  # noqa: E402
+import backups  # noqa: E402
 import probes  # noqa: E402
 import smart  # noqa: E402
 from settings import Settings  # noqa: E402
@@ -325,10 +327,49 @@ class HelperScriptTest(unittest.TestCase):
         finally:
             child.kill()
 
+    def test_backup_status_and_fetch(self):
+        h = self.h
+        root = Path(tempfile.mkdtemp())
+        wb = root / "weather-bot"
+        wb.mkdir()
+        for name, size, age in (("weather-bot-1.tar.gz", 500, 7200), ("weather-bot-2.tar.gz", 8000, 60),
+                                ("latest.tar.gz", 8000, 30)):
+            f = wb / name
+            f.write_bytes(b"x" * size)
+            os.utime(f, (time.time() - age, time.time() - age))
+        (wb / "link.tar.gz").symlink_to(wb / "latest.tar.gz")
+        watch = root / "backup-watch"
+        watch.write_text(f"# c\n{wb} 26\nrelative/path 5\n{root / 'missing'}\n")
+        h.WATCH_FILE = str(watch)
+        h.OUTBOX = str(root / "outbox")
+        out = []
+        with mock.patch("builtins.print", side_effect=out.append):
+            h.main(["backup-status"])
+        data = json.loads(out[0])
+        self.assertEqual(len(data), 2)                       # относительный путь отброшен
+        self.assertEqual(data[0]["newest"][0], "weather-bot-2.tar.gz")  # latest и ссылки не считаются
+        self.assertEqual(data[0]["previous"][0], "weather-bot-1.tar.gz")
+        self.assertEqual(data[0]["count"], 2)
+        self.assertFalse(data[1]["exists"])
+        with mock.patch.object(h.os, "chown"), mock.patch("builtins.print", side_effect=out.append):
+            h.main(["backup-fetch", "0"])
+            h.main(["backup-fetch", "0"])                    # повтор: старый файл заменяется
+        got = json.loads(out[-1])
+        self.assertEqual(Path(got["file"]).read_bytes(), b"x" * 8000)
+        self.assertEqual(os.listdir(root / "outbox"), ["weather-bot-2.tar.gz"])
+        self.assertEqual(self.code("backup-fetch", "5"), 2)
+        self.assertEqual(self.code("backup-fetch", "../x"), 2)
+        self.assertEqual(self.code("backup-fetch", "1"), 1)  # папки нет
+        bad = root / "outbox2"
+        bad.symlink_to(root)
+        h.OUTBOX = str(bad)
+        self.assertEqual(self.code("backup-fetch", "0"), 1)  # подложенная ссылка вместо папки
+
     def test_unknown_and_extra_args(self):
         self.assertEqual(self.code("rm", "-rf"), 2)
         self.assertEqual(self.code("reboot", "now"), 2)
         self.assertEqual(self.code("cleanup", "--all"), 2)
+        self.assertEqual(self.code("backup-status", "x"), 2)
 
 
 class ActionsTest(unittest.TestCase):
@@ -559,6 +600,100 @@ class SmartTest(unittest.TestCase):
         self.assertEqual(smart.ram_trend_events(self.cfg, self.st, h, T0, False, False, top_fn=lambda: None), [])
 
 
+class BackupsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.conf = self.dir / "config.yaml"
+        self.conf.write_text("token: x\n")
+        (self.dir / "settings.json").write_text("{}")
+        (self.dir / "state.json").write_text("{}")
+        history.History(self.dir / "metrics.db").record(fake_sample(10, 20, 30, 0, 0), T0)
+        self.st = checks.AlertState()
+        self.cfg = {"backup_time": "03:45", "backup_alerts": True}
+
+    def test_make_and_prune(self):
+        import tarfile
+        for i in range(4):
+            path, size, removed = backups.make_backup(self.conf, self.dir, keep=3, now=T0 + i)
+        self.assertEqual(removed, 1)
+        self.assertEqual(len(backups.own_files(self.dir)), 3)
+        with tarfile.open(path) as t:
+            names = sorted(t.getnames())
+        self.assertEqual(names, ["config.yaml", "data/metrics.db", "data/settings.json", "data/state.json"])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(backups.own_dir(self.dir)).st_mode & 0o777, 0o700)
+
+    def watched(self, newest_age_h, prev_size=8000, new_size=8000, exists=True):
+        def fn(now):
+            return [{"path": "/var/backups/weather-bot", "max_age_h": 26, "exists": exists, "count": 2,
+                     "total": prev_size + new_size,
+                     "newest": ["w-2.tar.gz", new_size, now - newest_age_h * 3600] if newest_age_h is not None else None,
+                     "previous": ["w-1.tar.gz", prev_size, now - 86400]}]
+        return fn
+
+    def test_age_alerts(self):
+        now = time.time()
+        r = backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(3))
+        self.assertIsNone(r["bak:/var/backups/weather-bot"])
+        self.assertIn("нет ни одной", r["bak:бот"])            # своих копий ещё нет
+        backups.make_backup(self.conf, self.dir)
+        r = backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(30))
+        self.assertIsNone(r["bak:бот"])
+        self.assertIn("уже 30 ч", r["bak:/var/backups/weather-bot"])
+        r = backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(None, exists=False))
+        self.assertIn("нет", r["bak:/var/backups/weather-bot"])
+        self.cfg["backup_time"] = None                         # своё расписание выключено — не проверяем
+        self.assertNotIn("bak:бот", backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(3)))
+        self.cfg["backup_alerts"] = False
+        self.assertEqual(backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(30)), {})
+
+    def test_size_drop_once(self):
+        now = time.time()
+        backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(1, 8000, 900))
+        self.assertEqual(len(self.st.bak_events), 1)
+        self.assertIn("намного меньше", self.st.bak_events[0])
+        backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(1, 8000, 900))
+        self.assertEqual(len(self.st.bak_events), 1)          # о той же копии второй раз не пишем
+
+    def test_watched_cache_and_helper_errors(self):
+        calls = []
+
+        def helper_fn(*args):
+            calls.append(args)
+            return True, '[{"path": "/x", "max_age_h": 26, "exists": true, "count": 0, "total": 0, "newest": null, "previous": null}]'
+        backups._cache.update(at=0.0, watched=None)
+        self.assertEqual(backups.watched_status(T0, helper_fn=helper_fn)[0]["path"], "/x")
+        backups.watched_status(T0 + 60, helper_fn=helper_fn)
+        self.assertEqual(len(calls), 1)                       # кэш 30 минут
+        backups.watched_status(T0 + 60, force=True, helper_fn=lambda *a: (False, "sudo: a password is required"))
+        self.assertIsNone(backups._cache["watched"])
+        self.assertEqual(backups.fetch(0, helper_fn=lambda *a, **k: (False, "too big: 99"))[1],
+                         "файл больше 45 МБ, Telegram его не примет")
+        self.assertEqual(backups.fetch(0, helper_fn=lambda *a, **k: (True, '{"file": "/run/x/a.tgz", "size": 1}'))[0],
+                         Path("/run/x/a.tgz"))
+        backups._cache.update(at=0.0, watched=None)
+
+    def test_status_text(self):
+        backups.make_backup(self.conf, self.dir)
+        text = backups.status_text(self.cfg, self.dir, watched_fn=self.watched(30))
+        self.assertIn("✅ Бот (настройки, состояние, история): последняя", text)
+        self.assertIn("❌ /var/backups/weather-bot", text)
+        self.assertIn("помощник не настроен", backups.status_text(self.cfg, self.dir, watched_fn=lambda now: None))
+
+    def test_step_sends_events(self):
+        st = checks.AlertState()
+        st.bak_events = ["⚠️ маленькая копия"]
+        cfg = {"thresholds": {}, "remind_min": 0, "tz": "UTC"}
+        with mock.patch.object(checks, "evaluate", return_value=results()), \
+             mock.patch.object(checks, "oom_kills", return_value=None), \
+             mock.patch.object(checks, "update_seen_containers"), \
+             mock.patch.object(checks, "docker_events", return_value=[]), \
+             mock.patch("security.events", return_value=[]):
+            a = checks.step(cfg, st, T0)
+        self.assertEqual([x.text for x in a], ["⚠️ маленькая копия"])
+        self.assertEqual(st.bak_events, [])
+
+
 class ProbesTest(unittest.TestCase):
     def setUp(self):
         self.st = checks.AlertState()
@@ -684,6 +819,8 @@ class BotButtonsTest(unittest.TestCase):
         upd.effective_chat.id = chat
         upd.effective_message.reply_text = mock.AsyncMock()
         ctx = mock.MagicMock()
+        ctx.bot.send_document = mock.AsyncMock()
+        self.ctx = ctx
         with mock.patch.object(self.bot, "reschedule"):
             asyncio.run(self.bot.on_button(upd, ctx))
         return q, upd
@@ -947,6 +1084,49 @@ class BotButtonsTest(unittest.TestCase):
         self.assertFalse(b.CFG["anomaly_alerts"])
         self.press("sm:group_alerts")
         self.assertFalse(b.CFG["group_alerts"])
+        b.S.reset()
+
+    def test_backup_menu(self):
+        b = self.bot
+        b.S.reset()
+        watched = [{"path": "/var/backups/weather-bot", "max_age_h": 26, "exists": True, "count": 1,
+                    "total": 10, "newest": ["w.tar.gz", 10, time.time()], "previous": None}]
+        out = Path(tempfile.mkdtemp()) / "w.tar.gz"
+        out.write_bytes(b"data")
+        with mock.patch.object(backups, "watched_status", return_value=watched), \
+             mock.patch.object(backups, "fetch", return_value=(out, "")):
+            q, upd = self.press("set:backup")
+            self.assertIn("Резервные копии", q.edit_message_text.await_args.args[0])
+            cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+            self.assertIn("bk:send:0", cbs)
+            for d in cbs:
+                self.assertLessEqual(len(d.encode()), 64, d)
+            q, upd = self.press("bk:send:own")
+            self.assertIn("Копий бота ещё нет", upd.effective_message.reply_text.await_args.args[0])
+            q, upd = self.press("bk:make")
+            self.assertIn("Готово: monitor-bot-", upd.effective_message.reply_text.await_args.args[0])
+            self.assertEqual(q.answer.await_count, 1)
+            q, _ = self.press("bk:send:own")
+            self.ctx.bot.send_document.assert_awaited()
+            q, _ = self.press("bk:send:0")
+            self.assertEqual(self.ctx.bot.send_document.await_args.kwargs["filename"], "w.tar.gz")
+            self.press("bk:time:off")
+            self.assertIsNone(b.CFG["backup_time"])
+            self.press("bk:time:05:00")
+            self.assertEqual(b.CFG["backup_time"], "05:00")
+            self.press("bk:daily")
+            self.assertTrue(b.CFG["backup_send_daily"])
+            # ежедневная задача: копия + отправка
+            ctx = mock.MagicMock()
+            ctx.bot.send_document = mock.AsyncMock()
+            ctx.bot.send_message = mock.AsyncMock()
+            asyncio.run(b.backup_job(ctx))
+            self.assertEqual(ctx.bot.send_document.await_count, 2)
+        with mock.patch.object(backups, "make_backup", side_effect=OSError("disk full")):
+            ctx = mock.MagicMock()
+            ctx.bot.send_message = mock.AsyncMock()
+            asyncio.run(b.backup_job(ctx))
+            self.assertIn("disk full", ctx.bot.send_message.await_args.args[1])
         b.S.reset()
 
     def test_stranger_blocked(self):

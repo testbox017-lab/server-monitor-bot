@@ -103,6 +103,10 @@ class Actions:
             res = self.cleanup()
         elif p.kind == "reboot":
             res = self.reboot()
+        elif p.kind == "update":
+            res = self._helper("update", p.arg, timeout=30)
+        elif p.kind == "prunebak":
+            res = self._helper("prune-bak", p.arg, timeout=300)
         else:
             res = (False, "неизвестное действие")
         self.log(p, *res)
@@ -134,6 +138,8 @@ def describe(p: Pending) -> str:
         "kill": f"остановка процесса {p.extra.get('name', '?')} (PID {p.arg})",
         "clean": "очистка места",
         "reboot": "перезагрузка сервера",
+        "update": f"обновление бота до {p.arg[:7]}",
+        "prunebak": "удаление старых копий кода",
     }.get(p.kind, p.kind)
 
 

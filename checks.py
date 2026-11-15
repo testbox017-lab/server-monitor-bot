@@ -419,6 +419,7 @@ class AlertState:
     ram_trend_at: float = 0.0
     bak_small: dict[str, str] = field(default_factory=dict)    # о какой маленькой копии уже писали
     bak_events: list[str] = field(default_factory=list)
+    update_reported: float | None = None                       # о каком обновлении уже сообщили
 
     path: Path | None = field(default=None, repr=False, compare=False)
 

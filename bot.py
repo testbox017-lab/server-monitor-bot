@@ -9,6 +9,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import html
+import json
 import logging
 import sys
 import time
@@ -27,6 +28,7 @@ import checks
 import history
 import probes
 import security
+import updater
 from settings import Settings
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -251,6 +253,7 @@ def settings_text() -> str:
         f"Проверок снаружи: {len(CFG.get('probes') or [])}"
         + (f", SSL предупреждать за {CFG.get('ssl_warn_days') or 14} дн." if CFG.get("ssl_alerts", True) else ""),
         f"Часовой пояс: {CFG.get('tz')}",
+        f"Версия бота: {updater.short(updater.current().get('sha'))}",
     ])
 
 
@@ -261,6 +264,7 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
               [Btn("🛡 Безопасность", callback_data="set:sec"), Btn("🌐 Сайты и порты", callback_data="set:probes")],
               [Btn("🧠 Умные алерты", callback_data="set:smart"), Btn("💾 Бэкапы", callback_data="set:backup")],
+              [Btn("⬆️ Обновление бота", callback_data="set:update")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -384,6 +388,62 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
 
 
 probe_id = short_id
+
+LATEST: dict = {}  # последняя проверка GitHub: {"sha", "message", "date", "changes", "checked", "error"}
+
+
+def update_repo() -> str:
+    return str(CFG.get("update_repo") or updater.DEFAULT_REPO)
+
+
+def check_updates() -> None:
+    cur = updater.current().get("sha")
+    try:
+        info = updater.latest(update_repo())
+        info["changes"] = updater.changes(update_repo(), cur, info["sha"]) if cur and cur != info["sha"] else []
+        info["error"] = None
+    except Exception as e:  # noqa: BLE001
+        info = {"error": str(e)[:200]}
+    info["checked"] = time.time()
+    LATEST.clear()
+    LATEST.update(info)
+
+
+def update_view() -> tuple[str, InlineKeyboardMarkup]:
+    cur = updater.current()
+    lines = ["⬆️ <b>Обновление бота</b>",
+             f"Сейчас: {updater.short(cur.get('sha'))}"
+             + (f", установлена {updater.age_text(cur.get('installed'))}" if cur.get("installed") else "")]
+    rows = [[Btn("🔍 Проверить обновления", callback_data="up:check")]]
+    if LATEST.get("error"):
+        lines.append(f"Не удалось проверить GitHub: {html.escape(LATEST['error'])}")
+    elif LATEST.get("sha"):
+        if LATEST["sha"] == cur.get("sha"):
+            lines.append("✅ Установлена последняя версия")
+        else:
+            lines.append(f"Доступна версия {LATEST['sha'][:7]}: {html.escape(LATEST['message'])}")
+            for c in LATEST.get("changes") or []:
+                lines.append(f"  • {html.escape(c)}")
+            if actions_on():
+                rows.append([Btn(f"⬆️ Обновить до {LATEST['sha'][:7]}", callback_data=f"up:go:{LATEST['sha']}")])
+    lines.append("\nПеред обновлением бот прогоняет тесты новой версии и сохраняет копию текущей. Если новая версия "
+                 "не запустится, бот сам вернёт прежнюю. Помощник с правами root, sudoers и файл службы так не "
+                 "обновляются, это делается вручную.")
+    if actions_on():
+        rows.append([Btn("🧽 Удалить старые копии кода", callback_data="up:prune")])
+    rows.append([BACK])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def report_update(bot) -> None:
+    """Сообщить результат обновления один раз (файл пишет помощник)."""
+    res = await asyncio.to_thread(updater.last_result)
+    if not res or res.get("finished") == STATE.update_reported:
+        return
+    STATE.update_reported = res.get("finished")
+    STATE.save()
+    await broadcast(bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(updater.result_text(res))}")
+
 
 BACKUP_TIMES = (None, "03:45", "05:00")
 
@@ -743,7 +803,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
                         "docker": docker_view, "sec": security_view, "probes": probes_view,
-                        "smart": smart_view, "backup": backup_view}[sub]
+                        "smart": smart_view, "backup": backup_view,
+                        "update": update_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -872,6 +933,43 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await asyncio.to_thread(backups.watched_status, None, True)
                 note = "Обновлено" if sub == "refresh" else "Сохранено"
                 await edit(update, *backup_view())
+        elif cmd == "up":
+            sub = parts[1]
+            if sub == "check":
+                await asyncio.to_thread(check_updates)
+                await edit(update, *update_view())
+                note = "Не удалось проверить" if LATEST.get("error") else "Проверено"
+            elif not actions_on():
+                note = "Действия выключены в config.yaml"
+            elif sub == "go":
+                sha = parts[2]
+                if not updater.SHA_RE.match(sha):
+                    note = "Неверная версия"
+                else:
+                    token = ACT.ask("update", sha, update.effective_chat.id)
+                    changes = "".join(f"\n  • {html.escape(c)}" for c in LATEST.get("changes") or [])
+                    await send(update, f"⬆️ Обновить бота до <b>{sha[:7]}</b>?{changes}\n\n"
+                                       "Сначала тесты, потом перезапуск бота (около минуты без ответа). "
+                                       "Если что-то пойдёт не так, вернётся прежняя версия.", confirm_kb(token))
+            elif sub == "prune":
+                ok, out = await asyncio.to_thread(ACT._helper, "bak-list")
+                try:
+                    baks = json.loads(out) if ok else None
+                except ValueError:
+                    baks = None
+                if baks is None:
+                    await send(update, f"Не удалось получить список: {html.escape(out)}")
+                elif len(baks) <= 2:
+                    note = f"Старых копий: {len(baks)}, удалять нечего"
+                else:
+                    extra = baks[2:]
+                    size = sum(b["size"] for b in extra)
+                    token = ACT.ask("prunebak", "2", update.effective_chat.id)
+                    names = "\n".join(f"  • {html.escape(Path(b['path']).name)} ({checks.fmt_bytes(b['size'])})"
+                                      for b in extra)
+                    await send(update, f"🧽 Удалить {len(extra)} старых копий кода и освободить "
+                                       f"{checks.fmt_bytes(size)}? Две самые новые останутся.\n{names}",
+                               confirm_kb(token))
         elif cmd == "act":
             if not actions_on():
                 note = "Действия выключены в config.yaml"
@@ -969,6 +1067,10 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
     ACT.drop(token)
     await edit(update, f"⏳ Выполняю: {actions.describe(p)}…")
     ok, out = await asyncio.to_thread(ACT.execute, p)
+    if p.kind == "update" and ok:
+        await edit(update, f"⏳ Обновление до {p.arg[:7]} запущено. Сначала тесты новой версии, потом перезапуск. "
+                           "Результат пришлю через 1–3 минуты.")
+        return None
     out = out.strip()[-1500:] or ("готово" if ok else "ошибка без вывода")
     icon = "✅" if ok else "❌"
     await edit(update, f"{icon} {html.escape(actions.describe(p))}\n<pre>{html.escape(out)}</pre>")
@@ -1000,6 +1102,10 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ok != STATE.heartbeat_ok:
             log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
             STATE.heartbeat_ok = ok
+    try:
+        await report_update(ctx.bot)
+    except Exception:
+        log.exception("Не удалось сообщить результат обновления")
     if CFG.get("group_alerts", True) and len(alerts) > 3:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return

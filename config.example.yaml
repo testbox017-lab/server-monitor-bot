@@ -100,6 +100,9 @@ ssl_warn_days: 14
 # и внешний сервис сообщит вам. Например, бесплатный https://healthchecks.io (Period 1 мин, Grace 5 мин).
 heartbeat_url: null         # "https://hc-ping.com/<ваш-uuid>"
 
+# Обновление бота кнопкой «Настройки → ⬆️ Обновление бота» (берётся последний коммит ветки main)
+update_repo: testbox017-lab/server-monitor-bot
+
 # Действия из Telegram (перезапуск, очистка, перезагрузка) — всегда с подтверждением.
 actions_enabled: true
 # Какие службы можно перезапускать. Тот же список должен быть в /etc/monitor-bot/allowed-services.

@@ -290,6 +290,18 @@ def copy_code(src: str, dst: str, group: int) -> None:
             os.chmod(p, 0o755 if n == "monitor-bot-action" else 0o644)
 
 
+def same_config(a: str, b: str) -> bool:
+    """Совпадают ли файлы без учёта комментариев и пустых строк (у установленной копии их могли убрать)."""
+    def lines(p: str) -> list[str]:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    if filecmp.cmp(a, b, shallow=False):
+        return True
+    if a.endswith("monitor-bot-action") or b.endswith("monitor-bot-action"):
+        return False  # у программы и комментарии — часть файла, сравниваем точно
+    return lines(a) == lines(b)
+
+
 def download(sha: str, dest_dir: str) -> str:
     url = f"https://codeload.github.com/{repo()}/tar.gz/{sha}"
     archive = os.path.join(dest_dir, "src.tar.gz")
@@ -387,7 +399,7 @@ def update_run(sha: str) -> None:
             os.chown(ver, 0, group)
             for rel, installed in NOT_AUTO:
                 new = os.path.join(src, rel)
-                if os.path.exists(new) and os.path.exists(installed) and not filecmp.cmp(new, installed, shallow=False):
+                if os.path.exists(new) and os.path.exists(installed) and not same_config(new, installed):
                     result["notes"].append(f"{installed} изменился в новой версии, его нужно обновить вручную")
             result["stage"] = "restart"
             ok, state = healthy_after_restart()

@@ -18,7 +18,7 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
             "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
-            "offsite_max_age_h", "verify_backups")
+            "offsite_max_age_h", "verify_backups", "weekly_report")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -32,6 +32,7 @@ DEFAULTS = {
     "quiet_hours": None,        # {"start": "23:00", "end": "08:00"}
     "remind_min": 60,           # 0 = не напоминать
     "daily_summary": None,      # "09:00"
+    "weekly_report": "09:00",   # недельный отчёт по понедельникам (None = выкл)
     "tz": "Europe/Kyiv",
     "containers_auto": False,   # отслеживать все контейнеры, которые бот видел работающими
     "log_alerts": True,         # алерт на ошибки в логах контейнеров

@@ -14,6 +14,8 @@ WorkingDirectory=/opt/monitor_bot
 ExecStart=/opt/monitor_bot/venv/bin/python /opt/monitor_bot/bot.py /opt/monitor_bot/config.yaml
 Restart=always
 RestartSec=10
+# /var/lib/monitor_bot для settings.json и state.json, доступна на запись пользователю службы
+StateDirectory=monitor_bot
 
 [Install]
 WantedBy=multi-user.target

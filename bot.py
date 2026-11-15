@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from telegram import (InlineKeyboardButton as Btn, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
+from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -1154,7 +1154,18 @@ def reschedule(app: Application) -> None:
     log.info("Проверка каждые %s с, сводка: %s", interval, CFG.get("daily_summary") or "выкл")
 
 
+COMMANDS = [("status", "📊 Состояние сервера"), ("procs", "🔝 Процессы по CPU"), ("mem", "💾 Процессы по памяти"),
+            ("services", "⚙️ Службы и контейнеры"), ("alerts", "🚨 Активные алерты"), ("chart", "📈 График за сутки"),
+            ("logs", "📜 Логи контейнера"), ("probe", "🌐 Сайты и порты"), ("backup", "🗄 Резервные копии"),
+            ("actions", "🧰 Действия с сервером"), ("settings", "🛠 Настройки"), ("mute", "🔕 Выключить уведомления на 1 ч"),
+            ("unmute", "🔔 Включить уведомления"), ("start", "👋 Клавиатура и помощь")]
+
+
 async def on_startup(app: Application) -> None:
+    try:
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMANDS])  # кнопка «Меню» в Telegram
+    except Exception:
+        log.exception("Не удалось зарегистрировать команды")
     reboot_msg = checks.check_reboot(STATE)
     parts = []
     if CFG.get("notify_on_start", True):

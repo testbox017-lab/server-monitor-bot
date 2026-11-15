@@ -125,8 +125,9 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
             for _, ip, n in state.ssh_failed:
                 by_ip[ip] = by_ip.get(ip, 0) + n
             top = ", ".join(f"{ip} ({n})" for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])[:3])
+            worst = max(by_ip.items(), key=lambda x: x[1])[0]
             out.append(Alert(f"🛡 Подбор пароля по SSH: {total} неудачных попыток за 10 мин. Чаще всего: {top}",
-                             None, "event"))
+                             f"brute:{worst}", "event"))
             state.ssh_fail_alert_at = now
             state.log.append([now, "ssh_bruteforce"])
 

@@ -473,6 +473,10 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
         check("swap", s["swap"].percent, th.get("swap"), "🔁 Активный swap")
     for path, d in s["disks"].items():
         check(f"disk:{path}", d.percent, th.get("disk"), f"🗄 Заканчивается место на {path}")
+    if th.get("inode") is not None:
+        import network
+        for path, pct in network.inode_usage(list(s["disks"])).items():
+            check(f"inode:{path}", pct, th["inode"], f"🗂 Заканчиваются inode (файлы) на {path}")
     if th.get("temp") is not None:
         for name, t in s["temps"].items():
             res[f"temp:{name}"] = (f"🌡 Перегрев {name}: {t:.0f}°C (порог {th['temp']}°C)"

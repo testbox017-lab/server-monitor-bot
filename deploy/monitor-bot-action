@@ -17,12 +17,17 @@
     update SHA             — обновить бота до коммита SHA с GitHub (в отдельной службе systemd, с откатом)
     bak-list               — старые копии кода /opt/monitor_bot.bak-* и их размер (JSON)
     prune-bak KEEP         — удалить старые копии кода, оставить KEEP самых новых
+    io-top                 — процессы с наибольшим чтением/записью на диск за 2 секунды (JSON)
+    ban-ip IP              — запретить входящие с IP через ufw (не локальные адреса и не IP с открытой SSH-сессией)
+    unban-ip IP            — снять запрет, поставленный ботом
+    banned-list            — IP, запрещённые ботом (JSON)
 
 Обновление ставит только код бота. Сам помощник, sudoers и файл службы не обновляются автоматически:
 так код с GitHub не может расширить права бота. Если они изменились, бот об этом напишет.
 """
 import filecmp
 import grp
+import ipaddress
 import json
 import os
 import re
@@ -60,6 +65,7 @@ NOT_AUTO = (("deploy/monitor-bot-action", "/usr/local/sbin/monitor-bot-action"),
             ("deploy/sudoers-monitor-bot", "/etc/sudoers.d/monitor-bot"),
             ("deploy/monitor-bot.service", "/etc/systemd/system/monitor-bot.service"))
 SETTLE_SEC = 30
+BAN_COMMENT = "monitor-bot"
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -467,6 +473,106 @@ def prune_bak(keep_s: str) -> None:
     print(json.dumps({"removed": removed, "freed": freed}))
 
 
+# ---------- диск и фаервол ----------
+
+def read_io() -> dict[int, tuple[str, int, int]]:
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/io", encoding="utf-8") as f:
+                vals = dict(ln.split(": ") for ln in f.read().splitlines() if ": " in ln)
+            with open(f"/proc/{d}/comm", encoding="utf-8") as f:
+                name = f.read().strip()
+            out[int(d)] = (name, int(vals.get("read_bytes", 0)), int(vals.get("write_bytes", 0)))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def io_top() -> None:
+    a = read_io()
+    time.sleep(2)
+    b = read_io()
+    rows = []
+    for pid, (name, r, w) in b.items():
+        if pid in a:
+            dr, dw = r - a[pid][1], w - a[pid][2]
+            if dr or dw:
+                rows.append({"pid": pid, "name": name, "read": dr / 2, "write": dw / 2})
+    rows.sort(key=lambda x: x["read"] + x["write"], reverse=True)
+    print(json.dumps(rows[:10], ensure_ascii=False))
+
+
+def parse_ip(s: str):
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        die("bad ip")
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+        die("refused: local or special address")
+    return ip
+
+
+def ssh_peers() -> set[str]:
+    """IP, с которых сейчас открыты SSH-сессии: их не блокируем, чтобы не отрезать себя."""
+    r = run(["ss", "-H", "-tn", "state", "established", "( sport = :22 )"])
+    peers = set()
+    for ln in r.stdout.splitlines():
+        parts = ln.split()
+        if len(parts) >= 4:
+            addr = parts[-1].rpartition(":")[0].strip("[]")
+            peers.add(addr.removeprefix("::ffff:"))
+    return peers
+
+
+def ufw_active() -> bool:
+    r = run(["ufw", "status"])
+    return r.returncode == 0 and "Status: active" in r.stdout
+
+
+def banned() -> list[str]:
+    r = run(["ufw", "status"])
+    ips = []
+    for ln in r.stdout.splitlines():
+        if "DENY" in ln and f"# {BAN_COMMENT}" in ln:
+            tokens = ln.split("DENY", 1)[1].split()  # «Anywhere  DENY  203.0.113.5  # monitor-bot»
+            if tokens and tokens[0] == "IN":
+                tokens = tokens[1:]
+            src = tokens[0] if tokens and tokens[0] != "#" else ""
+            if src and src not in ips:
+                ips.append(src)
+    return ips
+
+
+def ban_ip(s: str) -> None:
+    ip = parse_ip(s)
+    if str(ip) in ssh_peers():
+        die("refused: this IP has an open SSH session")
+    if not ufw_active():
+        die("ufw is not active", 1)
+    if str(ip) in banned():
+        print(f"already banned {ip}")
+        return
+    r = run(["ufw", "insert", "1", "deny", "from", str(ip), "to", "any", "comment", BAN_COMMENT])
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or "ufw failed", 1)
+    print(f"banned {ip}")
+
+
+def unban_ip(s: str) -> None:
+    ip = parse_ip(s)
+    if str(ip) not in banned():
+        die("not banned by monitor-bot", 1)
+    r = run(["ufw", "delete", "deny", "from", str(ip), "to", "any", "comment", BAN_COMMENT])
+    if r.returncode != 0:
+        r = run(["ufw", "delete", "deny", "from", str(ip), "to", "any"])
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or "ufw failed", 1)
+    print(f"unbanned {ip}")
+
+
 def reboot() -> None:
     subprocess.Popen(["systemctl", "reboot"])
     print("rebooting")
@@ -498,6 +604,14 @@ def main(argv: list[str]) -> None:
         bak_list()
     elif cmd == "prune-bak" and len(args) == 1:
         prune_bak(args[0])
+    elif cmd == "io-top" and not args:
+        io_top()
+    elif cmd == "ban-ip" and len(args) == 1:
+        ban_ip(args[0])
+    elif cmd == "unban-ip" and len(args) == 1:
+        unban_ip(args[0])
+    elif cmd == "banned-list" and not args:
+        print(json.dumps(banned()))
     else:
         die("unknown command")
 

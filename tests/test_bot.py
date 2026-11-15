@@ -20,6 +20,7 @@ CONF.write_text('token: "123456:' + "A" * 35 + '"\nallowed_chats: [42]\nservices
 import checks  # noqa: E402
 import history  # noqa: E402
 import backups  # noqa: E402
+import network  # noqa: E402
 import probes  # noqa: E402
 import updater  # noqa: E402
 import smart  # noqa: E402
@@ -515,6 +516,65 @@ class HelperScriptTest(unittest.TestCase):
         self.assertTrue((base / "other.bak-4").exists())
         self.assertTrue((base / "monitor_bot").exists())
 
+    UFW_STATUS = """Status: active
+
+To                         Action      From
+--                         ------      ----
+Anywhere                   DENY        185.220.101.5                # monitor-bot
+Anywhere                   DENY        94.102.61.1
+22/tcp                     ALLOW       Anywhere
+Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
+"""
+
+    def fake_run(self, peers=""):
+        calls = []
+
+        def run(cmd, timeout=300):
+            calls.append(cmd)
+            if cmd[:2] == ["ufw", "status"]:
+                return mock.Mock(returncode=0, stdout=self.UFW_STATUS, stderr="")
+            if cmd[0] == "ss":
+                return mock.Mock(returncode=0, stdout=peers, stderr="")
+            return mock.Mock(returncode=0, stdout="Rule inserted", stderr="")
+        return run, calls
+
+    def test_ban_rules(self):
+        h = self.h
+        run, calls = self.fake_run("0 0 2.29.199.153:22 91.240.118.7:51234\n")
+        with mock.patch.object(h, "run", run):
+            self.assertEqual(h.banned(), ["185.220.101.5", "2001:db8::7"])   # только поставленные ботом
+            self.assertEqual(self.code("ban-ip", "10.0.0.5"), 2)
+            self.assertEqual(self.code("ban-ip", "127.0.0.1"), 2)
+            self.assertEqual(self.code("ban-ip", "1.2.3.4; rm -rf /"), 2)
+            self.assertEqual(self.code("ban-ip", "91.240.118.7"), 2)         # открытая SSH-сессия
+            with mock.patch("builtins.print"):
+                h.main(["ban-ip", "45.155.205.233"])
+            self.assertEqual(calls[-1], ["ufw", "insert", "1", "deny", "from", "45.155.205.233", "to", "any",
+                                         "comment", "monitor-bot"])
+            n = len(calls)
+            with mock.patch("builtins.print"):
+                h.main(["ban-ip", "185.220.101.5"])                          # уже заблокирован
+            self.assertFalse(any(c[:2] == ["ufw", "insert"] for c in calls[n:]))
+            self.assertEqual(self.code("unban-ip", "94.102.61.1"), 1)      # блокировал не бот
+            with mock.patch("builtins.print"):
+                h.main(["unban-ip", "185.220.101.5"])
+            self.assertEqual(calls[-1][:3], ["ufw", "delete", "deny"])
+
+    def test_ssh_peers_parse(self):
+        h = self.h
+        out = "0 0 2.29.199.153:22 91.240.118.7:51234\n0 0 [::ffff:2.29.199.153]:22 [::ffff:80.94.95.3]:4000\n"
+        with mock.patch.object(h, "run", return_value=mock.Mock(returncode=0, stdout=out, stderr="")):
+            self.assertEqual(h.ssh_peers(), {"91.240.118.7", "80.94.95.3"})
+
+    def test_io_top(self):
+        h = self.h
+        snaps = [{1: ("a", 0, 0), 2: ("b", 100, 0)}, {1: ("a", 4000, 2000), 2: ("b", 100, 0), 3: ("c", 5, 5)}]
+        out = []
+        with mock.patch.object(h, "read_io", side_effect=snaps), mock.patch.object(h.time, "sleep"), \
+             mock.patch("builtins.print", side_effect=out.append):
+            h.main(["io-top"])
+        self.assertEqual(json.loads(out[0]), [{"pid": 1, "name": "a", "read": 2000.0, "write": 1000.0}])
+
     def test_unknown_and_extra_args(self):
         self.assertEqual(self.code("rm", "-rf"), 2)
         self.assertEqual(self.code("reboot", "now"), 2)
@@ -613,6 +673,7 @@ class SecurityTest(unittest.TestCase):
         texts = [x.text for x in a]
         self.assertTrue(any("нового IP 203.0.113.5" in t for t in texts), texts)
         self.assertTrue(any("Подбор пароля" in t and "198.51.100.7 (2)" in t for t in texts), texts)
+        self.assertIn("brute:198.51.100.7", [x.key for x in a])
         a = self.ev(T0 + 120)                       # тот же IP — уже известен, подбор — не чаще раза в час
         self.assertEqual(a, [])
         self.cfg["ssh_alert_all_logins"] = True
@@ -871,6 +932,35 @@ class UpdaterTest(unittest.TestCase):
         self.assertIn("⚠️ помощник изменился", t)
         self.assertIn("Тесты: FAILED", updater.result_text({"ok": False, "sha": "b" * 40, "stage": "tests",
                                                              "error": "тесты не прошли", "tests": "FAILED"}))
+
+
+class NetworkTest(unittest.TestCase):
+    def test_remote_ips(self):
+        C = lambda ip, st="ESTABLISHED": NS(status=st, raddr=(ip, 443) if ip else ())
+        conns = [C("140.82.121.3"), C("140.82.121.3"), C("::ffff:1.1.1.1"), C("127.0.0.1"), C("10.0.0.2"),
+                 C("8.8.8.8", "TIME_WAIT"), C(None)]
+        self.assertEqual(network.remote_ips(conns=conns), [("140.82.121.3", 2), ("1.1.1.1", 1)])
+
+    def test_net_text(self):
+        h = mock.Mock()
+        h.peaks.return_value = {"rx": 5 * 1024 ** 2, "tx": 1024 ** 2}
+        text = network.net_text({"disks": ["/"]}, None, lambda *a, **k: (True, '[{"pid": 5, "name": "dockerd", "read": 1024, "write": 2048}]'),
+                                rates_fn=lambda: [("eth0", 2048.0, 1024.0)], ips_fn=lambda: [("140.82.121.3", 3)])
+        self.assertIn("eth0: ↓ 2.0 КБ/с ↑ 1.0 КБ/с", text)
+        self.assertIn("140.82.121.3: 3", text)
+        self.assertIn("dockerd (5): 1.0 КБ / 2.0 КБ", text)
+        self.assertIn("Inode на /:", text)
+        text = network.net_text({}, h, lambda *a, **k: (False, "unknown command"), rates_fn=lambda: [], ips_fn=lambda: [])
+        self.assertIn("помощник не обновлён", text)
+        self.assertIn("Трафик за сутки", text)
+
+    def test_inode_alert(self):
+        with mock.patch.object(network, "inode_usage", return_value={"/": 95.0}):
+            r = checks.evaluate({"thresholds": {"inode": 90}, "disks": ["/"]})
+        self.assertIn("inode", r["inode:/"])
+        with mock.patch.object(network, "inode_usage", return_value={"/": 13.0}):
+            r = checks.evaluate({"thresholds": {"inode": 90}, "disks": ["/"]})
+        self.assertIsNone(r["inode:/"])
 
 
 class ProbesTest(unittest.TestCase):
@@ -1373,6 +1463,39 @@ class BotButtonsTest(unittest.TestCase):
         with mock.patch.object(checks, "check_reboot", return_value=None):
             asyncio.run(b.on_startup(app2))
         self.assertEqual(len(app2.bot.set_my_commands.await_args.args[0]), len(b.COMMANDS))
+
+    def test_ban_flow(self):
+        b = self.bot
+        key = "brute:185.220.101.5"
+        cbs = self.all_callbacks(b.alert_kb(key))
+        self.assertIn("act:ban:185.220.101.5", cbs)
+        q, upd = self.press("act:ban:2a00:1450:4001::7")                    # IPv6 с двоеточиями
+        self.assertIn("2a00:1450:4001::7", upd.effective_message.reply_text.await_args.args[0])
+        q, upd = self.press("act:ban:185.220.101.5")
+        yes = self.all_callbacks(upd.effective_message.reply_text.await_args.kwargs["reply_markup"])[0]
+        with mock.patch.object(b.ACT, "_helper", return_value=(False, "с этого IP сейчас открыта SSH-сессия, не блокирую")) as hp:
+            q, _ = self.press(yes)
+        hp.assert_called_once_with("ban-ip", "185.220.101.5", timeout=30)
+        self.assertIn("SSH-сессия", q.edit_message_text.await_args.args[0])
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, '["185.220.101.5"]')):
+            q, upd = self.press("act:banned")
+        m = upd.effective_message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(self.all_callbacks(m), ["act:unban:185.220.101.5"])
+        b.STATE.known_ips = ["80.94.95.4"]
+        q, upd = self.press("act:ban:80.94.95.4")
+        self.assertIn("раньше был успешный вход", upd.effective_message.reply_text.await_args.args[0])
+        q, upd = self.press("act:ban:10.1.1.1")
+        self.assertIn("Локальные адреса", upd.effective_message.reply_text.await_args.args[0])
+        b.STATE.known_ips = []
+
+    def test_net_button(self):
+        b = self.bot
+        with mock.patch.object(network, "net_text", return_value="🌐 <b>Сеть и диск</b>") as nt:
+            q, upd = self.press("net")
+            self.assertIn("Сеть и диск", upd.effective_message.reply_text.await_args.args[0])
+            q, _ = self.press("net:r")
+            q.edit_message_text.assert_awaited()
+        self.assertIn("net", self.all_callbacks(b.status_kb()))
 
     def test_stranger_blocked(self):
         b = self.bot

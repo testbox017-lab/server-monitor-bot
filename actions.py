@@ -11,6 +11,13 @@ import psutil
 
 HELPER = "/usr/local/sbin/monitor-bot-action"
 CONFIRM_TTL = 120  # секунд на подтверждение
+HELPER_ERRORS = {
+    "refused: this IP has an open SSH session": "с этого IP сейчас открыта SSH-сессия, не блокирую",
+    "refused: local or special address": "это локальный или служебный адрес",
+    "ufw is not active": "фаервол ufw выключен",
+    "not banned by monitor-bot": "этот IP блокировал не бот",
+    "unknown command": "помощник на сервере не обновлён (нет такой команды)",
+}
 
 
 @dataclass
@@ -61,6 +68,7 @@ class Actions:
         out = (r.stdout + r.stderr).strip()
         if "a password is required" in out or "not allowed" in out:
             out = "нет прав: на сервере не настроено правило sudo для бота (см. README)"
+        out = HELPER_ERRORS.get(out.strip(), out)
         return r.returncode == 0, out
 
     def restart_container(self, name: str) -> tuple[bool, str]:
@@ -105,6 +113,10 @@ class Actions:
             res = self.reboot()
         elif p.kind == "update":
             res = self._helper("update", p.arg, timeout=30)
+        elif p.kind == "ban":
+            res = self._helper("ban-ip", p.arg, timeout=30)
+        elif p.kind == "unban":
+            res = self._helper("unban-ip", p.arg, timeout=30)
         elif p.kind == "prunebak":
             res = self._helper("prune-bak", p.arg, timeout=300)
         else:
@@ -140,6 +152,8 @@ def describe(p: Pending) -> str:
         "reboot": "перезагрузка сервера",
         "update": f"обновление бота до {p.arg[:7]}",
         "prunebak": "удаление старых копий кода",
+        "ban": f"блокировка IP {p.arg}",
+        "unban": f"разблокировка IP {p.arg}",
     }.get(p.kind, p.kind)
 
 

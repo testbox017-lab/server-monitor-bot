@@ -21,6 +21,7 @@ import checks  # noqa: E402
 import history  # noqa: E402
 import backups  # noqa: E402
 import probes  # noqa: E402
+import updater  # noqa: E402
 import smart  # noqa: E402
 from settings import Settings  # noqa: E402
 from types import SimpleNamespace as NS  # noqa: E402
@@ -365,6 +366,143 @@ class HelperScriptTest(unittest.TestCase):
         h.OUTBOX = str(bad)
         self.assertEqual(self.code("backup-fetch", "0"), 1)  # подложенная ссылка вместо папки
 
+    def make_tree(self, root, version, extra=None):
+        root.mkdir(parents=True)
+        (root / "bot.py").write_text(f"V = {version!r}\n")
+        (root / "requirements.txt").write_text("psutil\n")
+        (root / "tests").mkdir()
+        (root / "tests" / "test_x.py").write_text("")
+        (root / "deploy").mkdir()
+        (root / "deploy" / "monitor-bot-action").write_text(f"# helper {version}\n")
+        for k, v in (extra or {}).items():
+            (root / k).write_text(v)
+        return root
+
+    def update_env(self):
+        h = self.h
+        base = Path(tempfile.mkdtemp())
+        app = self.make_tree(base / "monitor_bot", "old", {"config.yaml": "token: secret\n", "old_only.py": "x"})
+        (app / "venv").mkdir()
+        (app / "VERSION").write_text(json.dumps({"sha": "a" * 40}))
+        new_src = self.make_tree(base / "dl" / "server-monitor-bot-bbb", "new", {"new_module.py": "y"})
+        installed_helper = base / "installed-helper"
+        installed_helper.write_text("# helper old\n")
+        patches = [mock.patch.object(h, "APP_DIR", str(app)), mock.patch.object(h, "RESULT_FILE", str(base / "res.json")),
+                   mock.patch.object(h, "LOCK_FILE", str(base / "lock")),
+                   mock.patch.object(h, "NOT_AUTO", (("deploy/monitor-bot-action", str(installed_helper)),)),
+                   mock.patch.object(h, "download", return_value=str(new_src)),
+                   mock.patch.object(h.os, "chown"), mock.patch.object(h, "gid", return_value=0)]
+        for p_ in patches:
+            p_.start()
+            self.addCleanup(p_.stop)
+        return base, app
+
+    def test_update_success(self):
+        h = self.h
+        base, app = self.update_env()
+        ok_tests = mock.Mock(returncode=0, stdout="", stderr="Ran 79 tests\n\nOK")
+        with mock.patch.object(h.subprocess, "run", return_value=ok_tests), \
+             mock.patch.object(h, "healthy_after_restart", return_value=(True, "active")):
+            h.update_run("b" * 40)
+        res = json.loads((base / "res.json").read_text())
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["from"], "a" * 40)
+        self.assertEqual((app / "bot.py").read_text(), "V = 'new'\n")
+        self.assertTrue((app / "new_module.py").exists())
+        self.assertEqual((app / "config.yaml").read_text(), "token: secret\n")   # конфиг не тронут
+        self.assertEqual(json.loads((app / "VERSION").read_text())["sha"], "b" * 40)
+        self.assertTrue(any("обновить вручную" in n for n in res["notes"]))
+        bak = Path(res["backup"])
+        self.assertEqual((bak / "bot.py").read_text(), "V = 'old'\n")
+        self.assertFalse((bak / "config.yaml").exists())
+        self.assertFalse((base / "lock").exists())
+
+    def test_update_tests_fail_changes_nothing(self):
+        h = self.h
+        base, app = self.update_env()
+        bad = mock.Mock(returncode=1, stdout="", stderr="FAILED (failures=1)")
+        with mock.patch.object(h.subprocess, "run", return_value=bad), \
+             mock.patch.object(h, "healthy_after_restart") as restart:
+            h.update_run("b" * 40)
+        restart.assert_not_called()
+        res = json.loads((base / "res.json").read_text())
+        self.assertFalse(res["ok"])
+        self.assertIn("тесты", res["error"])
+        self.assertEqual((app / "bot.py").read_text(), "V = 'old'\n")
+
+    def test_update_rollback(self):
+        h = self.h
+        base, app = self.update_env()
+        ok_tests = mock.Mock(returncode=0, stdout="", stderr="OK")
+        with mock.patch.object(h.subprocess, "run", return_value=ok_tests), \
+             mock.patch.object(h, "healthy_after_restart", side_effect=[(False, "activating, автоперезапусков 2"),
+                                                                       (True, "active")]):
+            h.update_run("b" * 40)
+        res = json.loads((base / "res.json").read_text())
+        self.assertEqual(res["stage"], "rolled_back")
+        self.assertEqual((app / "bot.py").read_text(), "V = 'old'\n")
+        self.assertFalse((app / "new_module.py").exists())
+        self.assertTrue((app / "old_only.py").exists())
+        self.assertEqual(json.loads((app / "VERSION").read_text())["sha"], "a" * 40)
+
+    def test_update_args_and_lock(self):
+        h = self.h
+        self.assertEqual(self.code("update", "main"), 2)
+        self.assertEqual(self.code("update", "b" * 39), 2)
+        self.assertEqual(self.code("update-run", "../../etc"), 2)
+        base, _ = self.update_env()
+        (base / "lock").write_text("")
+        self.assertEqual(self.code("update", "b" * 40), 1)
+        with mock.patch.object(h, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run:
+            (base / "lock").unlink()
+            with mock.patch("builtins.print"):
+                h.main(["update", "b" * 40])
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[0], "systemd-run")
+        self.assertEqual(cmd[-2:], ["update-run", "b" * 40])
+
+    def test_download_extracts_single_dir(self):
+        import io
+        import tarfile as tf
+        h = self.h
+        buf = io.BytesIO()
+        with tf.open(fileobj=buf, mode="w:gz") as t:
+            data = b"print(1)"
+            info = tf.TarInfo("server-monitor-bot-abc/bot.py")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = io.BytesIO(buf.getvalue())
+        d = tempfile.mkdtemp()
+        with mock.patch.object(h.urllib.request, "urlopen", return_value=resp) as uo, \
+             mock.patch.object(h, "repo", return_value="o/r"):
+            src = h.download("b" * 40, d)
+        self.assertEqual(Path(src, "bot.py").read_bytes(), b"print(1)")
+        self.assertEqual(uo.call_args.args[0].full_url, "https://codeload.github.com/o/r/tar.gz/" + "b" * 40)
+
+    def test_prune_bak(self):
+        h = self.h
+        base = Path(tempfile.mkdtemp())
+        (base / "monitor_bot").mkdir()
+        for i, n in enumerate(("monitor_bot.bak-1", "monitor_bot.bak-2", "monitor_bot.bak-3", "other.bak-4")):
+            (base / n).mkdir()
+            (base / n / "f").write_text("x" * 100)
+            os.utime(base / n, (T0 + i, T0 + i))
+        (base / "monitor_bot.bak-link").symlink_to(base / "monitor_bot")
+        with mock.patch.object(h, "APP_DIR", str(base / "monitor_bot")), \
+             mock.patch.object(h, "du_bytes", return_value=100):
+            out = []
+            with mock.patch("builtins.print", side_effect=out.append):
+                h.main(["bak-list"])
+                self.assertEqual([Path(x["path"]).name for x in json.loads(out[0])],
+                                 ["monitor_bot.bak-3", "monitor_bot.bak-2", "monitor_bot.bak-1"])
+                h.main(["prune-bak", "2"])
+            self.assertEqual(json.loads(out[1])["removed"], ["monitor_bot.bak-1"])
+            self.assertEqual(self.code("prune-bak", "0"), 2)
+            self.assertEqual(self.code("prune-bak", "x"), 2)
+        self.assertTrue((base / "other.bak-4").exists())
+        self.assertTrue((base / "monitor_bot").exists())
+
     def test_unknown_and_extra_args(self):
         self.assertEqual(self.code("rm", "-rf"), 2)
         self.assertEqual(self.code("reboot", "now"), 2)
@@ -692,6 +830,35 @@ class BackupsTest(unittest.TestCase):
             a = checks.step(cfg, st, T0)
         self.assertEqual([x.text for x in a], ["⚠️ маленькая копия"])
         self.assertEqual(st.bak_events, [])
+
+
+class UpdaterTest(unittest.TestCase):
+    def test_version_and_api(self):
+        d = Path(tempfile.mkdtemp())
+        self.assertEqual(updater.current(d), {})
+        (d / "VERSION").write_text(json.dumps({"sha": "c" * 40, "installed": T0}))
+        self.assertEqual(updater.short(updater.current(d)["sha"]), "ccccccc")
+        (d / "VERSION").write_text('{"sha": "nope"}')
+        self.assertEqual(updater.current(d), {})
+
+        def api_fn(path):
+            if "/commits/" in path:
+                return {"sha": "d" * 40, "commit": {"message": "Этап 11\n\nподробности",
+                                                    "committer": {"date": "2026-11-15T10:00:00Z"}}}
+            return {"commits": [{"commit": {"message": "Изменение A"}, "parents": [1]},
+                                {"commit": {"message": "Merge pull request"}, "parents": [1, 2]}]}
+        self.assertEqual(updater.latest("o/r", api_fn=api_fn)["message"], "Этап 11")
+        self.assertEqual(updater.changes("o/r", "a", "b", api_fn=api_fn), ["Изменение A"])
+
+    def test_result_text(self):
+        self.assertIn("✅ Бот обновлён до bbbbbbb (было aaaaaaa)",
+                      updater.result_text({"ok": True, "sha": "b" * 40, "from": "a" * 40, "notes": []}))
+        t = updater.result_text({"ok": False, "sha": "b" * 40, "stage": "rolled_back", "error": "не запустилась",
+                                 "notes": ["помощник изменился"]})
+        self.assertIn("Работает прежняя версия", t)
+        self.assertIn("⚠️ помощник изменился", t)
+        self.assertIn("Тесты: FAILED", updater.result_text({"ok": False, "sha": "b" * 40, "stage": "tests",
+                                                             "error": "тесты не прошли", "tests": "FAILED"}))
 
 
 class ProbesTest(unittest.TestCase):
@@ -1128,6 +1295,56 @@ class BotButtonsTest(unittest.TestCase):
             asyncio.run(b.backup_job(ctx))
             self.assertIn("disk full", ctx.bot.send_message.await_args.args[1])
         b.S.reset()
+
+    def test_update_menu_flow(self):
+        b = self.bot
+        b.S.reset()
+        b.LATEST.clear()
+        with mock.patch.object(updater, "current", return_value={"sha": "a" * 40, "installed": time.time()}), \
+             mock.patch.object(updater, "latest", return_value={"sha": "b" * 40, "message": "Этап 11", "date": ""}), \
+             mock.patch.object(updater, "changes", return_value=["Обновление кнопкой <b>"]):
+            q, _ = self.press("up:check")
+            text = q.edit_message_text.await_args.args[0]
+            self.assertIn("Доступна версия bbbbbbb", text)
+            self.assertIn("&lt;b&gt;", text)
+            cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+            self.assertIn("up:go:" + "b" * 40, cbs)
+            for d in cbs:
+                self.assertLessEqual(len(d.encode()), 64, d)
+            q, upd = self.press("up:go:" + "b" * 40)
+            markup = upd.effective_message.reply_text.await_args.kwargs["reply_markup"]
+            yes = self.all_callbacks(markup)[0]
+            with mock.patch.object(b.ACT, "_helper", return_value=(True, "started")) as hp:
+                q, _ = self.press(yes)
+            hp.assert_called_once_with("update", "b" * 40, timeout=30)
+            self.assertIn("запущено", q.edit_message_text.await_args.args[0])
+            q, _ = self.press("up:go:notasha")
+            self.assertEqual(q.answer.await_args.args[0], "Неверная версия")
+        with mock.patch.object(updater, "latest", side_effect=OSError("no network")):
+            q, _ = self.press("up:check")
+            self.assertIn("Не удалось проверить GitHub", q.edit_message_text.await_args.args[0])
+        baks = [{"path": f"/opt/monitor_bot.bak-{i}", "mtime": 0, "size": 1000} for i in range(4)]
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, json.dumps(baks))):
+            q, upd = self.press("up:prune")
+            self.assertIn("Удалить 2 старых копий", upd.effective_message.reply_text.await_args.args[0])
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, json.dumps(baks[:2]))):
+            q, _ = self.press("up:prune")
+            self.assertIn("удалять нечего", q.answer.await_args.args[0])
+        b.LATEST.clear()
+
+    def test_report_update_once(self):
+        b = self.bot
+        sent = []
+
+        async def fake_broadcast(bot, text, markup=None):
+            sent.append(text)
+        res = {"ok": True, "sha": "b" * 40, "from": "a" * 40, "finished": 123.0, "notes": []}
+        b.STATE.update_reported = None
+        with mock.patch.object(updater, "last_result", return_value=res), mock.patch.object(b, "broadcast", fake_broadcast):
+            asyncio.run(b.report_update(None))
+            asyncio.run(b.report_update(None))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("обновлён до bbbbbbb", sent[0])
 
     def test_stranger_blocked(self):
         b = self.bot

@@ -14,7 +14,14 @@
     reboot                 — перезагрузка сервера
     backup-status          — свежие копии в папках из /etc/monitor-bot/backup-watch (JSON)
     backup-fetch N         — последнюю копию из N-й папки backup-watch положить боту для отправки в Telegram
+    update SHA             — обновить бота до коммита SHA с GitHub (в отдельной службе systemd, с откатом)
+    bak-list               — старые копии кода /opt/monitor_bot.bak-* и их размер (JSON)
+    prune-bak KEEP         — удалить старые копии кода, оставить KEEP самых новых
+
+Обновление ставит только код бота. Сам помощник, sudoers и файл службы не обновляются автоматически:
+так код с GitHub не может расширить права бота. Если они изменились, бот об этом напишет.
 """
+import filecmp
 import grp
 import json
 import os
@@ -23,6 +30,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
 
 ALLOWED_FILE = "/etc/monitor-bot/allowed-services"
 PROTECTED = {"systemd", "init", "sshd", "sshd-session", "dockerd", "containerd", "systemd-journald",
@@ -33,6 +44,22 @@ WATCH_FILE = "/etc/monitor-bot/backup-watch"
 OUTBOX = "/run/monitor-bot-outbox"
 BOT_GROUP = "monitor"
 MAX_SEND = 45 * 1024 * 1024  # Telegram принимает от бота файлы до 50 МБ
+REPO_FILE = "/etc/monitor-bot/update-repo"
+DEFAULT_REPO = "testbox017-lab/server-monitor-bot"
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+APP_DIR = "/opt/monitor_bot"
+VENV_PY = "/opt/monitor_bot/venv/bin/python"
+SERVICE = "monitor-bot"
+BAK_RE = re.compile(r"^monitor_bot\.bak-[A-Za-z0-9_.-]{1,64}$")
+RESULT_FILE = "/run/monitor-bot-update.json"
+LOCK_FILE = "/run/monitor-bot-update.lock"
+CODE_DIRS = ("tests", "deploy")
+CODE_FILES = ("requirements.txt", "README.md", "config.example.yaml")
+NOT_AUTO = (("deploy/monitor-bot-action", "/usr/local/sbin/monitor-bot-action"),
+            ("deploy/sudoers-monitor-bot", "/etc/sudoers.d/monitor-bot"),
+            ("deploy/monitor-bot.service", "/etc/systemd/system/monitor-bot.service"))
+SETTLE_SEC = 30
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -208,6 +235,226 @@ def backup_fetch(n_s: str) -> None:
     print(json.dumps({"file": dest, "size": size}))
 
 
+# ---------- обновление ----------
+
+def repo() -> str:
+    try:
+        with open(REPO_FILE, encoding="utf-8") as f:
+            r = f.read().strip()
+    except OSError:
+        r = DEFAULT_REPO
+    if not REPO_RE.match(r):
+        die("bad repo in " + REPO_FILE)
+    return r
+
+
+def write_result(data: dict) -> None:
+    data["finished"] = time.time()
+    tmp = RESULT_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, RESULT_FILE)
+
+
+def code_items(root: str) -> list[str]:
+    """Что считается кодом бота: *.py в корне, служебные файлы, tests/ и deploy/. Без config.yaml и venv."""
+    items = [n for n in sorted(os.listdir(root)) if n.endswith(".py") and os.path.isfile(os.path.join(root, n))]
+    items += [n for n in CODE_FILES + CODE_DIRS if os.path.exists(os.path.join(root, n))]
+    return items
+
+
+def copy_code(src: str, dst: str, group: int) -> None:
+    for name in code_items(src):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.isdir(s):
+            if os.path.isdir(d) and not os.path.islink(d):
+                shutil.rmtree(d)
+            shutil.copytree(s, d, symlinks=False, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copyfile(s, d)
+    for base, dirs, files in os.walk(dst):
+        if base.startswith(os.path.join(dst, "venv")):
+            continue
+        for n in dirs:
+            if n != "venv":
+                os.chown(os.path.join(base, n), 0, group)
+                os.chmod(os.path.join(base, n), 0o755)
+        for n in files:
+            p = os.path.join(base, n)
+            if os.path.islink(p) or n == "config.yaml":
+                continue
+            if base == dst and n not in code_items(dst):
+                continue
+            os.chown(p, 0, group)
+            os.chmod(p, 0o755 if n == "monitor-bot-action" else 0o644)
+
+
+def download(sha: str, dest_dir: str) -> str:
+    url = f"https://codeload.github.com/{repo()}/tar.gz/{sha}"
+    archive = os.path.join(dest_dir, "src.tar.gz")
+    req = urllib.request.Request(url, headers={"User-Agent": "monitor-bot-updater"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(archive, "wb") as f:
+        shutil.copyfileobj(r, f)
+    out = os.path.join(dest_dir, "src")
+    with tarfile.open(archive) as t:
+        t.extractall(out, filter="data")
+    tops = os.listdir(out)
+    if len(tops) != 1:
+        raise RuntimeError("unexpected archive layout")
+    return os.path.join(out, tops[0])
+
+
+def service_state() -> tuple[str, int]:
+    r = run(["systemctl", "show", SERVICE, "-p", "ActiveState", "-p", "NRestarts"])
+    props = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+    try:
+        n = int(props.get("NRestarts", "0"))
+    except ValueError:
+        n = 0
+    return props.get("ActiveState", "unknown"), n
+
+
+def healthy_after_restart() -> tuple[bool, str]:
+    run(["systemctl", "restart", SERVICE], timeout=120)
+    time.sleep(SETTLE_SEC)
+    state, restarts = service_state()
+    if state == "active" and restarts == 0:
+        return True, "active"
+    return False, f"{state}, автоперезапусков {restarts}"
+
+
+def read_version() -> dict:
+    try:
+        with open(os.path.join(APP_DIR, "VERSION"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def update_run(sha: str) -> None:
+    """Выполняется в отдельной службе systemd, чтобы перезапуск бота её не убил."""
+    if not SHA_RE.match(sha):
+        die("bad sha")
+    try:
+        lock = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        die("update already running", 1)
+    old = read_version()
+    result = {"sha": sha, "from": old.get("sha"), "ok": False, "stage": "download", "notes": []}
+    group = gid()
+    try:
+        with tempfile.TemporaryDirectory(prefix="monitor-bot-update-") as tmp:
+            os.chmod(tmp, 0o755)
+            src = download(sha, tmp)
+            for base, dirs, files in os.walk(tmp):  # тесты идут от пользователя бота
+                for n in dirs:
+                    os.chmod(os.path.join(base, n), 0o755)
+                for n in files:
+                    os.chmod(os.path.join(base, n), 0o644)
+            result["stage"] = "tests"
+            r = subprocess.run(["runuser", "-u", BOT_GROUP, "--", VENV_PY, "-m", "unittest", "discover", "tests"],
+                               cwd=src, capture_output=True, text=True, timeout=600)
+            tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
+            result["tests"] = " ".join(tail)[-300:]
+            if r.returncode != 0:
+                result["error"] = "тесты новой версии не прошли, ничего не менял"
+                return
+            result["stage"] = "backup"
+            bak = os.path.join(os.path.dirname(APP_DIR), "monitor_bot.bak-update-" + time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(bak)
+            for name in code_items(APP_DIR) + (["VERSION"] if os.path.exists(os.path.join(APP_DIR, "VERSION")) else []):
+                s_, d_ = os.path.join(APP_DIR, name), os.path.join(bak, name)
+                if os.path.isdir(s_):
+                    shutil.copytree(s_, d_, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+                else:
+                    shutil.copy2(s_, d_)
+            result["backup"] = bak
+            old_req = os.path.join(APP_DIR, "requirements.txt")
+            req_changed = not (os.path.exists(old_req) and filecmp.cmp(old_req, os.path.join(src, "requirements.txt"),
+                                                                     shallow=False))
+            result["stage"] = "install"
+            copy_code(src, APP_DIR, group)
+            if req_changed:
+                r = run([os.path.join(APP_DIR, "venv/bin/pip"), "install", "-q", "-r",
+                         os.path.join(APP_DIR, "requirements.txt")], timeout=900)
+                result["notes"].append("зависимости обновлены" if r.returncode == 0 else
+                                       "pip install не удался: " + (r.stderr or r.stdout).strip()[-200:])
+            ver = os.path.join(APP_DIR, "VERSION")
+            fd = os.open(ver, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"sha": sha, "installed": time.time()}, f)
+            os.chown(ver, 0, group)
+            for rel, installed in NOT_AUTO:
+                new = os.path.join(src, rel)
+                if os.path.exists(new) and os.path.exists(installed) and not filecmp.cmp(new, installed, shallow=False):
+                    result["notes"].append(f"{installed} изменился в новой версии, его нужно обновить вручную")
+            result["stage"] = "restart"
+            ok, state = healthy_after_restart()
+            if ok:
+                result["ok"] = True
+                result["stage"] = "done"
+                return
+            result["error"] = f"новая версия не запустилась ({state}), вернул прежнюю"
+            for name in code_items(APP_DIR):  # откат: удалить новое, вернуть старое
+                p = os.path.join(APP_DIR, name)
+                if not os.path.exists(os.path.join(bak, name)):
+                    shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+            copy_code(bak, APP_DIR, group)
+            if os.path.exists(os.path.join(bak, "VERSION")):
+                shutil.copy2(os.path.join(bak, "VERSION"), ver)
+            ok2, state2 = healthy_after_restart()
+            result["stage"] = "rolled_back" if ok2 else "rollback_failed"
+            if not ok2:
+                result["error"] += f"; после отката бот тоже не запустился ({state2})"
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"{result['stage']}: {e}"[:300]
+    finally:
+        write_result(result)
+        os.close(lock)
+        os.remove(LOCK_FILE)
+
+
+def update(sha: str) -> None:
+    if not SHA_RE.match(sha):
+        die("bad sha")
+    if os.path.exists(LOCK_FILE):
+        die("update already running", 1)
+    unit = "monitor-bot-update-" + sha[:7]
+    r = run(["systemd-run", f"--unit={unit}", "--collect", "--quiet", "/usr/bin/python3", "-I",
+             os.path.realpath(__file__), "update-run", sha], timeout=30)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or "systemd-run failed", 1)
+    print(f"started {unit}")
+
+
+def bak_dirs() -> list[tuple[str, float]]:
+    parent = os.path.dirname(APP_DIR)
+    out = []
+    for n in os.listdir(parent):
+        p = os.path.join(parent, n)
+        if BAK_RE.match(n) and os.path.isdir(p) and not os.path.islink(p):
+            out.append((p, os.lstat(p).st_mtime))
+    return sorted(out, key=lambda x: x[1], reverse=True)
+
+
+def bak_list() -> None:
+    print(json.dumps([{"path": p, "mtime": m, "size": du_bytes(p)} for p, m in bak_dirs()]))
+
+
+def prune_bak(keep_s: str) -> None:
+    if not keep_s.isdigit() or not 1 <= int(keep_s) <= 20:
+        die("bad keep")
+    freed, removed = 0, []
+    for p, _ in bak_dirs()[int(keep_s):]:
+        if os.path.dirname(os.path.realpath(p)) != os.path.dirname(APP_DIR):
+            continue
+        freed += du_bytes(p)
+        shutil.rmtree(p)
+        removed.append(os.path.basename(p))
+    print(json.dumps({"removed": removed, "freed": freed}))
+
+
 def reboot() -> None:
     subprocess.Popen(["systemctl", "reboot"])
     print("rebooting")
@@ -231,6 +478,14 @@ def main(argv: list[str]) -> None:
         backup_status()
     elif cmd == "backup-fetch" and len(args) == 1:
         backup_fetch(args[0])
+    elif cmd == "update" and len(args) == 1:
+        update(args[0])
+    elif cmd == "update-run" and len(args) == 1:
+        update_run(args[0])
+    elif cmd == "bak-list" and not args:
+        bak_list()
+    elif cmd == "prune-bak" and len(args) == 1:
+        prune_bak(args[0])
     else:
         die("unknown command")
 

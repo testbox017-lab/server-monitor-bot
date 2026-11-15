@@ -121,6 +121,74 @@ class StepTest(unittest.TestCase):
         self.assertLess(t - 1_800_000_000, 86400)
 
 
+class DockerEventsTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"containers": ["weather-bot"], "log_alert_min": 15}
+        self.st = checks.AlertState()
+
+    def ev(self, now, started="t1", restarts=0, logs="", recovered=(), quiet=False):
+        info = {"weather-bot": {"restarts": restarts, "started": started, "health": ""}}
+        return checks.docker_events(self.cfg, self.st, now, set(recovered), False, quiet, info,
+                                    lambda n, since: logs)
+
+    def test_restart_detected_once(self):
+        t = 1_800_000_000
+        self.assertEqual(self.ev(t), [])                       # первый раз только запоминаем
+        self.assertEqual(self.ev(t + 60), [])
+        a = self.ev(t + 120, started="t2", restarts=1)
+        self.assertEqual(len(a), 1)
+        self.assertIn("перезапустился", a[0].text)
+        self.assertIn("автоперезапуск", a[0].text)
+        self.assertEqual(a[0].key, "log:weather-bot")
+        self.assertEqual(self.ev(t + 180, started="t2", restarts=1), [])
+
+    def test_restart_not_duplicated_after_recovery(self):
+        t = 1_800_000_000
+        self.ev(t)
+        self.assertEqual(self.ev(t + 60, started="t2", recovered={"ctr:weather-bot"}), [])
+
+    def test_log_errors_rate_limited(self):
+        t = 1_800_000_000
+        self.assertEqual(self.ev(t, logs="Traceback boom"), [])  # первый запуск: старое не шлём
+        a = self.ev(t + 60, logs="ok\nTraceback (most recent call last)\nValueError: x\nERROR db")
+        self.assertEqual(len(a), 1)
+        self.assertIn("2 строк", a[0].text)
+        self.assertEqual(self.ev(t + 120, logs="ERROR again"), [])  # 15 мин не прошло
+        self.assertEqual(len(self.ev(t + 60 + 901, logs="ERROR again")), 1)
+        self.assertEqual(self.ev(t + 3000, logs="all good"), [])
+
+    def test_log_alerts_off_and_quiet(self):
+        t = 1_800_000_000
+        self.ev(t)
+        self.assertEqual(self.ev(t + 60, logs="ERROR", quiet=True), [])
+        self.cfg["log_alerts"] = False
+        self.assertEqual(self.ev(t + 2000, logs="ERROR"), [])
+
+    def test_auto_containers(self):
+        cfg = {"containers": ["a"], "containers_auto": True}
+        st = checks.AlertState(seen_containers=["a", "b"])
+        self.assertEqual(checks.watched_containers(cfg, st), ["a", "b"])
+        cfg["containers_auto"] = False
+        self.assertEqual(checks.watched_containers(cfg, st), ["a"])
+        with mock.patch.object(checks, "container_states", return_value={"c": "running", "d": "exited"}):
+            checks.update_seen_containers(st)
+        self.assertEqual(st.seen_containers, ["a", "b", "c"])
+
+    def test_container_info_parse(self):
+        out = mock.Mock(stdout="/weather-bot\t2\t2026-11-15T07:00:00Z\thealthy\n/x\tbad\t\t\n")
+        with mock.patch.object(checks, "docker", return_value=out):
+            info = checks.container_info(["weather-bot", "x"])
+        self.assertEqual(info["weather-bot"], {"restarts": 2, "started": "2026-11-15T07:00:00Z", "health": "healthy"})
+        self.assertEqual(info["x"]["restarts"], 0)
+
+    def test_unhealthy_is_problem(self):
+        cfg = {"containers": ["w"], "thresholds": {}}
+        with mock.patch.object(checks, "container_states", return_value={"w": "running"}), \
+             mock.patch.object(checks, "container_info", return_value={"w": {"health": "unhealthy"}}):
+            res = checks.evaluate(cfg)
+        self.assertIn("unhealthy", res["ctr:w"])
+
+
 class BotButtonsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -159,9 +227,14 @@ class BotButtonsTest(unittest.TestCase):
         b = self.bot
         seen = set()
         todo = self.all_callbacks(b.settings_kb()) + ["status", "procs:mem:20", "services", "alerts",
-                                                       "mute:3600", "mute:off", "mute:morning:a"]
+                                                       "mute:3600", "mute:off", "mute:morning:a",
+                                                       "logs:weather-bot", "logs:weather-bot:100",
+                                                       "dk:auto", "dk:logs", "dk:logs", "dk:every:60"]
         with mock.patch.object(checks, "running_services", return_value=["ssh", "cron", "docker"]), \
-             mock.patch.object(checks, "container_states", return_value={"weather-bot": "running"}):
+             mock.patch.object(checks, "container_states", return_value={"weather-bot": "running"}), \
+             mock.patch.object(checks, "container_info", return_value={}), \
+             mock.patch.object(checks, "container_stats", return_value=[("weather-bot", "0.5%", "50MiB")]), \
+             mock.patch.object(checks, "container_logs", return_value="line <b>1</b>"):
             while todo:
                 d = todo.pop()
                 if d in seen or d == "set:reset":
@@ -194,6 +267,28 @@ class BotButtonsTest(unittest.TestCase):
         self.assertEqual(saved["remind_min"] if "remind_min" in saved else 60, 60)
         self.press("set:reset")
         self.assertEqual(b.CFG["thresholds"]["cpu"], 90)
+
+    def test_alert_kb_logs_button(self):
+        b = self.bot
+        self.assertIn("logs:weather-bot", self.all_callbacks(b.alert_kb("ctr:weather-bot")))
+        self.assertIn("logs:weather-bot", self.all_callbacks(b.alert_kb("log:weather-bot")))
+        self.assertNotIn("logs:cpu", self.all_callbacks(b.alert_kb("cpu")))
+
+    def test_logs_text_escaped(self):
+        with mock.patch.object(checks, "container_logs", return_value="<script>" + "x" * 5000):
+            t = checks.logs_text("w")
+        self.assertNotIn("<script>", t)
+        self.assertLess(len(t), 4096)
+
+    def test_docker_settings(self):
+        b = self.bot
+        b.S.reset()
+        self.press("dk:auto")
+        self.assertTrue(b.CFG["containers_auto"])
+        self.press("dk:every:60")
+        self.assertEqual(b.CFG["log_alert_min"], 60)
+        b.S.reset()
+        self.assertFalse(b.CFG["containers_auto"])
 
     def test_stranger_blocked(self):
         b = self.bot

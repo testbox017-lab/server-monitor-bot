@@ -12,7 +12,8 @@ import yaml
 
 # Ключи, которые можно менять из Telegram. Всё остальное (token, allowed_chats) только в config.yaml.
 EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "processes", "disks",
-            "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start")
+            "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start",
+            "containers_auto", "log_alerts", "log_alert_min", "log_patterns")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -26,6 +27,10 @@ DEFAULTS = {
     "remind_min": 60,           # 0 = не напоминать
     "daily_summary": None,      # "09:00"
     "tz": "Europe/Kyiv",
+    "containers_auto": False,   # отслеживать все контейнеры, которые бот видел работающими
+    "log_alerts": True,         # алерт на ошибки в логах контейнеров
+    "log_alert_min": 15,        # не чаще раза в N минут на контейнер
+    "log_patterns": None,       # None = Traceback, ERROR, CRITICAL, Exception, FATAL
 }
 
 

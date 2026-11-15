@@ -60,14 +60,31 @@ def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
               [Btn("Показать 20" if n == 10 else "Показать 10", callback_data=f"procs:{by}:{20 if n == 10 else 10}")])
 
 
+def logs_btn(name: str, label: str | None = None) -> Btn | None:
+    data = f"logs:{name}"
+    return Btn(label or f"📜 {name}", callback_data=data) if len(data.encode()) <= 60 else None
+
+
 def services_kb() -> InlineKeyboardMarkup:
+    logs = [b for b in (logs_btn(c) for c in checks.watched_containers(CFG, STATE)) if b]
     return kb([Btn("🔄 Обновить", callback_data="services"),
-               Btn("✏️ Что отслеживать", callback_data="set:watch")])
+               Btn("✏️ Что отслеживать", callback_data="set:watch")],
+              *[logs[i:i + 2] for i in range(0, len(logs), 2)])
 
 
-def alert_kb() -> InlineKeyboardMarkup:
+def alert_kb(key: str | None = None) -> InlineKeyboardMarkup:
+    extra = []
+    if key and key.startswith(("ctr:", "log:")):
+        b = logs_btn(checks.key_label(key), "📜 Логи")
+        if b:
+            extra.append(b)
     return kb([Btn("🔕 На 1 ч", callback_data="mute:3600:a"), Btn("🌙 До утра", callback_data="mute:morning:a")],
-              [Btn("📊 Статус сейчас", callback_data="status:new")])
+              [Btn("📊 Статус сейчас", callback_data="status:new")] + extra)
+
+
+def logs_kb(name: str, tail: int) -> InlineKeyboardMarkup:
+    return kb([Btn("🔄 Обновить", callback_data=f"logs:{name}:{tail}"),
+               Btn("100 строк" if tail == 30 else "30 строк", callback_data=f"logs:{name}:{100 if tail == 30 else 30}")])
 
 
 def alerts_kb() -> InlineKeyboardMarkup:
@@ -119,6 +136,9 @@ def settings_text() -> str:
         f"Ежедневная сводка: в {summary}" if summary else "Ежедневная сводка: выкл",
         f"Служб: {len(CFG.get('services') or [])}, контейнеров: {len(CFG.get('containers') or [])}, "
         f"процессов: {len(CFG.get('processes') or [])}",
+        "Docker: " + ("все контейнеры" if CFG.get("containers_auto") else "только из списка")
+        + (f", ошибки в логах не чаще раза в {CFG.get('log_alert_min') or 15} мин" if CFG.get("log_alerts", True)
+           else ", ошибки в логах: выкл"),
         f"Часовой пояс: {CFG.get('tz')}",
     ])
 
@@ -127,7 +147,7 @@ def settings_kb() -> InlineKeyboardMarkup:
     return kb([Btn("📏 Пороги", callback_data="set:th"), Btn("⏱ Интервал", callback_data="set:int")],
               [Btn("👁 Что отслеживать", callback_data="set:watch")],
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
-              [Btn("📋 Ежедневная сводка", callback_data="set:summary")],
+              [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -214,6 +234,22 @@ def summary_view() -> tuple[str, InlineKeyboardMarkup]:
     return ("📋 <b>Ежедневная сводка</b>\nСостояние сервера и алерты за сутки.", kb(btns, [BACK]))
 
 
+def docker_view() -> tuple[str, InlineKeyboardMarkup]:
+    auto = bool(CFG.get("containers_auto"))
+    logs_on = CFG.get("log_alerts", True)
+    every = CFG.get("log_alert_min") or 15
+    rows = [[Btn(f"{onoff(auto)} Отслеживать все контейнеры", callback_data="dk:auto")],
+            [Btn(f"{onoff(logs_on)} Алерты на ошибки в логах", callback_data="dk:logs")]]
+    if logs_on:
+        rows.append([Btn(("• " if every == m else "") + f"не чаще 1 раза в {m} мин", callback_data=f"dk:every:{m}")
+                     for m in (15, 60)])
+    rows.append([BACK])
+    return ("🐳 <b>Docker</b>\nВсе контейнеры: бот сам добавляет каждый контейнер, который видел работающим, "
+            "и пишет, если он остановился или перезапустился.\n"
+            "Ошибки в логах: строки с Traceback, ERROR, CRITICAL, Exception, FATAL.",
+            InlineKeyboardMarkup(rows))
+
+
 # ---------- Доступ и отправка ----------
 
 def allowed(update: Update) -> bool:
@@ -243,7 +279,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "👋 Бот мониторинга сервера. Управляйте кнопками внизу или командами:\n"
-        "/status /procs /mem /services /alerts /settings\n"
+        "/status /procs /mem /services /alerts /settings /logs\n"
         "/mute 2h — выключить уведомления, /unmute — включить", reply_markup=MAIN_KB)
 
 
@@ -264,12 +300,27 @@ async def cmd_mem(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_services(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
-        await send(update, await asyncio.to_thread(checks.services_text, CFG), services_kb())
+        await send(update, await asyncio.to_thread(checks.services_text, CFG, STATE), services_kb())
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
         await send(update, alerts_text(), alerts_kb())
+
+
+async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    names = checks.watched_containers(CFG, STATE)
+    if not ctx.args:
+        btns = [b for b in (logs_btn(c) for c in names) if b]
+        await send(update, "Чьи логи показать? Или /logs имя_контейнера",
+                   kb(*[btns[i:i + 2] for i in range(0, len(btns), 2)]) if btns else None)
+        return
+    name = ctx.args[0]
+    tail = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 30
+    tail = max(1, min(tail, 300))
+    await send(update, await asyncio.to_thread(checks.logs_text, name, tail), logs_kb(name, 30 if tail == 30 else 100))
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,7 +396,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             by, n = parts[1], int(parts[2])
             await edit(update, await asyncio.to_thread(checks.top_processes, n, by), procs_kb(by, n))
         elif cmd == "services":
-            await edit(update, await asyncio.to_thread(checks.services_text, CFG), services_kb())
+            await edit(update, await asyncio.to_thread(checks.services_text, CFG, STATE), services_kb())
         elif cmd == "alerts":
             await edit(update, alerts_text(), alerts_kb())
         elif cmd == "mute":
@@ -371,7 +422,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await edit(update, settings_text(), settings_kb())
             else:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
-                        "quiet": quiet_view, "remind": remind_view, "summary": summary_view}[sub]
+                        "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
+                        "docker": docker_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -402,6 +454,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 start, end = ":".join(parts[1:]).split("-")
                 S.set("quiet_hours", {"start": start, "end": end})
             await edit(update, *quiet_view())
+        elif cmd == "dk":
+            if parts[1] == "auto":
+                S.set("containers_auto", not CFG.get("containers_auto"))
+            elif parts[1] == "logs":
+                S.set("log_alerts", not CFG.get("log_alerts", True))
+            elif parts[1] == "every":
+                S.set("log_alert_min", int(parts[2]))
+            await edit(update, *docker_view())
+        elif cmd == "logs":
+            name = parts[1]
+            tail = int(parts[2]) if len(parts) > 2 else 30
+            text = await asyncio.to_thread(checks.logs_text, name, tail)
+            if len(parts) > 2:
+                await edit(update, text, logs_kb(name, tail))
+            else:
+                await send(update, text, logs_kb(name, tail))
         elif cmd == "remind":
             S.set("remind_min", int(parts[1]))
             await edit(update, *remind_view())
@@ -409,7 +477,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             S.set("daily_summary", None if parts[1] == "off" else ":".join(parts[1:]))
             reschedule(ctx.application)
             await edit(update, *summary_view())
-        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary") and note is None:
+        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk") and note is None:
             note = "Сохранено"
     except Exception:
         log.exception("Ошибка кнопки %s", data)
@@ -434,7 +502,7 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Ошибка проверки")
         return
     for a in alerts:
-        markup = alert_kb() if a.kind in ("alert", "remind") else None
+        markup = alert_kb(a.key) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
 
 
@@ -475,7 +543,7 @@ def build_app() -> Application:
     app = Application.builder().token(CFG["token"]).post_init(on_startup).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
-                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute),
+                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

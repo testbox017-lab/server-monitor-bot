@@ -5,20 +5,29 @@
   папки /etc/monitor-bot/backup-watch, плюс SHA256SUMS. Ключ ничего другого на сервере делать не может
   (в authorized_keys для него стоят command= и restrict).
 
-  Каждый запуск создаёт папку <Dest>\ГГГГ-ММ-ДД_ЧЧММ, проверяет контрольные суммы и оставляет <Keep>
+  Куда класть копии: pull-backups.json рядом со скриптом (меняется через set-backup-path.ps1), по умолчанию
+  папка Backups\server в корне проекта. Каждый запуск создаёт папку <Dest>\ГГГГ-ММ-ДД_ЧЧММ, проверяет контрольные суммы и оставляет <Keep>
   последних папок. Результат пишет в <Dest>\pull.log. Код выхода 0 — всё хорошо.
 
-  Ручной запуск:  powershell -ExecutionPolicy Bypass -File pull-backups.ps1 -Server root@IP
+  Ручной запуск:  powershell -ExecutionPolicy Bypass -File pull-backups.ps1
+                  (сервер берётся из pull-backups.json, его записывает install-task.ps1; можно -Server root@IP)
   По расписанию:  install-task.ps1
 #>
 param(
-    [Parameter(Mandatory = $true)][string]$Server,   # например root@1.2.3.4
-    [string]$Key = "$env:USERPROFILE\.ssh\monitor_bot_pull",
-    [string]$Dest = "D:\Backups\server",
-    [int]$Keep = 30
+    [string]$Server,   # например root@1.2.3.4
+    [string]$Key,
+    [string]$Dest,
+    [int]$Keep
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "pull-common.ps1")
+$cfg = Read-PullConfig
+$Server = Pick $Server $cfg.Server $null
+$Key = Pick $Key $cfg.Key "$env:USERPROFILE\.ssh\monitor_bot_pull"
+$Dest = Pick $Dest $cfg.Dest $DefaultDest
+$Keep = [int](Pick $Keep $cfg.Keep 30)
+if (-not $Server) { Write-Output "Не указан сервер: запустите install-task.ps1 -Server root@IP"; exit 1 }
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 $logFile = Join-Path $Dest "pull.log"
 

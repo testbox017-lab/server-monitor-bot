@@ -19,6 +19,7 @@ CONF.write_text('token: "123456:' + "A" * 35 + '"\nallowed_chats: [42]\nservices
 import checks  # noqa: E402
 import history  # noqa: E402
 import probes  # noqa: E402
+import smart  # noqa: E402
 from settings import Settings  # noqa: E402
 from types import SimpleNamespace as NS  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
@@ -469,6 +470,95 @@ class SecurityTest(unittest.TestCase):
             self.assertFalse(security.heartbeat("https://hc-ping.com/x"))
 
 
+class SmartTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"thresholds": {"duration_sec": 300, "cpu": 90, "ram": 90}, "remind_min": 60, "tz": "UTC"}
+        self.st = checks.AlertState()
+        self.p = mock.patch.object(checks, "oom_kills", return_value=None)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def run_step(self, now, **kw):
+        return checks.step(self.cfg, self.st, now, results(**kw))
+
+    def test_ack_stops_reminders_until_recovered(self):
+        self.run_step(T0, **{"svc:ssh": "down"})
+        self.st.acked.append("svc:ssh")
+        self.assertEqual(self.run_step(T0 + 4000, **{"svc:ssh": "down"}), [])   # напоминания нет
+        self.assertEqual([x.kind for x in self.run_step(T0 + 4100)], ["recovered"])
+        self.assertEqual(self.st.acked, [])
+        a = self.run_step(T0 + 4200, **{"svc:ssh": "down"})                    # упало снова — снова алерт
+        self.assertEqual([x.kind for x in a], ["alert"])
+
+    def test_snooze_one_key(self):
+        self.run_step(T0, **{"svc:ssh": "down"})
+        self.st.snoozed["svc:ssh"] = T0 + 3600
+        self.assertEqual(self.run_step(T0 + 3000, **{"svc:ssh": "down"}), [])
+        self.run_step(T0 + 3100)                                               # восстановилось
+        self.assertEqual(self.run_step(T0 + 3200, **{"svc:ssh": "down"}), [])  # снова упало, но молчим
+        a = self.run_step(T0 + 3700, **{"svc:ssh": "down"})
+        self.assertEqual([x.kind for x in a], ["alert"])                       # час прошёл
+        self.assertEqual(self.st.snoozed, {})
+
+    def test_anomaly_rules(self):
+        prof = {"cpu": (10.0, 3.0, 5), "ram": (40.0, 2.0, 2)}
+        sample = {"cpu": 50.0, "ram": NS(percent=80.0)}
+        tzinfo = ZoneInfo("UTC")
+        r = smart.anomaly_results(self.cfg, sample, object(), T0, tzinfo, prof)
+        self.assertIn("обычно в этот час около 10%", r["anom:cpu"])
+        self.assertIsNone(r["anom:ram"])                      # мало истории (2 дня)
+        sample["cpu"] = 30.0
+        self.assertIsNone(smart.anomaly_results(self.cfg, sample, object(), T0, tzinfo, prof)["anom:cpu"])
+        sample["cpu"] = 95.0                                  # выше порога: будет обычный алерт, не дублируем
+        self.assertIsNone(smart.anomaly_results(self.cfg, sample, object(), T0, tzinfo, prof)["anom:cpu"])
+        self.cfg["anomaly_alerts"] = False
+        self.assertEqual(smart.anomaly_results(self.cfg, sample, object(), T0, tzinfo, prof), {})
+
+    def test_anomaly_needs_15_minutes(self):
+        text = "🧐 Необычно высокая CPU"
+        self.assertEqual(self.run_step(T0, **{"anom:cpu": text}), [])
+        self.assertEqual(self.run_step(T0 + 600, **{"anom:cpu": text}), [])
+        a = self.run_step(T0 + 901, **{"anom:cpu": text})
+        self.assertEqual([x.kind for x in a], ["alert"])
+        a = self.run_step(T0 + 1000, **{"anom:cpu": None})
+        self.assertEqual(a[0].text, "✅ Восстановлено: необычная нагрузка CPU")
+
+    def test_hour_profile(self):
+        h = history.History(TMP / "smart_profile.db")
+        tzinfo = ZoneInfo("UTC")
+        now = T0 - T0 % 86400 + 10 * 3600 + 1800        # 10:30 UTC
+        for d in range(1, 6):
+            for m in range(0, 60, 5):
+                ts = now - d * 86400 - 1800 + m * 60    # 10:00–10:55 прошлых дней
+                h.record(fake_sample(12, 40, 50, 0, 0), ts)
+                h.record(fake_sample(80, 90, 50, 0, 0), ts - 4 * 3600)  # другой час — не считается
+        prof = h.hour_profile(now, tzinfo)
+        self.assertAlmostEqual(prof["cpu"][0], 12)
+        self.assertEqual(prof["cpu"][2], 5)
+
+    def test_ram_trend(self):
+        h = history.History(TMP / "smart_trend.db")
+        for i in range(0, 6 * 60 + 1, 5):               # 6 часов, RAM от 55% до 79%
+            h.record(fake_sample(10, 55 + i * 4 / 60, 50, 0, 0), T0 - 6 * 3600 + i * 60)
+        top = lambda: ("java", 2 * 1024 ** 3)
+        a = smart.ram_trend_events(self.cfg, self.st, h, T0, False, False, top_fn=top)
+        self.assertEqual(len(a), 1)
+        self.assertIn("Память растёт: +24% за 6 ч, сейчас 79%", a[0].text)
+        self.assertIn("через 5 ч", a[0].text)
+        self.assertIn("java (2.0 ГБ)", a[0].text)
+        self.assertEqual(smart.ram_trend_events(self.cfg, self.st, h, T0 + 60, False, False, top_fn=top), [])
+        st = checks.AlertState()
+        self.assertEqual(smart.ram_trend_events(self.cfg, st, h, T0, False, True, top_fn=top), [])  # ночью молчим
+
+    def test_ram_flat_no_alert(self):
+        h = history.History(TMP / "smart_flat.db")
+        for i in range(0, 361, 5):
+            h.record(fake_sample(10, 70 + (i % 10) * 0.1, 50, 0, 0), T0 - 6 * 3600 + i * 60)
+        self.assertEqual(smart.ram_trend_events(self.cfg, self.st, h, T0, False, False, top_fn=lambda: None), [])
+
+
 class ProbesTest(unittest.TestCase):
     def setUp(self):
         self.st = checks.AlertState()
@@ -587,6 +677,7 @@ class BotButtonsTest(unittest.TestCase):
         q.answer = mock.AsyncMock()
         q.edit_message_text = mock.AsyncMock()
         q.edit_message_media = mock.AsyncMock()
+        q.edit_message_reply_markup = mock.AsyncMock()
         upd = mock.MagicMock()
         upd.effective_message.reply_photo = mock.AsyncMock()
         upd.callback_query = q
@@ -800,6 +891,62 @@ class BotButtonsTest(unittest.TestCase):
             self.assertFalse(b.CFG["ssl_alerts"])
             self.press([d for d in cbs if d.startswith("pr:del:")][0])
             self.assertEqual(b.CFG["probes"], [])
+        b.S.reset()
+
+    def test_ack_snooze_buttons(self):
+        b = self.bot
+        b.STATE.active = ["web:https://site.ru/very/long/path/that/is/long"]
+        key = b.STATE.active[0]
+        m = b.alert_kb(key, True)
+        cbs = self.all_callbacks(m)
+        for d in cbs:
+            self.assertLessEqual(len(d.encode()), 64, d)
+        ack = [d for d in cbs if d.startswith("ack:")][0]
+        q, _ = self.press(ack)
+        self.assertIn(key, b.STATE.acked)
+        self.assertIn("Принято", q.answer.await_args.args[0])
+        new_markup = q.edit_message_reply_markup.await_args.args[0]
+        self.assertFalse(any(d.startswith("ack:") for d in self.all_callbacks(new_markup)))
+        q, _ = self.press([d for d in cbs if d.startswith("snz:")][0])
+        self.assertGreater(b.STATE.snoozed[key], time.time() + 3000)
+        self.assertIn("✔️ принято", b.alerts_text())
+        q, _ = self.press("ack:0000000000")
+        self.assertEqual(q.answer.await_args.args[0], "Эта проблема уже решена")
+        b.STATE.acked = []
+        self.press("ackall")
+        self.assertEqual(b.STATE.acked, [key])
+        b.STATE.active, b.STATE.acked, b.STATE.snoozed = [], [], {}
+
+    def test_grouped_alerts(self):
+        b = self.bot
+        b.S.reset()
+        alerts = [checks.Alert(f"🚨 проблема {i} <x>", f"svc:s{i}", "alert") for i in range(5)]
+        sent = []
+
+        async def fake_broadcast(bot, text, markup=None):
+            sent.append((text, markup))
+        with mock.patch.object(checks, "step", return_value=alerts), \
+             mock.patch.object(b, "broadcast", fake_broadcast), mock.patch.object(b.HIST, "record"):
+            asyncio.run(b.monitor_job(mock.MagicMock()))
+            self.assertEqual(len(sent), 1)
+            self.assertIn("Сразу 5 событий", sent[0][0])
+            self.assertIn("&lt;x&gt;", sent[0][0])
+            sent.clear()
+            b.S.set("group_alerts", False)
+            asyncio.run(b.monitor_job(mock.MagicMock()))
+            self.assertEqual(len(sent), 5)
+            self.assertTrue(any(d.startswith("ack:") for d in self.all_callbacks(sent[0][1])))
+        b.S.reset()
+
+    def test_smart_settings(self):
+        b = self.bot
+        b.S.reset()
+        q, _ = self.press("set:smart")
+        self.assertIn("Умные алерты", q.edit_message_text.await_args.args[0])
+        self.press("sm:anomaly_alerts")
+        self.assertFalse(b.CFG["anomaly_alerts"])
+        self.press("sm:group_alerts")
+        self.assertFalse(b.CFG["group_alerts"])
         b.S.reset()
 
     def test_stranger_blocked(self):

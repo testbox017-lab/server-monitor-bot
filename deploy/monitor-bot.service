@@ -16,6 +16,8 @@ Restart=always
 RestartSec=10
 # /var/lib/monitor_bot для settings.json и state.json, доступна на запись пользователю службы
 StateDirectory=monitor_bot
+# кэш matplotlib (у пользователя monitor нет домашней папки)
+Environment=MPLCONFIGDIR=/var/lib/monitor_bot/.mpl
 
 [Install]
 WantedBy=multi-user.target

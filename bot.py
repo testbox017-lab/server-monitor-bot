@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from telegram import (InlineKeyboardButton as Btn, InlineKeyboardMarkup, KeyboardButton,
+from telegram import (InlineKeyboardButton as Btn, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -21,6 +21,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 import checks
+import history
 from settings import Settings
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -31,6 +32,7 @@ CONFIG_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_na
 S = Settings(CONFIG_PATH)
 CFG = S.cfg  # общий словарь, обновляется на месте при изменении настроек
 STATE = checks.AlertState.load(S.dir / "state.json")
+HIST = history.History(S.dir / "metrics.db")
 HOST = checks.platform.node()
 
 # ---------- Клавиатуры ----------
@@ -49,7 +51,7 @@ def kb(*rows) -> InlineKeyboardMarkup:
 
 
 def status_kb() -> InlineKeyboardMarkup:
-    return kb([Btn("🔄 Обновить", callback_data="status")],
+    return kb([Btn("🔄 Обновить", callback_data="status"), Btn("📈 График", callback_data="chart:24h")],
               [Btn("🔝 Процессы", callback_data="procs:cpu:10"), Btn("⚙️ Службы", callback_data="services")])
 
 
@@ -80,6 +82,25 @@ def alert_kb(key: str | None = None) -> InlineKeyboardMarkup:
             extra.append(b)
     return kb([Btn("🔕 На 1 ч", callback_data="mute:3600:a"), Btn("🌙 До утра", callback_data="mute:morning:a")],
               [Btn("📊 Статус сейчас", callback_data="status:new")] + extra)
+
+
+def chart_kb(period: str) -> InlineKeyboardMarkup:
+    return kb([Btn(("• " if p == period else "") + history.PERIOD_NAMES[p], callback_data=f"chart:{p}:e")
+               for p in history.PERIODS])
+
+
+async def make_chart(period: str) -> tuple[bytes | None, str]:
+    png = await asyncio.to_thread(history.chart_png, HIST, period, checks.tz(CFG), HOST)
+    caption = await asyncio.to_thread(history.chart_caption, HIST, period)
+    return png, caption
+
+
+async def send_chart(update: Update, period: str) -> None:
+    png, caption = await make_chart(period)
+    if png is None:
+        await send(update, "📈 Данных для графика пока нет: история копится раз в минуту, загляните чуть позже.")
+        return
+    await update.effective_message.reply_photo(png, caption=caption, reply_markup=chart_kb(period))
 
 
 def logs_kb(name: str, tail: int) -> InlineKeyboardMarkup:
@@ -279,7 +300,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "👋 Бот мониторинга сервера. Управляйте кнопками внизу или командами:\n"
-        "/status /procs /mem /services /alerts /settings /logs\n"
+        "/status /procs /mem /services /alerts /settings /logs /chart\n"
         "/mute 2h — выключить уведомления, /unmute — включить", reply_markup=MAIN_KB)
 
 
@@ -321,6 +342,12 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tail = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 30
     tail = max(1, min(tail, 300))
     await send(update, await asyncio.to_thread(checks.logs_text, name, tail), logs_kb(name, 30 if tail == 30 else 100))
+
+
+async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        period = ctx.args[0] if ctx.args and ctx.args[0] in history.PERIODS else "24h"
+        await send_chart(update, period)
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -462,6 +489,16 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             elif parts[1] == "every":
                 S.set("log_alert_min", int(parts[2]))
             await edit(update, *docker_view())
+        elif cmd == "chart":
+            period = parts[1] if parts[1] in history.PERIODS else "24h"
+            if len(parts) > 2:  # переключение периода под уже отправленным графиком
+                png, caption = await make_chart(period)
+                if png is None:
+                    note = "Данных за этот период пока нет"
+                else:
+                    await q.edit_message_media(InputMediaPhoto(png, caption=caption), reply_markup=chart_kb(period))
+            else:
+                await send_chart(update, period)
         elif cmd == "logs":
             name = parts[1]
             tail = int(parts[2]) if len(parts) > 2 else 30
@@ -501,13 +538,17 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         log.exception("Ошибка проверки")
         return
+    try:
+        await asyncio.to_thread(HIST.record, checks.LAST_SAMPLE)
+    except Exception:
+        log.exception("Не удалось записать историю")
     for a in alerts:
         markup = alert_kb(a.key) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
 
 
 async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = await asyncio.to_thread(checks.summary_text, CFG, STATE)
+    text = await asyncio.to_thread(checks.summary_text, CFG, STATE, None, HIST)
     await broadcast(ctx.bot, text, status_kb())
 
 
@@ -543,7 +584,7 @@ def build_app() -> Application:
     app = Application.builder().token(CFG["token"]).post_init(on_startup).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
-                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs),
+                     ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

@@ -17,7 +17,27 @@ CONF.write_text('token: "123456:' + "A" * 35 + '"\nallowed_chats: [42]\nservices
                 f'data_dir: "{TMP}"\n', encoding="utf-8")
 
 import checks  # noqa: E402
+import history  # noqa: E402
 from settings import Settings  # noqa: E402
+from types import SimpleNamespace as NS  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+T0 = 1_800_000_000
+
+
+def fake_sample(cpu, ram, disk, rx, tx):
+    return {"cpu": cpu, "ram": NS(percent=ram), "disks": {"/": NS(percent=disk)},
+            "net": NS(bytes_recv=rx, bytes_sent=tx), "load": (0.5, 0.4, 0.3)}
+
+
+def filled_history(path, days=7, step=600):
+    h = history.History(path)
+    n = days * 86400 // step
+    for i in range(n):
+        ts = T0 - (n - i) * step
+        rx = (i % 500) * 10_000_000  # счётчик иногда «сбрасывается»
+        h.record(fake_sample(20 + (i % 10) * 5, 40 + (i % 7), 50 + i * 20 / n, rx, rx // 2), ts)
+    return h
 
 
 def results(**kw):
@@ -189,6 +209,65 @@ class DockerEventsTest(unittest.TestCase):
         self.assertIn("unhealthy", res["ctr:w"])
 
 
+class HistoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.h = filled_history(TMP / "hist_test.db")
+
+    def test_peaks_and_traffic(self):
+        p = self.h.peaks(86400, T0)
+        self.assertEqual(p["cpu"][0], 65)
+        self.assertEqual(p["ram"][0], 46)
+        self.assertGreater(p["rx"], 0)
+        self.assertLess(p["disk_from"], p["disk_to"])
+
+    def test_forecast(self):
+        days = self.h.disk_forecast(T0)
+        # 20% за 7 дней ≈ 2.86%/сут, осталось ~30% → ~10.5 дней
+        self.assertAlmostEqual(days, 10.5, delta=1.0)
+
+    def test_forecast_flat_and_short(self):
+        h = history.History(TMP / "flat.db")
+        for i in range(100):
+            h.record(fake_sample(10, 10, 40.0, i, i), T0 - (100 - i) * 600)
+        self.assertIsNone(h.disk_forecast(T0))
+        h2 = history.History(TMP / "short.db")
+        for i in range(5):
+            h2.record(fake_sample(10, 10, 40 + i, i, i), T0 - (5 - i) * 60)
+        self.assertIsNone(h2.disk_forecast(T0))
+
+    def test_retention(self):
+        h = history.History(TMP / "ret.db")
+        h.record(fake_sample(1, 1, 1, 1, 1), T0 - 40 * 86400)
+        h._last_cleanup = 0
+        h.record(fake_sample(1, 1, 1, 1, 1), T0)
+        self.assertEqual(len(h.rows(0, T0 + 1)), 1)
+
+    def test_chart_png(self):
+        for period in history.PERIODS:
+            png = history.chart_png(self.h, period, ZoneInfo("Europe/Kyiv"), "srv", T0)
+            self.assertTrue(png.startswith(b"\x89PNG"), period)
+        (TMP / "chart_7d.png").write_bytes(history.chart_png(self.h, "7d", ZoneInfo("Europe/Kyiv"), "srv", T0))
+        self.assertIsNone(history.chart_png(history.History(TMP / "empty.db"), "1h", ZoneInfo("UTC"), "srv", T0))
+
+    def test_caption(self):
+        c = history.chart_caption(self.h, "7d", T0)
+        self.assertIn("Пик CPU 65%", c)
+        self.assertIn("диск заполнится", c)
+
+    def test_bucket(self):
+        rows = self.h.rows(0, T0)
+        self.assertEqual(len(history._bucket(rows, 100)), 100)
+
+    def test_summary_with_history(self):
+        st = checks.AlertState(log=[[T0 - 100, "restart:w"], [T0 - 50, "cpu"]])
+        with mock.patch.object(checks, "status_text", return_value="STATUS"):
+            t = checks.summary_text({"tz": "Europe/Kyiv"}, st, T0, self.h)
+        self.assertIn("Пик CPU: 65%", t)
+        self.assertIn("Перезапусков контейнеров: 1", t)
+        self.assertIn("диск заполнится", t)
+
+
 class BotButtonsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -202,7 +281,9 @@ class BotButtonsTest(unittest.TestCase):
         q.data = data
         q.answer = mock.AsyncMock()
         q.edit_message_text = mock.AsyncMock()
+        q.edit_message_media = mock.AsyncMock()
         upd = mock.MagicMock()
+        upd.effective_message.reply_photo = mock.AsyncMock()
         upd.callback_query = q
         upd.effective_chat.id = chat
         upd.effective_message.reply_text = mock.AsyncMock()
@@ -289,6 +370,20 @@ class BotButtonsTest(unittest.TestCase):
         self.assertEqual(b.CFG["log_alert_min"], 60)
         b.S.reset()
         self.assertFalse(b.CFG["containers_auto"])
+
+    def test_chart_buttons(self):
+        b = self.bot
+        q, upd = self.press("chart:24h")  # истории ещё нет — текст вместо графика
+        upd.effective_message.reply_text.assert_awaited()
+        self.assertIn("chart:24h", self.all_callbacks(b.status_kb()))
+        with mock.patch.object(b, "HIST", filled_history(TMP / "bot_hist.db")), \
+             mock.patch.object(history.time, "time", return_value=T0):
+            q, upd = self.press("chart:7d")
+            upd.effective_message.reply_photo.assert_awaited()
+            self.assertTrue(upd.effective_message.reply_photo.await_args.args[0].startswith(b"\x89PNG"))
+            q, upd = self.press("chart:24h:e")
+            q.edit_message_media.assert_awaited()
+            self.assertEqual(q.answer.await_args.args, (None,))
 
     def test_stranger_blocked(self):
         b = self.bot

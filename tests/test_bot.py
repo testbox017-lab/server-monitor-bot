@@ -417,6 +417,18 @@ class HelperScriptTest(unittest.TestCase):
         self.assertFalse((bak / "config.yaml").exists())
         self.assertFalse((base / "lock").exists())
 
+    def test_same_config_ignores_comments(self):
+        h = self.h
+        d = Path(tempfile.mkdtemp())
+        (d / "a.service").write_text("[Service]\n# кэш\nUser=monitor\n\n")
+        (d / "b.service").write_text("[Service]\nUser=monitor\n")
+        (d / "c.service").write_text("[Service]\nUser=root\n")
+        self.assertTrue(h.same_config(str(d / "a.service"), str(d / "b.service")))
+        self.assertFalse(h.same_config(str(d / "a.service"), str(d / "c.service")))
+        (d / "monitor-bot-action").write_text("# v1\nx\n")
+        (d / "inst-monitor-bot-action").write_text("# v2\nx\n")
+        self.assertFalse(h.same_config(str(d / "monitor-bot-action"), str(d / "inst-monitor-bot-action")))
+
     def test_update_tests_fail_changes_nothing(self):
         h = self.h
         base, app = self.update_env()
@@ -1230,6 +1242,7 @@ class BotButtonsTest(unittest.TestCase):
         async def fake_broadcast(bot, text, markup=None):
             sent.append((text, markup))
         with mock.patch.object(checks, "step", return_value=alerts), \
+             mock.patch.object(updater, "last_result", return_value=None), \
              mock.patch.object(b, "broadcast", fake_broadcast), mock.patch.object(b.HIST, "record"):
             asyncio.run(b.monitor_job(mock.MagicMock()))
             self.assertEqual(len(sent), 1)

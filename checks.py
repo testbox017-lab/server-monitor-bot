@@ -420,6 +420,7 @@ class AlertState:
     bak_small: dict[str, str] = field(default_factory=dict)    # о какой маленькой копии уже писали
     bak_events: list[str] = field(default_factory=list)
     update_reported: float | None = None                       # о каком обновлении уже сообщили
+    verify_last: dict = field(default_factory=dict)            # последняя проверка копий: ts, results, err
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -451,6 +452,8 @@ class AlertState:
 def key_label(key: str) -> str:
     if key.startswith("anom:"):
         return "необычная нагрузка " + smart.NAMES.get(key[5:], key[5:])
+    if key == "bak:pc":
+        return "копии на ПК"
     return key.split(":", 1)[-1]
 
 

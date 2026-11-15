@@ -17,7 +17,8 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
-            "backup_time", "backup_keep", "backup_send_daily", "backup_alerts")
+            "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
+            "offsite_max_age_h", "verify_backups")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -51,6 +52,8 @@ DEFAULTS = {
     "backup_keep": 14,              # сколько копий бота хранить
     "backup_send_daily": False,     # присылать копии в Telegram (копия бота содержит токен!)
     "backup_alerts": True,          # алерт, если бэкап устарел или подозрительно маленький
+    "offsite_max_age_h": 72,        # алерт, если ПК не забирал копии дольше (None = выкл)
+    "verify_backups": True,         # по воскресеньям в 04:30 проверять, что копии читаются целиком
     # Проверки снаружи
     "probes": [],                   # https://site.ru, https://site.ru/health | OK, tcp://host:5432, ping://host, dns://name
     "probe_timeout": 10,            # секунд на одну проверку

@@ -29,6 +29,7 @@ from types import SimpleNamespace as NS  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
 
 T0 = 1_800_000_000
+backups.OFFSITE_STATUS = TMP / "no-offsite-status.json"  # тесты не читают настоящий файл сервера
 
 
 def fake_sample(cpu, ram, disk, rx, tx):
@@ -540,7 +541,7 @@ Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
 
     def test_ban_rules(self):
         h = self.h
-        run, calls = self.fake_run("0 0 2.29.199.153:22 91.240.118.7:51234\n")
+        run, calls = self.fake_run("0 0 5.161.0.10:22 91.240.118.7:51234\n")
         with mock.patch.object(h, "run", run):
             self.assertEqual(h.banned(), ["185.220.101.5", "2001:db8::7"])   # только поставленные ботом
             self.assertEqual(self.code("ban-ip", "10.0.0.5"), 2)
@@ -562,7 +563,7 @@ Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
 
     def test_ssh_peers_parse(self):
         h = self.h
-        out = "0 0 2.29.199.153:22 91.240.118.7:51234\n0 0 [::ffff:2.29.199.153]:22 [::ffff:80.94.95.3]:4000\n"
+        out = "0 0 5.161.0.10:22 91.240.118.7:51234\n0 0 [::ffff:5.161.0.10]:22 [::ffff:80.94.95.3]:4000\n"
         with mock.patch.object(h, "run", return_value=mock.Mock(returncode=0, stdout=out, stderr="")):
             self.assertEqual(h.ssh_peers(), {"91.240.118.7", "80.94.95.3"})
 
@@ -1513,6 +1514,169 @@ class BotButtonsTest(unittest.TestCase):
         self.assertIn("summary", names)
         self.assertIn("monitor", names)
         b.S.reset()
+
+
+class OffsiteTest(unittest.TestCase):
+    """Этап 13: копии на ПК и проверка, что копии читаются."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.conf = self.dir / "config.yaml"
+        self.conf.write_text("token: x\n")
+        (self.dir / "state.json").write_text("{}")
+        history.History(self.dir / "metrics.db").record(fake_sample(10, 20, 30, 0, 0), T0)
+
+    def test_offsite_alert(self):
+        st, now = checks.AlertState(), time.time()
+        cfg = {"backup_alerts": True, "offsite_max_age_h": 72}
+        never = backups.evaluate(cfg, st, now, None, lambda n: [], offsite_fn=lambda: None)
+        self.assertNotIn("bak:pc", never)                       # ПК ещё не настроен — не шумим
+        old = backups.evaluate(cfg, st, now, None, lambda n: [], offsite_fn=lambda: {"ts": now - 80 * 3600})
+        self.assertIn("уже 80 ч", old["bak:pc"])
+        fresh = backups.evaluate(cfg, st, now, None, lambda n: [], offsite_fn=lambda: {"ts": now - 3600})
+        self.assertIsNone(fresh["bak:pc"])
+        cfg["offsite_max_age_h"] = None
+        self.assertNotIn("bak:pc", backups.evaluate(cfg, st, now, None, lambda n: [], offsite_fn=lambda: {"ts": 0}))
+        self.assertEqual(checks.key_label("bak:pc"), "копии на ПК")
+
+    def test_offsite_status_file(self):
+        f = self.dir / "status.json"
+        self.assertIsNone(backups.offsite_status(f))
+        f.write_text('{"ts": 5, "files": [{"name": "a"}], "bytes": 2048}')
+        self.assertEqual(backups.offsite_status(f)["ts"], 5)
+        text = backups.offsite_text({"offsite_max_age_h": 72}, 5 + 3600, lambda: backups.offsite_status(f))
+        self.assertIn("✅ На ПК: забраны", text)
+        self.assertIn("ещё ни разу", backups.offsite_text({}, 0, lambda: None))
+
+    def test_verify_own(self):
+        self.assertFalse(backups.verify_own(self.dir)["ok"])     # копий нет
+        path, _, _ = backups.make_backup(self.conf, self.dir)
+        r = backups.verify_own(self.dir)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("история: 1 записей", r["note"])
+        path.write_bytes(path.read_bytes()[:200])               # обрезанная копия
+        r = backups.verify_own(self.dir)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"])
+
+    def test_verify_all_and_text(self):
+        backups.make_backup(self.conf, self.dir)
+        other = [{"label": "weather-bot", "path": "/var/backups/weather-bot", "name": "w.tar.gz", "size": 10,
+                  "ok": False, "members": 0, "error": "EOFError: обрыв"}]
+        res, err = backups.verify_all(self.dir, helper_fn=lambda *a, **k: (True, json.dumps(other)))
+        self.assertIsNone(err)
+        self.assertEqual([r["ok"] for r in res], [True, False])
+        self.assertTrue(backups.verify_failed(res))
+        text = backups.verify_text(res, err, "15.11 04:30")
+        self.assertIn("✅ бот", text)
+        self.assertIn("❌ /var/backups/weather-bot: EOFError", text)
+        res, err = backups.verify_all(self.dir, helper_fn=lambda *a, **k: (False, "sudo: a password is required"))
+        self.assertEqual(len(res), 1)
+        self.assertIn("не проверены", backups.verify_text(res, err))
+
+
+class HelperOffsiteTest(unittest.TestCase):
+    def setUp(self):
+        import gzip
+        import tarfile
+        self.h = load_helper()
+        base = Path(tempfile.mkdtemp())
+        own, w = base / "own", base / "weather-bot"
+        own.mkdir()
+        w.mkdir()
+        good = own / "monitor-bot-2026-11-15_034500.tar.gz"
+        with tarfile.open(good, "w:gz") as t:
+            src = base / "f.txt"
+            src.write_text("hello")
+            t.add(src, arcname="config.yaml")
+        (own / "junk.txt").write_text("не копия бота")
+        self.bad = w / "weather-2026-11-15.tar.gz"
+        self.bad.write_bytes(gzip.compress(b"x" * 5000)[:100])
+        os.symlink("/etc/passwd", w / "zzz-link.tar.gz")         # ссылки помощник не трогает
+        watch = base / "backup-watch"
+        watch.write_text(f"{w} 26\n")
+        self.h.OWN_BACKUPS, self.h.WATCH_FILE = str(own), str(watch)
+        self.h.OFFSITE_DIR = str(base / "offsite")
+        self.h.OFFSITE_STATUS = str(base / "offsite" / "status.json")
+
+    def run_cmd(self, *argv):
+        import io
+        out = io.BytesIO()
+        fake = NS(buffer=out, write=lambda s: out.write(s.encode()), flush=lambda: None)
+        with mock.patch.object(sys, "stdout", fake), mock.patch.dict(os.environ, {"SSH_CONNECTION": "93.184.216.34 5 6 22"}):
+            self.h.main(list(argv))
+        return out.getvalue()
+
+    def test_newest_copies(self):
+        items = self.h.newest_copies()
+        self.assertEqual([(i[0], i[2]) for i in items],
+                         [("monitor-bot", "monitor-bot-2026-11-15_034500.tar.gz"),
+                          ("weather-bot", "weather-2026-11-15.tar.gz")])
+
+    def test_pull_stream(self):
+        import hashlib
+        import io
+        import tarfile
+        data = self.run_cmd("pull-stream")
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            names = t.getnames()
+            sums = t.extractfile("SHA256SUMS").read().decode().split("\n")
+            files = {n: t.extractfile(n).read() for n in names if n != "SHA256SUMS"}
+        self.assertEqual(names, ["monitor-bot/monitor-bot-2026-11-15_034500.tar.gz",
+                                 "weather-bot/weather-2026-11-15.tar.gz", "SHA256SUMS"])
+        for line in filter(None, sums):
+            digest, name = line.split("  ")
+            self.assertEqual(hashlib.sha256(files[name]).hexdigest(), digest)
+        st = json.loads(Path(self.h.OFFSITE_STATUS).read_text())
+        self.assertEqual(len(st["files"]), 2)
+        self.assertEqual(st["client"], "93.184.216.34")
+        self.assertEqual(os.stat(self.h.OFFSITE_STATUS).st_mode & 0o777, 0o644)
+
+    def test_backup_verify(self):
+        res = json.loads(self.run_cmd("backup-verify"))
+        self.assertEqual([(r["label"], r["ok"]) for r in res], [("monitor-bot", True), ("weather-bot", False)])
+        self.assertEqual(res[0]["members"], 1)
+        self.assertTrue(res[1]["error"])
+
+    def test_pull_stream_no_backups(self):
+        self.h.OWN_BACKUPS, self.h.WATCH_FILE = "/nonexistent", "/nonexistent"
+        with self.assertRaises(SystemExit):
+            self.run_cmd("pull-stream")
+        self.assertFalse(os.path.exists(self.h.OFFSITE_STATUS))
+
+
+class OffsiteButtonsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def test_backup_view_and_buttons(self):
+        b = self.bot
+        b.S.reset()
+        b.STATE.verify_last = {}
+        text, markup = b.backup_view()
+        self.assertIn("ещё не проверялись", text)
+        self.assertIn("ещё ни разу", text)
+        cbs = [x.callback_data for row in markup.inline_keyboard for x in row]
+        self.assertIn("bk:verify", cbs)
+        self.assertIn("bk:pc:168", cbs)
+        self.assertTrue(all(len(c.encode()) <= 64 for c in cbs))
+        press = BotButtonsTest.press.__get__(self)
+        press("bk:pc:168")
+        self.assertEqual(b.CFG["offsite_max_age_h"], 168)
+        press("bk:pc:off")
+        self.assertIsNone(b.CFG["offsite_max_age_h"])
+        press("bk:vauto")
+        self.assertFalse(b.CFG["verify_backups"])
+        res = [{"path": "бот", "name": "a.tar.gz", "ok": True, "members": 3, "size": 10}]
+        with mock.patch.object(b.backups, "verify_all", return_value=(res, None)):
+            q, upd = press("bk:verify")
+        self.assertIn("читается целиком", upd.effective_message.reply_text.call_args[0][0])
+        self.assertIn("все копии читаются", b.verify_line())
+        b.S.reset()
+        b.STATE.verify_last = {}
 
 
 if __name__ == "__main__":

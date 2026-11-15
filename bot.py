@@ -451,6 +451,7 @@ async def report_update(bot) -> None:
 
 
 BACKUP_TIMES = (None, "03:45", "05:00")
+OFFSITE_OPTS = (None, 48, 72, 168)
 
 
 def backup_kb() -> InlineKeyboardMarkup:
@@ -465,14 +466,35 @@ def backup_kb() -> InlineKeyboardMarkup:
     rows.append([Btn(f"{onoff(CFG.get('backup_send_daily'))} Каждый день присылать копии сюда",
                      callback_data="bk:daily")])
     rows.append([Btn(f"{onoff(CFG.get('backup_alerts', True))} Алерт, если бэкап устарел", callback_data="bk:alerts")])
+    lim = CFG.get("offsite_max_age_h")
+    rows.append([Btn("💻 ПК:", callback_data="noop")] +
+                [Btn(("• " if lim == o else "") + (f"{o // 24} дн." if o else "выкл"), callback_data=f"bk:pc:{o or 'off'}")
+                 for o in OFFSITE_OPTS])
+    rows.append([Btn("🧪 Проверить копии сейчас", callback_data="bk:verify")])
+    rows.append([Btn(f"{onoff(CFG.get('verify_backups', True))} Проверять копии по воскресеньям",
+                     callback_data="bk:vauto")])
     rows.append([Btn("🔄 Обновить", callback_data="bk:refresh"), BACK])
     return InlineKeyboardMarkup(rows)
 
 
+def local_dt(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, checks.tz(CFG)).strftime("%d.%m %H:%M")
+
+
+def verify_line() -> str:
+    v = STATE.verify_last
+    if not v:
+        return "🧪 Копии ещё не проверялись"
+    bad = [r for r in v.get("results") or [] if not r.get("ok")]
+    when = local_dt(v["ts"])
+    return (f"🧪 Проверка {when}: " + ("все копии читаются целиком" if not bad else
+            "есть проблемы: " + ", ".join(html.escape(str(r.get("path"))) for r in bad)))
+
+
 def backup_view() -> tuple[str, InlineKeyboardMarkup]:
-    text = backups.status_text(CFG, S.dir) + (
+    text = backups.status_text(CFG, S.dir) + "\n" + verify_line() + (
         "\n\nКопия бота: config.yaml (с токеном), настройки, состояние алертов, история метрик. "
-        "Лежит на этом же сервере, поэтому полезно присылать её сюда. Не пересылайте её никому.")
+        "Лежит на этом же сервере, поэтому полезно присылать её сюда или забирать на ПК. Не пересылайте её никому.")
     return text, backup_kb()
 
 
@@ -926,9 +948,19 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         await send(update, f"Не удалось: {html.escape(err)}")
                     else:
                         await send_file(ctx.bot, chat[0], path, f"💾 {path.name} с {HOST}")
+            elif sub == "verify":
+                await q.answer("Проверяю копии, это может занять пару минут…")
+                answered = True
+                text = await run_verify()
+                await send(update, text)
             else:
                 if sub == "time":
                     S.set("backup_time", None if parts[2] == "off" else ":".join(parts[2:]))
+                    reschedule(ctx.application)
+                elif sub == "pc":
+                    S.set("offsite_max_age_h", None if parts[2] == "off" else int(parts[2]))
+                elif sub == "vauto":
+                    S.set("verify_backups", not CFG.get("verify_backups", True))
                     reschedule(ctx.application)
                 elif sub == "daily":
                     S.set("backup_send_daily", not CFG.get("backup_send_daily"))
@@ -1204,6 +1236,27 @@ async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await broadcast(ctx.bot, "❌ Не все копии удалось отправить:\n" + html.escape("\n".join(errors)))
 
 
+async def run_verify() -> str:
+    results, err = await asyncio.to_thread(backups.verify_all, S.dir)
+    STATE.verify_last = {"ts": time.time(), "results": results, "err": err}
+    await asyncio.to_thread(STATE.save)
+    return backups.verify_text(results, err, local_dt(STATE.verify_last["ts"]))
+
+
+async def verify_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в неделю: копии читаются целиком? Пишем, только если что-то не так."""
+    try:
+        text = await run_verify()
+    except Exception as e:
+        log.exception("Ошибка проверки копий")
+        await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n❌ Не удалось проверить копии: {html.escape(str(e))}")
+        return
+    v = STATE.verify_last
+    log.info("Проверка копий: %s", "есть ошибки" if backups.verify_failed(v["results"]) else "ok")
+    if backups.verify_failed(v["results"]) or v.get("err"):
+        await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{text}")
+
+
 async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = await asyncio.to_thread(checks.summary_text, CFG, STATE, None, HIST)
     await broadcast(ctx.bot, text, status_kb())
@@ -1211,7 +1264,7 @@ async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def reschedule(app: Application) -> None:
     jq = app.job_queue
-    for name in ("monitor", "summary", "backup"):
+    for name in ("monitor", "summary", "backup", "verify"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
     interval = int(CFG.get("check_interval_sec", 60))
@@ -1222,6 +1275,8 @@ def reschedule(app: Application) -> None:
     if CFG.get("backup_time"):
         h, m = map(int, CFG["backup_time"].split(":"))
         jq.run_daily(backup_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), name="backup")
+    if CFG.get("verify_backups", True):  # воскресенье (в PTB 0 = воскресенье), после ночных бэкапов
+        jq.run_daily(verify_job, time=dt.time(4, 30, tzinfo=checks.tz(CFG)), days=(0,), name="verify")
     log.info("Проверка каждые %s с, сводка: %s", interval, CFG.get("daily_summary") or "выкл")
 
 

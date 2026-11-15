@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time as dtime, timedelta
@@ -18,6 +19,7 @@ import psutil
 import smart
 
 IS_WINDOWS = platform.system() == "Windows"
+_save_lock = threading.RLock()
 LAST_SAMPLE: dict | None = None  # последний снимок из evaluate(), бот пишет его в историю
 
 
@@ -183,14 +185,8 @@ def service_state(name: str) -> str:
 
 def container_states() -> dict[str, str] | None:
     """{имя контейнера: статус} для всех контейнеров Docker, None если docker недоступен."""
-    if not shutil.which("docker"):
-        return None
-    try:
-        r = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}"],
-                           capture_output=True, text=True, timeout=15)
-    except Exception:
-        return None
-    if r.returncode != 0:
+    r = docker("ps", "-a", "--format", PS_FMT)
+    if r is None or r.returncode != 0:
         return None
     out = {}
     for line in r.stdout.splitlines():
@@ -206,7 +202,34 @@ def container_state(name: str, states: dict[str, str] | None) -> str:
     return states.get(name, "not found")
 
 
+# Форматы вывода docker. Помощник monitor-bot-action разрешает ровно эти строки.
+PS_FMT = "{{.Names}}\t{{.State}}"
+INSPECT_FMT = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+               "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
+STATS_FMT = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+HELPER = "/usr/local/sbin/monitor-bot-action"
+DOCKER_DIRECT_RETRY = 600
+_docker_mode = {"direct_until": 0.0}
+
+
+def docker_via_helper() -> bool:
+    """Linux, бот не root и помощник установлен: docker вызываем через sudo-помощник,
+    чтобы пользователю бота не нужна была группа docker (она даёт root)."""
+    return (not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() != 0 and os.path.exists(HELPER)
+            and time.time() >= _docker_mode["direct_until"])
+
+
 def docker(*args: str, timeout: int = 15) -> subprocess.CompletedProcess | None:
+    if docker_via_helper():
+        try:
+            r = subprocess.run(["sudo", "-n", HELPER, "docker", *args], capture_output=True, text=True,
+                               timeout=timeout + 5, encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        if r.returncode != 2 or "unknown command" not in r.stdout:
+            return r
+        # Старый помощник без команды docker: пока работаем напрямую (если бот ещё в группе docker)
+        _docker_mode["direct_until"] = time.time() + DOCKER_DIRECT_RETRY
     if not shutil.which("docker"):
         return None
     try:
@@ -221,9 +244,10 @@ def container_info(names: list[str]) -> dict[str, dict]:
     reason — что написала последняя проверка healthcheck (если она есть)."""
     if not names:
         return {}
-    fmt = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
-           "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
-    r = docker("inspect", "--format", fmt, *names)
+    names = [n for n in names if valid_container(n)]
+    if not names:
+        return {}
+    r = docker("inspect", "--format", INSPECT_FMT, *names)
     out: dict[str, dict] = {}
     if r is None:
         return out
@@ -248,7 +272,7 @@ def container_info(names: list[str]) -> dict[str, dict]:
 
 def container_stats() -> list[tuple[str, str, str]]:
     """[(имя, CPU%, память)] для работающих контейнеров."""
-    r = docker("stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", timeout=20)
+    r = docker("stats", "--no-stream", "--format", STATS_FMT, timeout=20)
     if r is None or r.returncode != 0:
         return []
     rows = []
@@ -259,8 +283,18 @@ def container_stats() -> list[tuple[str, str, str]]:
     return sorted(rows)
 
 
+CONTAINER_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+def valid_container(name: str) -> bool:
+    """Имя контейнера Docker: буквы, цифры, _ . -, не с «-» (иначе docker примет его за параметр)."""
+    return bool(name) and len(name) <= 128 and name[0].isalnum() and set(name) <= CONTAINER_CHARS
+
+
 def container_logs(name: str, tail: int = 30, since: int | None = None) -> str | None:
-    args = ["logs", "--tail", str(tail)] if since is None else ["logs", "--since", str(since)]
+    if not valid_container(name):
+        return None
+    args = ["logs", "--tail", str(tail)] if since is None else ["logs", "--since", str(int(since))]
     r = docker(*args, name, timeout=20)
     if r is None or r.returncode != 0:
         return None
@@ -435,29 +469,55 @@ class AlertState:
     autobans: dict[str, float] = field(default_factory=dict)   # автобан: IP → до какого времени (0 = навсегда)
     autoban_skip: dict[str, float] = field(default_factory=dict)  # IP, которые помощник не дал заблокировать
     maint_until: float = 0.0                                   # режим обслуживания: молчим и помечаем инциденты
+    known_ip_at: dict[str, float] = field(default_factory=dict)   # IP → время последнего успешного входа по SSH
+    seen_missing: dict[str, float] = field(default_factory=dict)  # авто-контейнер → с какого времени его нет
 
     path: Path | None = field(default=None, repr=False, compare=False)
+    load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
 
     @classmethod
     def load(cls, path: Path) -> "AlertState":
         st = cls()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
             for k, v in data.items():
-                if k in cls.__dataclass_fields__ and k != "path":
+                if k in cls.__dataclass_fields__ and k not in ("path", "load_error"):
                     setattr(st, k, v)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             pass
+        except (OSError, ValueError) as e:
+            # Не начинаем молча с нуля: битый файл сохраняем рядом, бот напишет об этом при запуске
+            bad = path.with_name(path.name + ".bad")
+            try:
+                os.replace(path, bad)
+            except OSError:
+                bad = path
+            st.load_error = f"{path.name} был повреждён ({type(e).__name__}), сохранён как {bad.name}"
         st.path = path
+        now = time.time()
+        for ip in st.known_ips:  # состояние из прошлой версии: времени входа ещё нет
+            st.known_ip_at.setdefault(ip, now)
         return st
 
     def save(self) -> None:
         if not self.path:
             return
-        data = {k: v for k, v in asdict(self).items() if k != "path"}
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
+        # Сохраняют из нескольких потоков (проверка в фоне и кнопки), поэтому под общей блокировкой
+        with _save_lock:
+            for attempt in range(3):
+                try:
+                    data = {k: v for k, v in asdict(self).items() if k not in ("path", "load_error")}
+                    text = json.dumps(data, ensure_ascii=False)
+                    break
+                except RuntimeError:  # словарь меняли в другом потоке прямо во время копирования
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05)
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, self.path)
 
     def muted(self, now: float) -> bool:
         return now < self.mute_until
@@ -563,8 +623,9 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     quiet = in_quiet_hours(cfg, now)
     out: list[Alert] = []
     real = results is None
+    forgotten: list[str] = []
     if real:
-        update_seen_containers(state)
+        forgotten = update_seen_containers(state, cfg, now)
     results = evaluate(cfg, state) if real else dict(results)
     if real and hist is not None:
         try:
@@ -647,6 +708,9 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:
             import logging
             logging.getLogger("monitor_bot").exception("Ошибка проверки SSL")
+        if forgotten and cfg.get("containers_auto") and not muted:
+            out.append(Alert("🗑 Контейнеры удалены больше суток назад, больше не слежу: " + ", ".join(forgotten),
+                             None, "event"))
         if state.bak_events and not muted:
             out += [Alert(t, None, "event") for t in state.bak_events]
         state.bak_events = []
@@ -676,11 +740,31 @@ def _journal(inc, op: str, *args) -> None:
         logging.getLogger("monitor_bot").exception("Журнал инцидентов: %s", op)
 
 
-def update_seen_containers(state: AlertState) -> None:
+SEEN_FORGET_SEC = 24 * 3600  # авто-контейнер, которого нет столько времени, больше не отслеживаем
+
+
+def update_seen_containers(state: AlertState, cfg: dict | None = None, now: float | None = None) -> list[str]:
+    """Запомнить работающие контейнеры (для авто-режима) и забыть удалённые больше суток назад.
+    Контейнеры из списка containers не забываются никогда. Возвращает забытые имена."""
     states = container_states()
-    for name, st in (states or {}).items():
+    if states is None:
+        return []  # docker недоступен — ничего не трогаем
+    now = now or time.time()
+    for name, st in states.items():
         if st == "running" and name not in state.seen_containers:
             state.seen_containers.append(name)
+    fixed = set((cfg or {}).get("containers") or [])
+    forgotten = []
+    for name in list(state.seen_containers):
+        if name in states or name in fixed:
+            state.seen_missing.pop(name, None)
+            continue
+        first = state.seen_missing.setdefault(name, now)
+        if now - first >= SEEN_FORGET_SEC:
+            state.seen_containers.remove(name)
+            state.seen_missing.pop(name, None)
+            forgotten.append(name)
+    return forgotten
 
 
 DEFAULT_LOG_PATTERNS = ["Traceback", "ERROR", "CRITICAL", "Exception", "FATAL"]

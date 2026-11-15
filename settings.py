@@ -67,8 +67,6 @@ DEFAULTS = {
     "ssl_alerts": True,             # предупреждать об окончании SSL-сертификатов
     "ssl_warn_days": 14,            # за сколько дней начинать предупреждать
     "heartbeat_url": None,          # URL для пинга раз в проверку (healthchecks.io и т.п.), только config.yaml
-    # Обновление бота с GitHub (только config.yaml)
-    "update_repo": "testbox017-lab/server-monitor-bot",
     # Действия из Telegram (только config.yaml, кнопками не меняются)
     "actions_enabled": True,
     "action_services": [],      # какие службы можно перезапускать; должны совпадать с /etc/monitor-bot/allowed-services

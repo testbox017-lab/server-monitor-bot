@@ -155,7 +155,7 @@ def actions_menu() -> tuple[str, InlineKeyboardMarkup]:
                  Btn("⛔ Остановить процесс", callback_data="act:killmenu")])
     rows.append([Btn("📜 Журнал действий", callback_data="act:log"),
                  Btn("🔄 Перезагрузить сервер", callback_data="act:reboot")])
-    text = ("🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Контейнеры перезапускаются через docker, "
+    text = ("🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Контейнеры перезапускаются через помощник, "
             "службы — только из списка action_services в config.yaml.")
     return text, InlineKeyboardMarkup(rows)
 
@@ -307,14 +307,23 @@ def interval_view() -> tuple[str, InlineKeyboardMarkup]:
             kb([Btn(("• " if cur == s else "") + t, callback_data=f"int:{s}") for s, t in opts], [BACK]))
 
 
+def toggle_btn(label: str, kind: str, name: str) -> Btn:
+    """Кнопка «перестать отслеживать». Telegram ограничивает callback_data 64 байтами: обрезать имя нельзя
+    (обрезанное имя добавилось бы в список как новое), поэтому для длинного имени кнопка ничего не делает."""
+    data = f"tg:{kind}:{name}"
+    if len(data.encode()) <= 64:
+        return Btn(label, callback_data=data)
+    return Btn(label + " (длинное имя, убрать можно в config.yaml)", callback_data="noop")
+
+
 def watch_view() -> tuple[str, InlineKeyboardMarkup]:
     rows = []
     for svc in CFG.get("services") or []:
-        rows.append([Btn(f"✅ служба {svc}", callback_data=f"tg:services:{svc}"[:64])])
+        rows.append([toggle_btn(f"✅ служба {svc}", "services", svc)])
     for c in CFG.get("containers") or []:
-        rows.append([Btn(f"✅ контейнер {c}", callback_data=f"tg:containers:{c}"[:64])])
+        rows.append([toggle_btn(f"✅ контейнер {c}", "containers", c)])
     for p in CFG.get("processes") or []:
-        rows.append([Btn(f"✅ процесс {p}", callback_data=f"tg:processes:{p}"[:64])])
+        rows.append([toggle_btn(f"✅ процесс {p}", "processes", p)])
     rows.append([Btn("➕ Служба", callback_data="add:services"), Btn("➕ Контейнер", callback_data="add:containers")])
     rows.append([BACK])
     return ("👁 <b>Что отслеживать</b>\nНажмите на элемент, чтобы перестать его отслеживать.",
@@ -330,8 +339,8 @@ async def add_view(kind: str) -> tuple[str, InlineKeyboardMarkup]:
         found = sorted(states or {})
         title = "контейнеры"
     current = set(CFG.get(kind) or [])
-    btns = [Btn(f"{onoff(n in current)} {n}", callback_data=f"tg:{kind}:{n}:add"[:64])
-            for n in found if len(f"tg:{kind}:{n}:add") <= 64]
+    btns = [Btn(f"{onoff(n in current)} {n}", callback_data=f"tg:{kind}:{n}:add")
+            for n in found if len(f"tg:{kind}:{n}:add".encode()) <= 64]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([Btn("⬅️ Назад", callback_data="set:watch")])
     text = f"➕ <b>Работающие {title} на сервере</b>\nНажмите, чтобы включить или выключить отслеживание."
@@ -415,8 +424,8 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
             f"Внешний контроль (heartbeat_url в config.yaml): {hb_text}\n"
             "Подбор пароля: алерт, если неудачных попыток за 10 минут больше порога, не чаще раза в час.\n"
             + (f"Автобан: IP с {ab_thr} и больше неудачными попытками за 10 минут блокируется "
-               f"{security.ban_duration_text(ab_h)}. IP, с которых уже входили по SSH, и открытые сейчас "
-               "SSH-сессии не блокируются никогда." if CFG.get("autoban", True) else "Автобан: выкл"))
+               f"{security.ban_duration_text(ab_h)}. IP, с которых входили по SSH за 30 дней, и открытые "
+               "сейчас SSH-сессии не блокируются." if CFG.get("autoban", True) else "Автобан: выкл"))
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -426,7 +435,9 @@ LATEST: dict = {}  # последняя проверка GitHub: {"sha", "messag
 
 
 def update_repo() -> str:
-    return str(CFG.get("update_repo") or updater.DEFAULT_REPO)
+    """Репозиторий, из которого ставит обновления помощник (/etc/monitor-bot/update-repo или по умолчанию).
+    Берём его же, иначе бот показал бы изменения одного репозитория, а помощник поставил бы код из другого."""
+    return updater.helper_repo() or updater.DEFAULT_REPO
 
 
 def check_updates() -> None:
@@ -611,8 +622,17 @@ def run_probes_now() -> None:
 # ---------- Доступ и отправка ----------
 
 def allowed(update: Update) -> bool:
+    """Личный чат из allowed_chats. В группе (если её chat_id добавлен в allowed_chats) команды принимаются
+    только от людей из allowed_users или чьи личные chat_id есть в allowed_chats: иначе сервером управлял бы
+    любой участник группы."""
     chat = update.effective_chat
-    return bool(chat) and chat.id in CFG["allowed_chats"]
+    if not chat or chat.id not in CFG["allowed_chats"]:
+        return False
+    if chat.type == "private":
+        return True
+    user = update.effective_user
+    trusted = set(CFG["allowed_chats"]) | {int(x) for x in (CFG.get("allowed_users") or [])}
+    return bool(user) and user.id in trusted
 
 
 async def send(update: Update, text: str, markup=None) -> None:
@@ -676,6 +696,9 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                    kb(*[btns[i:i + 2] for i in range(0, len(btns), 2)]) if btns else None)
         return
     name = ctx.args[0]
+    if not checks.valid_container(name):
+        await send(update, f"Неверное имя контейнера: {html.escape(name[:64])}")
+        return
     tail = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 30
     tail = max(1, min(tail, 300))
     await send(update, await asyncio.to_thread(checks.logs_text, name, tail), logs_kb(name, 30 if tail == 30 else 100))
@@ -739,6 +762,9 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, settings_text(), settings_kb())
 
 
+MAX_MUTE_SEC = 30 * 86400
+
+
 def parse_duration(s: str) -> int | None:
     s = s.strip().lower()
     mult = {"m": 60, "м": 60, "h": 3600, "ч": 3600, "d": 86400, "д": 86400}
@@ -746,7 +772,7 @@ def parse_duration(s: str) -> int | None:
         if s[-1] in mult:
             return int(float(s[:-1]) * mult[s[-1]])
         return int(float(s) * 60)
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, OverflowError):  # «1e400d» даёт бесконечность
         return None
 
 
@@ -754,8 +780,8 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     sec = parse_duration(ctx.args[0]) if ctx.args else 3600
-    if not sec or sec <= 0:
-        await send(update, "Формат: /mute 30m, /mute 2h, /mute 1d")
+    if not sec or sec <= 0 or sec > MAX_MUTE_SEC:
+        await send(update, "Формат: /mute 30m, /mute 2h, /mute 1d (до 30 дней)")
         return
     await send(update, set_mute(time.time() + sec))
 
@@ -976,6 +1002,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await edit(update, *security_view())
         elif cmd == "secforget":
             STATE.known_ips = []
+            STATE.known_ip_at = {}
             STATE.save()
             note = "Следующий вход с любого IP придёт как новый"
             await edit(update, *security_view())
@@ -1332,14 +1359,20 @@ def ban_log(ip: str, kind: str, ok: bool, out: str) -> None:
 def autoban_step(now: float) -> tuple[list[tuple[str, int]], list[str]]:
     """Снять истёкшие автобаны и заблокировать новых подборщиков. ([(ip, попыток)], [снятые ip])."""
     lifted = []
+    changed_unban = False
     if not actions_on():
         return [], lifted
     for ip in security.expired_autobans(STATE, now):
         ok, out = ACT._helper("unban-ip", ip, timeout=30)
         ban_log(ip, "unban", ok, "автобан истёк: " + out)
-        STATE.autobans.pop(ip, None)
-        if ok:
-            lifted.append(ip)
+        if ok or out == actions.HELPER_ERRORS["not banned by monitor-bot"]:  # сняли или правила уже нет
+            STATE.autobans.pop(ip, None)
+            if ok:
+                lifted.append(ip)
+        else:  # не забываем бан, иначе он стал бы вечным: повторим через час
+            STATE.autobans[ip] = now + security.AUTOBAN_RETRY
+            changed_unban = True
+            log.warning("Не удалось снять автобан %s: %s", ip, out)
     banned = []
     hours = CFG.get("autoban_hours")
     hours = 24 if hours is None else int(hours)
@@ -1354,7 +1387,7 @@ def autoban_step(now: float) -> tuple[list[tuple[str, int]], list[str]]:
             if not ok:
                 log.warning("Автобан %s не удался: %s", ip, out)
     STATE.autoban_skip = {ip: ts for ip, ts in STATE.autoban_skip.items() if now - ts < security.AUTOBAN_RETRY}
-    if banned or lifted:
+    if banned or lifted or changed_unban:
         STATE.save()
     return banned, lifted
 
@@ -1499,6 +1532,9 @@ async def on_startup(app: Application) -> None:
         parts.append(f"▶️ Мониторинг запущен на {html.escape(HOST)}")
     if reboot_msg:
         parts.append(reboot_msg)
+    if STATE.load_error:
+        parts.append(f"⚠️ {STATE.load_error}. Состояние начато заново: алерты, известные IP и сроки автобанов "
+                     "сброшены. Заблокированные IP видны в «Безопасность → Заблокированные IP».")
     if parts:
         for chat_id in CFG["allowed_chats"]:
             try:
@@ -1508,7 +1544,8 @@ async def on_startup(app: Application) -> None:
 
 
 def build_app() -> Application:
-    app = Application.builder().token(CFG["token"]).post_init(on_startup).build()
+    # concurrent_updates: долгое действие (очистка места, проверка копий) не задерживает ответы на другие кнопки
+    app = Application.builder().token(CFG["token"]).post_init(on_startup).concurrent_updates(8).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),

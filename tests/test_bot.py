@@ -1,5 +1,6 @@
 """Проверки логики без Telegram: python -m unittest discover tests"""
 import asyncio
+import io
 import json
 import os
 import sys
@@ -401,6 +402,7 @@ class HelperScriptTest(unittest.TestCase):
                    mock.patch.object(h, "LOCK_FILE", str(base / "lock")),
                    mock.patch.object(h, "NOT_AUTO", (("deploy/monitor-bot-action", str(installed_helper)),)),
                    mock.patch.object(h, "download", return_value=str(new_src)),
+                   mock.patch.object(h, "check_ownership"), mock.patch.object(h, "check_in_main"),
                    mock.patch.object(h.os, "chown"), mock.patch.object(h, "gid", return_value=0)]
         for p_ in patches:
             p_.start()
@@ -558,12 +560,12 @@ Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
             self.assertEqual(self.code("ban-ip", "91.240.118.7"), 2)         # открытая SSH-сессия
             with mock.patch("builtins.print"):
                 h.main(["ban-ip", "45.155.205.233"])
-            self.assertEqual(calls[-1], ["ufw", "insert", "1", "deny", "from", "45.155.205.233", "to", "any",
+            self.assertEqual(calls[-1], ["ufw", "prepend", "deny", "from", "45.155.205.233", "to", "any",
                                          "comment", "monitor-bot"])
             n = len(calls)
             with mock.patch("builtins.print"):
                 h.main(["ban-ip", "185.220.101.5"])                          # уже заблокирован
-            self.assertFalse(any(c[:2] == ["ufw", "insert"] for c in calls[n:]))
+            self.assertFalse(any(c[:2] == ["ufw", "prepend"] for c in calls[n:]))
             self.assertEqual(self.code("unban-ip", "94.102.61.1"), 1)      # блокировал не бот
             with mock.patch("builtins.print"):
                 h.main(["unban-ip", "185.220.101.5"])
@@ -1095,6 +1097,7 @@ class BotButtonsTest(unittest.TestCase):
         upd.effective_message.reply_photo = mock.AsyncMock()
         upd.callback_query = q
         upd.effective_chat.id = chat
+        upd.effective_chat.type = "private"
         upd.effective_message.reply_text = mock.AsyncMock()
         ctx = mock.MagicMock()
         ctx.bot.send_document = mock.AsyncMock()
@@ -1285,6 +1288,7 @@ class BotButtonsTest(unittest.TestCase):
         b.S.reset()
         upd = mock.MagicMock()
         upd.effective_chat.id = 42
+        upd.effective_chat.type = "private"
         upd.effective_message.reply_text = mock.AsyncMock()
         ctx = mock.MagicMock()
         ctx.args = ["site.ru"]
@@ -1954,6 +1958,312 @@ class MaintenanceBotTest(unittest.TestCase):
         b.STATE.since = saved
         self.assertIn("maint", [c for c, _ in b.COMMANDS])
         b.S.reset()
+
+
+# ---------- исправления по ревью 2026-11-15 ----------
+
+class ReviewFixesHelperTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.h = load_helper()
+
+    def code(self, *argv):
+        with mock.patch("builtins.print"), self.assertRaises(SystemExit) as e:
+            self.h.main(list(argv))
+        return e.exception.code
+
+    def test_docker_formats_match_bot(self):
+        self.assertEqual(self.h.PS_FMT, checks.PS_FMT)
+        self.assertEqual(self.h.INSPECT_FMT, checks.INSPECT_FMT)
+        self.assertEqual(self.h.STATS_FMT, checks.STATS_FMT)
+
+    def test_docker_allowlist(self):
+        h = self.h
+        with mock.patch.object(h.subprocess, "run") as run:
+            for bad in (["run", "-v", "/:/host", "alpine"], ["ps", "-a", "--format", "{{json .}}"],
+                        ["inspect", "--format", "{{.Config.Env}}", "w"], ["logs", "--tail", "30", "-f"],
+                        ["logs", "--tail", "99999", "w"], ["restart", "--time=0"], ["exec", "w", "sh"],
+                        ["inspect", "--format", h.INSPECT_FMT, "w;rm"]):
+                self.assertEqual(self.code("docker", *bad), 2, bad)
+            run.assert_not_called()
+            run.return_value = mock.Mock(returncode=0, stdout=b"w\trunning\n", stderr=b"")
+            with mock.patch.object(h.sys, "stdout", mock.Mock()), mock.patch.object(h.sys, "stderr", mock.Mock()):
+                for good in (["ps", "-a", "--format", h.PS_FMT], ["stats", "--no-stream", "--format", h.STATS_FMT],
+                             ["inspect", "--format", h.INSPECT_FMT, "weather-bot", "x"],
+                             ["logs", "--tail", "30", "weather-bot"], ["logs", "--since", "1800000000", "w"],
+                             ["restart", "weather-bot"]):
+                    self.assertEqual(self.code("docker", *good), 0, good)
+                    self.assertEqual(run.call_args.args[0], ["docker", *good])
+
+    def test_kill_protects_packages_and_update(self):
+        h = self.h
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(child.kill)
+        for comm in ("dpkg", "apt-get", "unattended-upgr", "containerd-shim", "systemd-udevd", "sshd-auth"):
+            with mock.patch.object(h, "proc_name", return_value=comm), mock.patch.object(h.os, "kill") as k:
+                self.assertEqual(self.code("kill", str(child.pid)), 2, comm)
+                k.assert_not_called()
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if str(path).endswith("/cgroup"):
+                return io.StringIO("0::/system.slice/monitor-bot-update-abcdef1.service\n")
+            return real_open(path, *a, **kw)
+        with mock.patch("builtins.open", fake_open), mock.patch.object(h.os, "kill") as k:
+            self.assertEqual(self.code("kill", str(child.pid)), 2)
+            k.assert_not_called()
+
+    def test_check_in_main(self):
+        h = self.h
+        h.check_in_main("a" * 40, api_fn=lambda p: {"status": "behind"})
+        h.check_in_main("a" * 40, api_fn=lambda p: {"status": "identical"})
+        for st in ("diverged", "ahead", None):
+            with self.assertRaises(RuntimeError):
+                h.check_in_main("a" * 40, api_fn=lambda p, st=st: {"status": st})
+
+    def test_update_refuses_commit_outside_main(self):
+        h = self.h
+        base = Path(tempfile.mkdtemp())
+        with mock.patch.object(h, "RESULT_FILE", str(base / "res.json")), \
+             mock.patch.object(h, "LOCK_FILE", str(base / "lock")), \
+             mock.patch.object(h, "check_ownership"), \
+             mock.patch.object(h, "github_api", return_value={"status": "diverged"}), \
+             mock.patch.object(h, "download") as dl:
+            h.update_run("c" * 40)
+        dl.assert_not_called()
+        res = json.loads((base / "res.json").read_text())
+        self.assertFalse(res["ok"])
+        self.assertIn("не входит в ветку main", res["error"])
+
+    def test_unsafe_paths(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "bin").mkdir()
+        (d / "bin" / "pip").write_text("x")
+        if os.geteuid() == 0:
+            os.chmod(d, 0o755)
+            os.chmod(d / "bin", 0o755)
+            os.chmod(d / "bin" / "pip", 0o644)
+            self.assertEqual(self.h.unsafe_paths(str(d)), [])
+            os.chmod(d / "bin" / "pip", 0o666)
+            self.assertEqual(self.h.unsafe_paths(str(d)), [str(d / "bin" / "pip")])
+        else:
+            self.assertIn(str(d), self.h.unsafe_paths(str(d)))  # владелец не root
+
+    def test_pip_only_wheels(self):
+        with mock.patch.object(self.h, "run") as run:
+            self.h.pip_install("/x/requirements.txt")
+        self.assertIn("--only-binary=:all:", run.call_args.args[0])
+
+    def test_copy_code_does_not_follow_planted_symlink(self):
+        h = self.h
+        base = Path(tempfile.mkdtemp())
+        src, dst = base / "src", base / "dst"
+        src.mkdir()
+        dst.mkdir()
+        (src / "bot.py").write_text("new\n")
+        target = base / "victim"
+        target.write_text("secret\n")
+        (dst / "bot.py").symlink_to(target)
+        with mock.patch.object(h.os, "chown"):
+            h.copy_code(str(src), str(dst), 0)
+        self.assertEqual(target.read_text(), "secret\n")
+        self.assertFalse((dst / "bot.py").is_symlink())
+        self.assertEqual((dst / "bot.py").read_text(), "new\n")
+
+    def test_hardlink_refused_without_protection(self):
+        h = self.h
+        d = Path(tempfile.mkdtemp())
+        (d / "a").write_text("x")
+        os.link(d / "a", d / "b")
+        with mock.patch.object(h, "hardlinks_protected", return_value=False):
+            with self.assertRaises(OSError):
+                h.open_regular(str(d / "b"))
+        with mock.patch.object(h, "hardlinks_protected", return_value=True):
+            h.open_regular(str(d / "b")).close()
+
+    def test_sshd_ports(self):
+        h = self.h
+        ss = ('LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n'
+              'LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=2,fd=3))\n')
+
+        def run(cmd, timeout=300):
+            if cmd[0] == "ss" and "-tlnp" in cmd:
+                return mock.Mock(returncode=0, stdout=ss, stderr="")
+            if cmd[0] == "ss":
+                return mock.Mock(returncode=0, stdout="0 0 5.1.1.1:2222 91.240.118.7:5000\n"
+                                                      "0 0 5.1.1.1:80 80.94.95.3:4000\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(h, "run", run):
+            self.assertEqual(h.sshd_ports(), {"2222"})
+            self.assertEqual(h.ssh_peers(), {"91.240.118.7"})
+        sock = mock.Mock(returncode=0, stdout="[::]:2200 (Stream)\n", stderr="")
+        with mock.patch.object(h, "run", lambda cmd, timeout=300: sock if cmd[0] == "systemctl"
+                               else mock.Mock(returncode=0, stdout="", stderr="")):
+            self.assertEqual(h.sshd_ports(), {"2200"})
+
+
+class ReviewFixesTest(unittest.TestCase):
+    def test_ssh_username_injection(self):
+        text = ("Invalid user x from 8.8.8.8 port 1 from 203.0.113.9 port 51000\n"
+                "Failed password for invalid user x from 8.8.8.8 port 1 from 203.0.113.9 port 51000 ssh2\n")
+        _, failed = security.parse_ssh(text)
+        self.assertEqual(failed, {"203.0.113.9": 1})
+
+    def test_ssh_invalid_user_counted_once(self):
+        text = ("Invalid user bob from 1.2.3.4 port 5\n"
+                "Failed password for invalid user bob from 1.2.3.4 port 5 ssh2\n"
+                "Failed password for invalid user bob from 1.2.3.4 port 5 ssh2\n"
+                "Invalid user eve from 1.2.3.4 port 6\n")
+        _, failed = security.parse_ssh(text)
+        self.assertEqual(failed, {"1.2.3.4": 3})   # два пароля в одном соединении + одно без пароля
+
+    def test_ssh_read_while_muted(self):
+        cfg = {"ssh_alerts": True, "port_alerts": False, "update_alerts": False}
+        st = checks.AlertState(ssh_checked=T0)
+        text = ("Failed password for root from 1.1.1.1 port 1 ssh2\n"
+                "Accepted publickey for root from 203.0.113.5 port 2 ssh2: ED25519 SHA256:x\n")
+        out = security.events(cfg, st, T0 + 60, True, False, ssh_text_fn=lambda since: text)
+        self.assertEqual(out, [])                         # молчим
+        self.assertEqual(st.ssh_failed[0][1:], ["1.1.1.1", 1])  # но попытки посчитаны (автобан работает)
+        self.assertIn("203.0.113.5", st.known_ips)
+
+    def test_known_ips_expire_for_autoban(self):
+        st = checks.AlertState(known_ips=["80.94.95.3"], known_ip_at={"80.94.95.3": T0},
+                               ssh_failed=[[T0 + 40 * 86400, "80.94.95.3", 50]])
+        cfg = {"autoban_threshold": 10}
+        self.assertEqual(security.autoban_candidates(cfg, st, T0 + 40 * 86400 + 10), [("80.94.95.3", 50)])
+        st.known_ip_at["80.94.95.3"] = T0 + 39 * 86400
+        self.assertEqual(security.autoban_candidates(cfg, st, T0 + 40 * 86400 + 10), [])
+
+    def test_corrupt_state_kept_and_reported(self):
+        p = TMP / "state_corrupt.json"
+        p.write_text("{not json", encoding="utf-8")
+        st = checks.AlertState.load(p)
+        self.assertIn("повреждён", st.load_error)
+        self.assertTrue((TMP / "state_corrupt.json.bad").exists())
+        st.save()
+        self.assertNotIn("load_error", json.loads(p.read_text()))
+        self.assertEqual(checks.AlertState.load(p).load_error, "")
+
+    def test_old_state_gets_known_ip_time(self):
+        p = TMP / "state_old_ips.json"
+        p.write_text(json.dumps({"known_ips": ["1.2.3.4"]}), encoding="utf-8")
+        st = checks.AlertState.load(p)
+        self.assertIn("1.2.3.4", st.known_ip_at)
+
+    def test_save_from_threads(self):
+        import threading
+        st = checks.AlertState.load(TMP / "state_threads.json")
+        errors = []
+
+        def work(i):
+            try:
+                for j in range(30):
+                    st.since[f"k{i}-{j}"] = j
+                    st.save()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+        ts = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(json.loads((TMP / "state_threads.json").read_text())["since"]), 120)
+
+    def test_seen_containers_forgotten_after_a_day(self):
+        st = checks.AlertState(seen_containers=["keep", "tmp", "fixed"])
+        cfg = {"containers": ["fixed"]}
+        with mock.patch.object(checks, "container_states", return_value={"keep": "exited"}):
+            self.assertEqual(checks.update_seen_containers(st, cfg, T0), [])
+            self.assertEqual(checks.update_seen_containers(st, cfg, T0 + 86400), ["tmp"])
+        self.assertEqual(st.seen_containers, ["keep", "fixed"])
+        with mock.patch.object(checks, "container_states", return_value=None):  # docker недоступен
+            self.assertEqual(checks.update_seen_containers(st, cfg, T0 + 10 * 86400), [])
+        self.assertEqual(st.seen_containers, ["keep", "fixed"])
+
+    def test_container_name_validation(self):
+        self.assertTrue(checks.valid_container("weather-bot"))
+        for bad in ("-f", "--follow", "", "a b", "a;b", "x" * 200, "имя"):
+            self.assertFalse(checks.valid_container(bad), bad)
+        with mock.patch.object(checks, "docker") as d:
+            self.assertIsNone(checks.container_logs("--follow"))
+            d.assert_not_called()
+
+    def test_docker_via_helper_and_fallback(self):
+        checks._docker_mode["direct_until"] = 0.0
+        self.addCleanup(checks._docker_mode.update, {"direct_until": 0.0})
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[0] == "sudo":
+                return mock.Mock(returncode=2, stdout="unknown command\n", stderr="")
+            return mock.Mock(returncode=0, stdout="w\trunning\n", stderr="")
+        with mock.patch.object(checks, "docker_via_helper", side_effect=[True, False]), \
+             mock.patch.object(checks.shutil, "which", return_value="/usr/bin/docker"), \
+             mock.patch.object(checks.subprocess, "run", run):
+            self.assertEqual(checks.container_states(), {"w": "running"})
+        self.assertEqual(calls[0][:4], ["sudo", "-n", checks.HELPER, "docker"])
+        self.assertEqual(calls[1][0], "docker")              # старый помощник: напрямую
+        self.assertGreater(checks._docker_mode["direct_until"], time.time())
+
+    def test_helper_repo(self):
+        f = TMP / "update-repo"
+        f.write_text("someone/fork\n")
+        self.assertEqual(updater.helper_repo(f), "someone/fork")
+        f.write_text("bad repo; rm\n")
+        self.assertIsNone(updater.helper_repo(f))
+        self.assertIsNone(updater.helper_repo(TMP / "no-such-file"))
+
+
+class ReviewFixesBotTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def test_parse_duration_overflow(self):
+        self.assertIsNone(self.bot.parse_duration("1e400d"))
+        self.assertEqual(self.bot.parse_duration("2h"), 7200)
+
+    def test_allowed_in_group(self):
+        b = self.bot
+        upd = mock.MagicMock()
+        upd.effective_chat.id = 42
+        upd.effective_chat.type = "private"
+        self.assertTrue(b.allowed(upd))
+        upd.effective_chat.id = 7
+        self.assertFalse(b.allowed(upd))
+        b.CFG["allowed_chats"] = [42, -100500]
+        try:
+            upd.effective_chat.id = -100500
+            upd.effective_chat.type = "supergroup"
+            upd.effective_user.id = 999
+            self.assertFalse(b.allowed(upd))     # чужой участник группы
+            upd.effective_user.id = 42
+            self.assertTrue(b.allowed(upd))
+        finally:
+            b.CFG["allowed_chats"] = [42]
+
+    def test_long_name_button_not_truncated(self):
+        btn = self.bot.toggle_btn("x", "services", "a" * 80)
+        self.assertEqual(btn.callback_data, "noop")
+        self.assertEqual(self.bot.toggle_btn("x", "services", "cron").callback_data, "tg:services:cron")
+
+    def test_failed_unban_is_retried_not_forgotten(self):
+        b = self.bot
+        saved = (dict(b.STATE.autobans), b.STATE.ssh_failed)
+        self.addCleanup(lambda: (setattr(b.STATE, "autobans", saved[0]), setattr(b.STATE, "ssh_failed", saved[1])))
+        now = time.time()
+        b.STATE.autobans = {"45.155.205.9": now - 5}
+        b.STATE.ssh_failed = []
+        with mock.patch.object(b.ACT, "_helper", return_value=(False, "ufw failed")):
+            banned, lifted = b.autoban_step(now)
+        self.assertEqual(lifted, [])
+        self.assertGreater(b.STATE.autobans["45.155.205.9"], now)   # повторим позже
+        with mock.patch.object(b.ACT, "_helper", return_value=(False, "этот IP блокировал не бот")):
+            b.autoban_step(now + 4000)
+        self.assertNotIn("45.155.205.9", b.STATE.autobans)          # правила уже нет — забываем
 
 
 if __name__ == "__main__":

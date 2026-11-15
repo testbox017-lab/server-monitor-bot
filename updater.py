@@ -11,6 +11,17 @@ APP_DIR = Path(__file__).resolve().parent
 RESULT_FILE = Path("/run/monitor-bot-update.json")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_REPO = "testbox017-lab/server-monitor-bot"
+HELPER_REPO_FILE = Path("/etc/monitor-bot/update-repo")  # отсюда берёт репозиторий помощник
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def helper_repo(path: Path = HELPER_REPO_FILE) -> str | None:
+    """Репозиторий из файла помощника, None — файла нет (тогда помощник берёт DEFAULT_REPO)."""
+    try:
+        r = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return r if REPO_RE.match(r) else None
 
 
 def current(app_dir: Path = APP_DIR) -> dict:

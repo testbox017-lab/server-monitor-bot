@@ -533,7 +533,7 @@ class Alert:
 
 
 def step(cfg: dict, state: AlertState, now: float | None = None,
-         results: dict[str, str | None] | None = None, hist=None) -> list[Alert]:
+         results: dict[str, str | None] | None = None, hist=None, inc=None) -> list[Alert]:
     """Одна итерация проверки. Возвращает сообщения для отправки и сохраняет состояние."""
     now = now or time.time()
     th = cfg.get("thresholds", {})
@@ -561,6 +561,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             need = smart.anomaly_duration(duration) if key.startswith("anom:") else duration
             if not (instant_keys(key) or now - state.since[key] >= need):
                 continue
+            _journal(inc, "open", key, problem, state.since[key])  # в журнал — даже в тихие часы
             snoozed = state.snoozed.get(key, 0) > now
             suppressed = muted or snoozed or (quiet and not is_critical(key))
             if suppressed:
@@ -578,6 +579,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 out.append(Alert(f"⏰ Всё ещё не решено ({mins} мин): {problem}", key, "remind"))
         else:
             state.since.pop(key, None)
+            _journal(inc, "close", key, now)
             if key in state.active:
                 state.active.remove(key)
                 state.last_sent.pop(key, None)
@@ -589,6 +591,9 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                     out.append(Alert(f"✅ Восстановлено: {key_label(key)}", key, "recovered"))
 
     # Ключи, которых больше нет в проверке (убрали из настроек) — забываем молча
+    if inc is not None:
+        for key in inc.open_keys() - set(results):
+            _journal(inc, "close", key, now)
     for key in list(state.active):
         if key not in results:
             state.active.remove(key)
@@ -632,9 +637,23 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 import logging
                 logging.getLogger("monitor_bot").exception("Ошибка прогноза памяти")
 
+    for a in out:
+        if a.kind == "event":
+            _journal(inc, "event", a.key, a.text, now)
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]
     state.save()
     return out
+
+
+def _journal(inc, op: str, *args) -> None:
+    """Запись в журнал инцидентов не должна ломать проверку."""
+    if inc is None:
+        return
+    try:
+        getattr(inc, op)(*args)
+    except Exception:
+        import logging
+        logging.getLogger("monitor_bot").exception("Журнал инцидентов: %s", op)
 
 
 def update_seen_containers(state: AlertState) -> None:

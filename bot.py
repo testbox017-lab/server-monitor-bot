@@ -26,6 +26,7 @@ import actions
 import backups
 import checks
 import history
+import incidents
 import network
 import probes
 import security
@@ -42,6 +43,7 @@ CFG = S.cfg  # общий словарь, обновляется на месте
 STATE = checks.AlertState.load(S.dir / "state.json")
 HIST = history.History(S.dir / "metrics.db")
 ACT = actions.Actions(S.dir / "actions.log")
+INC = incidents.Incidents(S.dir / "metrics.db")
 HOST = checks.platform.node()
 
 # ---------- Клавиатуры ----------
@@ -198,7 +200,7 @@ def logs_kb(name: str, tail: int) -> InlineKeyboardMarkup:
 
 
 def alerts_kb() -> InlineKeyboardMarkup:
-    rows = [[Btn("🔄 Обновить", callback_data="alerts")]]
+    rows = [[Btn("🔄 Обновить", callback_data="alerts"), Btn("📒 Журнал", callback_data="inc")]]
     if STATE.muted(time.time()):
         rows.append([Btn("🔔 Включить уведомления", callback_data="mute:off")])
     else:
@@ -249,6 +251,7 @@ def settings_text() -> str:
         f"Тихие часы: {q['start']}–{q['end']}" if q else "Тихие часы: выкл",
         f"Напоминать о нерешённой проблеме: каждые {remind} мин" if remind else "Напоминания: выкл",
         f"Ежедневная сводка: в {summary}" if summary else "Ежедневная сводка: выкл",
+        f"Недельный отчёт: по понедельникам в {CFG['weekly_report']}" if CFG.get("weekly_report") else "Недельный отчёт: выкл",
         f"Служб: {len(CFG.get('services') or [])}, контейнеров: {len(CFG.get('containers') or [])}, "
         f"процессов: {len(CFG.get('processes') or [])}",
         "Docker: " + ("все контейнеры" if CFG.get("containers_auto") else "только из списка")
@@ -265,7 +268,7 @@ def settings_kb() -> InlineKeyboardMarkup:
     return kb([Btn("📏 Пороги", callback_data="set:th"), Btn("⏱ Интервал", callback_data="set:int")],
               [Btn("👁 Что отслеживать", callback_data="set:watch")],
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
-              [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
+              [Btn("📋 Сводки и отчёт", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
               [Btn("🛡 Безопасность", callback_data="set:sec"), Btn("🌐 Сайты и порты", callback_data="set:probes")],
               [Btn("🧠 Умные алерты", callback_data="set:smart"), Btn("💾 Бэкапы", callback_data="set:backup")],
               [Btn("⬆️ Обновление бота", callback_data="set:update")],
@@ -352,7 +355,14 @@ def summary_view() -> tuple[str, InlineKeyboardMarkup]:
     cur = CFG.get("daily_summary")
     btns = [Btn(("• " if cur == t else "") + (t or "Выкл"), callback_data=f"summary:{t or 'off'}")
             for t in (None, "09:00", "20:00")]
-    return ("📋 <b>Ежедневная сводка</b>\nСостояние сервера и алерты за сутки.", kb(btns, [BACK]))
+    wk = CFG.get("weekly_report")
+    wbtns = [Btn(("• " if wk == t else "") + (t or "Выкл"), callback_data=f"wk:time:{t or 'off'}")
+             for t in (None, "09:00", "20:00")]
+    return ("📋 <b>Сводки</b>\nЕжедневная: состояние сервера и алерты за сутки.\n"
+            "Недельная (по понедельникам): инциденты и простой, доступность сайтов, нагрузка, события, "
+            "бэкапы и график за 7 дней.",
+            kb([Btn("Каждый день:", callback_data="noop")], btns, [Btn("По понедельникам:", callback_data="noop")],
+               wbtns, [Btn("📅 Прислать недельный отчёт сейчас", callback_data="wk:now")], [BACK]))
 
 
 def docker_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -692,6 +702,15 @@ async def cmd_probe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await send(update, *probes_view())
 
 
+async def cmd_incidents(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await send(update, await asyncio.to_thread(incidents.incidents_text, INC, CFG), inc_kb())
+
+
+def inc_kb() -> InlineKeyboardMarkup:
+    return kb([Btn("🔄 Обновить", callback_data="inc:r"), Btn("📅 Отчёт за неделю", callback_data="wk:now")])
+
+
 async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
         await send(update, *(await asyncio.to_thread(backup_view)))
@@ -1027,6 +1046,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             S.set("daily_summary", None if parts[1] == "off" else ":".join(parts[1:]))
             reschedule(ctx.application)
             await edit(update, *summary_view())
+        elif cmd == "inc":
+            text = await asyncio.to_thread(incidents.incidents_text, INC, CFG)
+            if len(parts) > 1:
+                await edit(update, text, inc_kb())
+            else:
+                await send(update, text, inc_kb())
+        elif cmd == "wk":
+            if parts[1] == "now":
+                await q.answer("Собираю отчёт…")
+                answered = True
+                await send_weekly(ctx.bot, [update.effective_chat.id])
+            else:
+                S.set("weekly_report", None if parts[2] == "off" else ":".join(parts[2:]))
+                reschedule(ctx.application)
+                note = "Сохранено"
+                await edit(update, *summary_view())
         if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr", "sm", "bk") and note is None:
             note = "Сохранено"
     except Exception:
@@ -1192,7 +1227,7 @@ async def broadcast(bot, text: str, markup=None) -> None:
 
 async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        alerts = await asyncio.to_thread(checks.step, CFG, STATE, None, None, HIST)
+        alerts = await asyncio.to_thread(checks.step, CFG, STATE, None, None, HIST, INC)
     except Exception:
         log.exception("Ошибка проверки")
         return
@@ -1257,6 +1292,43 @@ async def verify_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{text}")
 
 
+def weekly_extra() -> list[str]:
+    lines = ["💾 Бэкапы:", "  " + verify_line(), "  " + backups.offsite_text(CFG, time.time())]
+    ok, out = ACT._helper("banned-list", timeout=20)
+    try:
+        n = len(json.loads(out)) if ok else None
+    except ValueError:
+        n = None
+    if n is not None:
+        lines.append(f"🚫 Заблокировано IP ботом: {n}")
+    return lines
+
+
+async def send_weekly(bot, chat_ids: list[int]) -> None:
+    def build():
+        now = time.time()
+        text = incidents.weekly_text(CFG, INC, HIST, now, weekly_extra())
+        try:
+            png = history.chart_png(HIST, "7d", checks.tz(CFG), HOST, now)
+        except Exception:
+            log.exception("Не удалось построить график для отчёта")
+            png = None
+        return text, png
+    text, png = await asyncio.to_thread(build)
+    text = f"<b>{html.escape(HOST)}</b>\n{text}"
+    for c in chat_ids:
+        try:
+            await bot.send_message(c, text, parse_mode=ParseMode.HTML)
+            if png:
+                await bot.send_photo(c, photo=png, caption="📈 За 7 дней")
+        except Exception:
+            log.exception("Не удалось отправить недельный отчёт в %s", c)
+
+
+async def weekly_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_weekly(ctx.bot, CFG["allowed_chats"])
+
+
 async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = await asyncio.to_thread(checks.summary_text, CFG, STATE, None, HIST)
     await broadcast(ctx.bot, text, status_kb())
@@ -1264,7 +1336,7 @@ async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def reschedule(app: Application) -> None:
     jq = app.job_queue
-    for name in ("monitor", "summary", "backup", "verify"):
+    for name in ("monitor", "summary", "backup", "verify", "weekly"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
     interval = int(CFG.get("check_interval_sec", 60))
@@ -1275,13 +1347,16 @@ def reschedule(app: Application) -> None:
     if CFG.get("backup_time"):
         h, m = map(int, CFG["backup_time"].split(":"))
         jq.run_daily(backup_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), name="backup")
+    if CFG.get("weekly_report"):  # понедельник (в PTB 1 = понедельник)
+        h, m = map(int, CFG["weekly_report"].split(":"))
+        jq.run_daily(weekly_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), days=(1,), name="weekly")
     if CFG.get("verify_backups", True):  # воскресенье (в PTB 0 = воскресенье), после ночных бэкапов
         jq.run_daily(verify_job, time=dt.time(4, 30, tzinfo=checks.tz(CFG)), days=(0,), name="verify")
     log.info("Проверка каждые %s с, сводка: %s", interval, CFG.get("daily_summary") or "выкл")
 
 
 COMMANDS = [("status", "📊 Состояние сервера"), ("procs", "🔝 Процессы по CPU"), ("mem", "💾 Процессы по памяти"),
-            ("services", "⚙️ Службы и контейнеры"), ("net", "🌐 Сеть и диск"), ("alerts", "🚨 Активные алерты"), ("chart", "📈 График за сутки"),
+            ("services", "⚙️ Службы и контейнеры"), ("net", "🌐 Сеть и диск"), ("alerts", "🚨 Активные алерты"), ("incidents", "📒 Журнал инцидентов"), ("chart", "📈 График за сутки"),
             ("logs", "📜 Логи контейнера"), ("probe", "🌐 Сайты и порты"), ("backup", "🗄 Резервные копии"),
             ("actions", "🧰 Действия с сервером"), ("settings", "🛠 Настройки"), ("mute", "🔕 Выключить уведомления на 1 ч"),
             ("unmute", "🔔 Включить уведомления"), ("start", "👋 Клавиатура и помощь")]
@@ -1311,7 +1386,7 @@ def build_app() -> Application:
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
-                     ("probe", cmd_probe), ("backup", cmd_backup), ("net", cmd_net), ("ban", cmd_ban),
+                     ("probe", cmd_probe), ("backup", cmd_backup), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
                      ("unmute", cmd_unmute)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

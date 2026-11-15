@@ -1090,6 +1090,8 @@ class BotButtonsTest(unittest.TestCase):
         upd.effective_message.reply_text = mock.AsyncMock()
         ctx = mock.MagicMock()
         ctx.bot.send_document = mock.AsyncMock()
+        ctx.bot.send_message = mock.AsyncMock()
+        ctx.bot.send_photo = mock.AsyncMock()
         self.ctx = ctx
         with mock.patch.object(self.bot, "reschedule"):
             asyncio.run(self.bot.on_button(upd, ctx))
@@ -1677,6 +1679,115 @@ class OffsiteButtonsTest(unittest.TestCase):
         self.assertIn("все копии читаются", b.verify_line())
         b.S.reset()
         b.STATE.verify_last = {}
+
+
+class IncidentsTest(unittest.TestCase):
+    """Этап 15: журнал инцидентов и недельный отчёт."""
+
+    def setUp(self):
+        import incidents
+        self.m = incidents
+        self.inc = incidents.Incidents(Path(tempfile.mkdtemp()) / "metrics.db")
+        self.cfg = {"thresholds": {"duration_sec": 300}, "remind_min": 0, "tz": "UTC",
+                    "quiet_hours": {"start": "00:00", "end": "23:59"}}
+
+    def run_step(self, st, now, res):
+        with mock.patch.object(checks, "oom_kills", return_value=None):
+            return checks.step(self.cfg, st, now, res, None, self.inc)
+
+    def test_step_records_even_in_quiet_hours(self):
+        st = checks.AlertState()
+        self.run_step(st, T0, results(cpu="CPU 99%"))
+        self.assertEqual(self.inc.recent(), [])                  # ещё не дольше порога
+        out = self.run_step(st, T0 + 400, results(cpu="CPU 99%"))
+        self.assertEqual(out, [])                                # тихие часы: cpu не критичен, молчим
+        rows = self.inc.recent()
+        self.assertEqual([(r[0], r[2], r[3]) for r in rows], [("cpu", T0, None)])  # но в журнал попал
+        self.run_step(st, T0 + 500, results(cpu="CPU 99%"))
+        self.assertEqual(len(self.inc.recent()), 1)              # не дублируется
+        self.run_step(st, T0 + 900, results())
+        self.assertEqual(self.inc.recent()[0][3], T0 + 900)
+        self.assertEqual(self.inc.open_keys(), set())
+
+    def test_removed_key_closed_and_events(self):
+        st = checks.AlertState()
+        self.inc.open("svc:old", "служба old", T0)
+        self.run_step(st, T0 + 60, results())
+        self.assertEqual(self.inc.recent()[0][3], T0 + 60)       # ключ убрали из настроек — закрываем
+        reopened = self.m.Incidents(self.inc.path)
+        self.assertEqual(reopened.open_keys(), set())
+        self.inc.event("log:w", "🔁 Контейнер w перезапустился", T0)
+        self.inc.event(None, "💥 OOM killer убил процесс(ы): 1", T0 + 1)
+        ev = self.inc.between(T0 - 10, T0 + 10, "event")
+        self.assertEqual([self.m.event_kind(e[1]) for e in ev], ["перезапуски контейнеров", "OOM killer"])
+
+    def test_open_survives_restart(self):
+        self.inc.open("ctr:w", "контейнер w", T0)
+        again = self.m.Incidents(self.inc.path)
+        self.assertEqual(again.open_keys(), {"ctr:w"})
+        again.open("ctr:w", "контейнер w", T0 + 5)
+        self.assertEqual(len(again.recent()), 1)
+
+    def test_incidents_text(self):
+        self.assertIn("Пока пусто", self.m.incidents_text(self.inc, self.cfg, T0))
+        self.inc.open("web:https://site.example", "не отвечает", T0 - 3 * 3600)
+        self.inc.close("web:https://site.example", T0 - 3 * 3600 + 600)
+        self.inc.open("ctr:weather-bot", "лежит", T0 - 1800)
+        text = self.m.incidents_text(self.inc, self.cfg, T0)
+        self.assertIn("🔴 weather-bot: с", text)
+        self.assertIn("https://site.example: 10 мин", text)
+        self.assertIn("За 7 дней: 2 инцидент(ов), простоя в сумме 40 мин", text)
+
+    def test_weekly_text(self):
+        cfg = dict(self.cfg, probes=["https://site.example", "tcp://db.example:5432"])
+        self.inc.open("web:https://site.example", "x", T0 - 2 * 86400)
+        self.inc.close("web:https://site.example", T0 - 2 * 86400 + 3024)  # 50,4 мин = 0,5% недели
+        self.inc.open("cpu", "x", T0 - 10 * 86400)                          # прошлая неделя
+        self.inc.close("cpu", T0 - 10 * 86400 + 600)
+        self.inc.event(None, "🛡 Подбор пароля по SSH", T0 - 100)
+        h = filled_history(TMP / "weekly.db")
+        text = self.m.weekly_text(cfg, self.inc, h, T0, ["💾 Бэкапы: ok"])
+        self.assertIn("Инцидентов: 1 (неделей раньше 1)", text)
+        self.assertIn("https://site.example: 99.50%", text)
+        self.assertIn("tcp://db.example:5432: 100%", text)
+        self.assertIn("CPU в среднем", text)
+        self.assertIn("подбор пароля по SSH — 1", text)
+        self.assertTrue(text.endswith("💾 Бэкапы: ok"))
+        empty = self.m.weekly_text(self.cfg, self.m.Incidents(Path(tempfile.mkdtemp()) / "m.db"), None, T0)
+        self.assertIn("✅ Инцидентов не было", empty)
+
+
+class WeeklyButtonsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def test_buttons(self):
+        b = self.bot
+        b.S.reset()
+        press = BotButtonsTest.press.__get__(self)
+        text, markup = b.summary_view()
+        cbs = [x.callback_data for row in markup.inline_keyboard for x in row]
+        self.assertIn("wk:now", cbs)
+        self.assertIn("• 09:00", [x.text for row in markup.inline_keyboard for x in row])  # по умолчанию включён
+        press("wk:time:off")
+        self.assertIsNone(b.CFG["weekly_report"])
+        press("wk:time:20:00")
+        self.assertEqual(b.CFG["weekly_report"], "20:00")
+        q, upd = press("inc")
+        self.assertIn("Журнал инцидентов", upd.effective_message.reply_text.call_args[0][0])
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, '["185.220.101.5"]')), \
+             mock.patch.object(b.history, "chart_png", return_value=b"png"):
+            press("wk:now")
+        self.ctx.bot.send_message.assert_called()
+        sent = self.ctx.bot.send_message.call_args[0][1]
+        self.assertIn("📅 <b>Неделя", sent)
+        self.assertIn("Заблокировано IP ботом: 1", sent)
+        self.ctx.bot.send_photo.assert_called()
+        self.assertIn(("incidents", "📒 Журнал инцидентов"), b.COMMANDS)
+        b.S.reset()
 
 
 if __name__ == "__main__":

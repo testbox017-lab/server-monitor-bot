@@ -4,6 +4,7 @@ settings.json
 settings.json.bak
 state.json
 *.db
+metrics.db*
 
 # Python
 __pycache__/

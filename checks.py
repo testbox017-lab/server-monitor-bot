@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 IS_WINDOWS = platform.system() == "Windows"
+LAST_SAMPLE: dict | None = None  # последний снимок из evaluate(), бот пишет его в историю
 
 
 # ---------- Метрики ----------
@@ -429,8 +430,10 @@ def key_label(key: str) -> str:
 
 def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | None]:
     """Возвращает {ключ: описание проблемы или None, если всё в порядке}."""
+    global LAST_SAMPLE
     th = cfg.get("thresholds", {})
     s = collect(cfg)
+    LAST_SAMPLE = s
     res: dict[str, str | None] = {}
 
     def check(key, value, limit, label):
@@ -629,11 +632,24 @@ def check_reboot(state: AlertState) -> str | None:
     return msg
 
 
-def summary_text(cfg: dict, state: AlertState, now: float | None = None) -> str:
+def summary_text(cfg: dict, state: AlertState, now: float | None = None, hist=None) -> str:
     now = now or time.time()
     day = [x for x in state.log if now - x[0] < 24 * 3600]
-    lines = ["📋 <b>Сводка за сутки</b>", status_text(cfg), "",
-             f"Алертов за 24 ч: {len(day)}"]
+    lines = ["📋 <b>Сводка за сутки</b>", status_text(cfg), ""]
+    p = hist.peaks(86400, now) if hist else None
+    if p:
+        lines.append(f"Пик CPU: {p['cpu'][0]:.0f}% в {fmt_local(cfg, p['cpu'][1])}, в среднем {p['cpu_avg']:.0f}%")
+        lines.append(f"Пик RAM: {p['ram'][0]:.0f}% в {fmt_local(cfg, p['ram'][1])}")
+        if p["disk_from"] is not None:
+            lines.append(f"Диск: {p['disk_from']:.1f}% → {p['disk_to']:.1f}%")
+        lines.append(f"Трафик за сутки: ↓ {fmt_bytes(p['rx'])} ↑ {fmt_bytes(p['tx'])}")
+        days = hist.disk_forecast(now)
+        if days is not None and days < 365:
+            lines.append(f"⚠️ При текущем темпе диск заполнится примерно через {days:.0f} дн.")
+    restarts = [k for _, k in day if k.startswith("restart:")]
+    if restarts:
+        lines.append(f"Перезапусков контейнеров: {len(restarts)}")
+    lines.append(f"Алертов за 24 ч: {len(day)}")
     if day:
         counts: dict[str, int] = {}
         for _, k in day:

@@ -1,0 +1,12 @@
+# Секреты и локальные данные
+config.yaml
+settings.json
+settings.json.bak
+state.json
+*.db
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/

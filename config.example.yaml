@@ -1,0 +1,41 @@
+# Скопируйте этот файл в config.yaml и заполните.
+
+# Токен бота от @BotFather
+token: "ВАШ_ТОКЕН"
+
+# Кому бот отвечает и куда шлёт алерты. Свой chat_id можно узнать,
+# отправив боту /start (он ответит, даже если доступа ещё нет).
+allowed_chats:
+  - 123456789
+
+# Как часто проверять сервер, секунд
+check_interval_sec: 60
+
+# Сообщать в Telegram при запуске бота
+notify_on_start: true
+
+thresholds:
+  cpu: 90          # %, алерт если держится дольше duration_sec
+  ram: 90          # %
+  swap: 80         # %
+  disk: 85         # % заполнения любого диска
+  temp: 85         # °C (только Linux, где доступны датчики)
+  duration_sec: 300  # сколько должно держаться превышение по ресурсам
+
+# Какие диски проверять. Пусто = все обычные разделы.
+# Linux: "/", "/var"   Windows: "C:\\", "D:\\"
+disks: []
+
+# Службы: systemd на Linux (nginx, postgresql), службы Windows по имени (Spooler, MSSQLSERVER)
+services: []
+#  - nginx
+#  - postgresql
+
+# Процессы: ищутся по имени или части командной строки
+processes: []
+#  - python my_script.py
+#  - java
+
+# Контейнеры Docker по имени (docker ps). Боту нужен доступ к docker.
+containers: []
+#  - weather-bot

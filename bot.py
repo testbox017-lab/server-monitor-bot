@@ -201,11 +201,17 @@ def logs_kb(name: str, tail: int) -> InlineKeyboardMarkup:
 
 def alerts_kb() -> InlineKeyboardMarkup:
     rows = [[Btn("🔄 Обновить", callback_data="alerts"), Btn("📒 Журнал", callback_data="inc")]]
-    if STATE.muted(time.time()):
+    now = time.time()
+    if STATE.muted(now):
         rows.append([Btn("🔔 Включить уведомления", callback_data="mute:off")])
     else:
         rows.append([Btn("🔕 1 ч", callback_data="mute:3600"), Btn("🔕 3 ч", callback_data="mute:10800"),
                      Btn("🌙 До утра", callback_data="mute:morning")])
+    if STATE.in_maintenance(now):
+        rows.append([Btn("✅ Закончить обслуживание", callback_data="mt:off")])
+    else:
+        rows.append([Btn("🔧 Обслуживание:", callback_data="noop")] +
+                    [Btn(t, callback_data=f"mt:{s}") for t, s in (("30 мин", 1800), ("1 ч", 3600), ("2 ч", 7200))])
     return kb(*rows)
 
 
@@ -216,6 +222,9 @@ def alerts_text() -> str:
     lines = []
     if STATE.muted(now):
         lines.append(f"🔕 Уведомления выключены до {checks.fmt_local(CFG, STATE.mute_until)}")
+    if STATE.in_maintenance(now):
+        lines.append(f"🔧 Идёт обслуживание до {checks.fmt_local(CFG, STATE.maint_until)}: алерты не приходят, "
+                     "проблемы пишутся в журнал как плановые")
     if checks.in_quiet_hours(CFG, now):
         lines.append("🌙 Сейчас тихие часы: приходят только критичные алерты")
     if STATE.active:
@@ -331,7 +340,7 @@ async def add_view(kind: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(rows)
 
 
-QUIET_OPTS = (None, ("23:00", "08:00"), ("00:00", "07:00"), ("22:00", "09:00"))
+QUIET_OPTS = (None, ("23:00", "06:00"), ("23:00", "08:00"), ("00:00", "07:00"), ("22:00", "09:00"))
 
 
 def quiet_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -341,7 +350,7 @@ def quiet_view() -> tuple[str, InlineKeyboardMarkup]:
                 callback_data=f"quiet:{o[0]}-{o[1]}" if o else "quiet:off") for o in QUIET_OPTS]
     return ("🌙 <b>Тихие часы</b>\nВ это время приходят только критичные алерты: упала служба, контейнер "
             "или процесс. Остальные придут утром, если проблема не исчезнет.",
-            kb(btns[:2], btns[2:], [BACK]))
+            kb(btns[:3], btns[3:], [BACK]))
 
 
 def remind_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -756,6 +765,38 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, set_mute(0))
 
 
+def set_maint(until: float) -> str:
+    STATE.maint_until = until
+    STATE.save()
+    if until <= time.time():
+        return "✅ Обслуживание закончено, алерты снова приходят"
+    return f"🔧 Обслуживание до {checks.fmt_local(CFG, until)}: алерты не приходят"
+
+
+def maint_end_text() -> str:
+    lines = [f"<b>{html.escape(HOST)}</b>", "✅ Обслуживание закончилось, алерты снова приходят."]
+    probs = [k for k, s in STATE.since.items()]
+    if probs:
+        lines.append("Сейчас есть проблемы, алерты по ним придут в ближайшие минуты: "
+                     + ", ".join(html.escape(checks.key_label(k)) for k in probs[:8]))
+    else:
+        lines.append("Проблем сейчас нет.")
+    return "\n".join(lines)
+
+
+async def cmd_maint(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if ctx.args and ctx.args[0] in ("off", "stop", "0"):
+        await send(update, set_maint(0))
+        return
+    sec = parse_duration(ctx.args[0]) if ctx.args else 1800
+    if not sec or sec <= 0 or sec > 86400:
+        await send(update, "Формат: /maint 30m, /maint 2h (до суток), /maint off")
+        return
+    await send(update, set_maint(time.time() + sec))
+
+
 def set_mute(until: float) -> str:
     STATE.mute_until = until
     STATE.save()
@@ -845,6 +886,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await send(update, note)  # под алертом: подтверждение отдельным сообщением
             else:
                 await edit(update, alerts_text(), alerts_kb())
+        elif cmd == "mt":
+            note = set_maint(0 if parts[1] == "off" else time.time() + int(parts[1]))
+            await edit(update, alerts_text(), alerts_kb())
         elif cmd == "set":
             sub = parts[1] if len(parts) > 1 else ""
             if sub == "reset":
@@ -1261,6 +1305,10 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ok != STATE.heartbeat_ok:
             log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
             STATE.heartbeat_ok = ok
+    if STATE.maint_until and not STATE.in_maintenance(time.time()):
+        STATE.maint_until = 0.0  # обслуживание кончилось по времени
+        STATE.save()
+        await broadcast(ctx.bot, maint_end_text())
     try:
         await run_autoban(ctx.bot)
     except Exception:
@@ -1436,7 +1484,8 @@ COMMANDS = [("status", "📊 Состояние сервера"), ("procs", "�
             ("services", "⚙️ Службы и контейнеры"), ("net", "🌐 Сеть и диск"), ("alerts", "🚨 Активные алерты"), ("incidents", "📒 Журнал инцидентов"), ("chart", "📈 График за сутки"),
             ("logs", "📜 Логи контейнера"), ("probe", "🌐 Сайты и порты"), ("backup", "🗄 Резервные копии"),
             ("actions", "🧰 Действия с сервером"), ("settings", "🛠 Настройки"), ("mute", "🔕 Выключить уведомления на 1 ч"),
-            ("unmute", "🔔 Включить уведомления"), ("start", "👋 Клавиатура и помощь")]
+            ("unmute", "🔔 Включить уведомления"),
+            ("maint", "🔧 Обслуживание 30 мин (/maint 2h, /maint off)"), ("start", "👋 Клавиатура и помощь")]
 
 
 async def on_startup(app: Application) -> None:
@@ -1464,7 +1513,7 @@ def build_app() -> Application:
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
                      ("probe", cmd_probe), ("backup", cmd_backup), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
-                     ("unmute", cmd_unmute)]:
+                     ("unmute", cmd_unmute), ("maint", cmd_maint)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

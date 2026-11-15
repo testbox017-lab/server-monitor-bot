@@ -90,6 +90,11 @@ def clipped(rows: list[tuple], since: float, until: float) -> list[tuple[str, st
             for k, t, s, e in rows]
 
 
+def planned(text: str | None) -> bool:
+    from checks import MAINT_MARK
+    return bool(text) and text.startswith(MAINT_MARK)
+
+
 def downtime_by_key(rows: list[tuple], since: float, until: float) -> dict[str, tuple[int, float]]:
     out: dict[str, tuple[int, float]] = {}
     for k, _, dur, _ in clipped(rows, since, until):
@@ -119,12 +124,12 @@ def incidents_text(inc: Incidents, cfg: dict, now: float | None = None, n: int =
         lines.append("Пока пусто: ни одна проблема не держалась дольше порога.")
         return "\n".join(lines)
     for k, text, s, e in rows:
-        label = html.escape(key_label(k))
+        label = html.escape(key_label(k)) + (" (обслуживание)" if planned(text) else "")
         if e is None:
             lines.append(f"🔴 {label}: с {local(cfg, s)}, идёт {fmt_duration(now - s)}")
         else:
             lines.append(f"• {local(cfg, s)} {label}: {fmt_duration(max(e - s, 60))}")
-    week = inc.between(now - WEEK, now)
+    week = [r for r in inc.between(now - WEEK, now) if not planned(r[1])]
     total = sum(d for *_, d, _ in clipped(week, now - WEEK, now))
     lines.append(f"\nЗа 7 дней: {len(week)} инцидент(ов), простоя в сумме {fmt_duration(total) if total else '0 мин'}")
     return "\n".join(lines)
@@ -142,8 +147,10 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
     since, prev = now - WEEK, now - 2 * WEEK
     lines = [f"📅 <b>Неделя {local(cfg, since, '%d.%m')}–{local(cfg, now, '%d.%m')}</b>"]
 
-    rows = inc.between(since, now)
-    prev_n = len(inc.between(prev, since))
+    allrows = inc.between(since, now)
+    rows = [r for r in allrows if not planned(r[1])]
+    plan = [r for r in allrows if planned(r[1])]
+    prev_n = len([r for r in inc.between(prev, since) if not planned(r[1])])
     by_key = downtime_by_key(rows, since, now)
     total = sum(v[1] for v in by_key.values())
     if not rows:
@@ -155,6 +162,10 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
         still = [k for k, *_, e in rows if e is None]
         if still:
             lines.append("  Не решено сейчас: " + ", ".join(html.escape(key_label(k)) for k in still))
+    if plan:
+        pdur = sum(d for *_, d, _ in clipped(plan, since, now))
+        lines.append(f"🔧 Во время обслуживания: {len(plan)} проблем(ы), {fmt_duration(max(pdur, 60))}, "
+                     "в простой не считаются")
 
     targets = [f"web:{p}" if isinstance(p, str) else None for p in cfg.get("probes") or []]
     targets = [t for t in targets if t]

@@ -1,0 +1,142 @@
+#!/usr/bin/python3 -I
+"""Помощник для действий бота, которым нужен root.
+
+Устанавливается как /usr/local/sbin/monitor-bot-action (root:root, 755).
+Бот вызывает его через sudo; sudoers разрешает ТОЛЬКО этот файл:
+    monitor ALL=(root) NOPASSWD: /usr/local/sbin/monitor-bot-action *
+Все аргументы проверяются здесь, поэтому бот не может выполнить ничего другого.
+
+Команды:
+    restart-service NAME   — systemctl restart, только службы из /etc/monitor-bot/allowed-services
+    kill PID               — SIGTERM обычному процессу (не ядру, не systemd, не sshd/dockerd/containerd)
+    cleanup-estimate       — сколько места освободит cleanup
+    cleanup                — docker image prune, builder prune, journalctl --vacuum-size, apt clean
+    reboot                 — перезагрузка сервера
+"""
+import os
+import re
+import signal
+import subprocess
+import sys
+
+ALLOWED_FILE = "/etc/monitor-bot/allowed-services"
+PROTECTED = {"systemd", "init", "sshd", "sshd-session", "dockerd", "containerd", "systemd-journald",
+             "systemd-logind", "systemd-networkd", "systemd-resolved", "dbus-daemon", "monitor-bot"}
+NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
+JOURNAL_LIMIT = "200M"
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg)
+    sys.exit(code)
+
+
+def run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def allowed_services() -> set[str]:
+    try:
+        with open(ALLOWED_FILE, encoding="utf-8") as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except OSError:
+        return set()
+
+
+def restart_service(name: str) -> None:
+    if not NAME_RE.match(name):
+        die("bad service name")
+    if name not in allowed_services():
+        die(f"service {name} is not in {ALLOWED_FILE}")
+    r = run(["systemctl", "restart", name], timeout=120)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or "systemctl failed", 1)
+    print(run(["systemctl", "is-active", name]).stdout.strip())
+
+
+def proc_name(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        die("no such process")
+
+
+def kill(pid_s: str) -> None:
+    if not pid_s.isdigit():
+        die("bad pid")
+    pid = int(pid_s)
+    if pid <= 2 or pid == os.getpid() or pid == os.getppid():
+        die("refused: protected pid")
+    name = proc_name(pid)
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if not f.read():
+                die("refused: kernel thread")
+    except OSError:
+        die("no such process")
+    if name in PROTECTED:
+        die(f"refused: {name} is protected")
+    os.kill(pid, signal.SIGTERM)
+    print(f"SIGTERM sent to {pid} ({name})")
+
+
+def du_bytes(path: str) -> int:
+    r = run(["du", "-sb", path])
+    try:
+        return int(r.stdout.split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def cleanup_estimate() -> None:
+    lines = []
+    r = run(["docker", "system", "df", "--format", "{{.Type}}\t{{.Reclaimable}}"])
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            t, _, rec = ln.partition("\t")
+            if t in ("Images", "Build Cache"):
+                lines.append(f"docker {t}: {rec}")
+    r = run(["journalctl", "--disk-usage"])
+    if r.returncode == 0:
+        lines.append(f"journal: {r.stdout.strip()} (limit {JOURNAL_LIMIT})")
+    apt = du_bytes("/var/cache/apt/archives")
+    lines.append(f"apt cache: {apt / 1e6:.0f} MB")
+    print("\n".join(lines))
+
+
+def cleanup() -> None:
+    out = []
+    for cmd in (["docker", "image", "prune", "-f"], ["docker", "builder", "prune", "-f"],
+                ["journalctl", f"--vacuum-size={JOURNAL_LIMIT}"], ["apt-get", "clean"]):
+        r = run(cmd)
+        tail = (r.stdout.strip().splitlines() or [""])[-1] or (r.stderr.strip().splitlines() or [""])[-1]
+        out.append(f"{' '.join(cmd[:3])}: {'ok' if r.returncode == 0 else 'error'} {tail}".strip())
+    print("\n".join(out))
+
+
+def reboot() -> None:
+    subprocess.Popen(["systemctl", "reboot"])
+    print("rebooting")
+
+
+def main(argv: list[str]) -> None:
+    if not argv:
+        die(__doc__)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "restart-service" and len(args) == 1:
+        restart_service(args[0])
+    elif cmd == "kill" and len(args) == 1:
+        kill(args[0])
+    elif cmd == "cleanup-estimate" and not args:
+        cleanup_estimate()
+    elif cmd == "cleanup" and not args:
+        cleanup()
+    elif cmd == "reboot" and not args:
+        reboot()
+    else:
+        die("unknown command")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

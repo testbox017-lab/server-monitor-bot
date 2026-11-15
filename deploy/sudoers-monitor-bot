@@ -1,0 +1,3 @@
+# /etc/sudoers.d/monitor-bot  (root:root, 440; проверить: visudo -cf /etc/sudoers.d/monitor-bot)
+# Бот может запускать через sudo только помощник, который сам проверяет все аргументы.
+monitor ALL=(root) NOPASSWD: /usr/local/sbin/monitor-bot-action *

@@ -1,0 +1,5 @@
+# /etc/monitor-bot/allowed-services  (root:root, 644)
+# Службы, которые бот может перезапускать. Должно совпадать с action_services в config.yaml.
+docker
+containerd
+cron

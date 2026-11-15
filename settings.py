@@ -31,6 +31,9 @@ DEFAULTS = {
     "log_alerts": True,         # алерт на ошибки в логах контейнеров
     "log_alert_min": 15,        # не чаще раза в N минут на контейнер
     "log_patterns": None,       # None = Traceback, ERROR, CRITICAL, Exception, FATAL
+    # Действия из Telegram (только config.yaml, кнопками не меняются)
+    "actions_enabled": True,
+    "action_services": [],      # какие службы можно перезапускать; должны совпадать с /etc/monitor-bot/allowed-services
 }
 
 

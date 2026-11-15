@@ -65,5 +65,12 @@ log_alert_min: 15
 # Что считать ошибкой (с учётом регистра). null = Traceback, ERROR, CRITICAL, Exception, FATAL
 log_patterns: null
 
+# Действия из Telegram (перезапуск, очистка, перезагрузка) — всегда с подтверждением.
+actions_enabled: true
+# Какие службы можно перезапускать. Тот же список должен быть в /etc/monitor-bot/allowed-services.
+action_services: []
+#  - docker
+#  - cron
+
 # Куда писать settings.json и state.json. Пусто = $STATE_DIRECTORY (systemd) или папка с config.yaml
 data_dir: null

@@ -13,7 +13,8 @@ import yaml
 # Ключи, которые можно менять из Telegram. Всё остальное (token, allowed_chats) только в config.yaml.
 EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "processes", "disks",
             "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start",
-            "containers_auto", "log_alerts", "log_alert_min", "log_patterns")
+            "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
+            "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -31,6 +32,13 @@ DEFAULTS = {
     "log_alerts": True,         # алерт на ошибки в логах контейнеров
     "log_alert_min": 15,        # не чаще раза в N минут на контейнер
     "log_patterns": None,       # None = Traceback, ERROR, CRITICAL, Exception, FATAL
+    # Безопасность
+    "ssh_alerts": True,             # вход по SSH с нового IP и подбор пароля
+    "ssh_alert_all_logins": False,  # сообщать о каждом входе, а не только с нового IP
+    "ssh_fail_threshold": 30,       # неудачных попыток за 10 мин для алерта (0 = выкл)
+    "port_alerts": True,            # новый открытый наружу порт
+    "update_alerts": True,          # обновления безопасности Ubuntu
+    "heartbeat_url": None,          # URL для пинга раз в проверку (healthchecks.io и т.п.), только config.yaml
     # Действия из Telegram (только config.yaml, кнопками не меняются)
     "actions_enabled": True,
     "action_services": [],      # какие службы можно перезапускать; должны совпадать с /etc/monitor-bot/allowed-services

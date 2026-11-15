@@ -373,6 +373,101 @@ class ActionsTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+import security  # noqa: E402
+
+SSH_LOG = """Accepted publickey for root from 203.0.113.5 port 51122 ssh2: ED25519 SHA256:xx
+Failed password for invalid user admin from 198.51.100.7 port 4242 ssh2
+Invalid user test from 198.51.100.7 port 4243
+Failed password for root from 198.51.100.9 port 1 ssh2
+Connection closed by 198.51.100.7 port 4243 [preauth]
+"""
+
+SS_OUT = """tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*
+tcp LISTEN 0 4096 [::]:22 [::]:*
+tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+tcp LISTEN 0 4096 127.0.0.1:35217 0.0.0.0:*
+udp UNCONN 0 0 [::1]:323 [::]:*
+tcp LISTEN 0 511 0.0.0.0:8080 0.0.0.0:*
+"""
+
+
+class SecurityTest(unittest.TestCase):
+    def setUp(self):
+        self.st = checks.AlertState()
+        self.cfg = {"ssh_fail_threshold": 3}
+        self.ssh = ""
+        self.ports = {"tcp/22"}
+        self.updates = []
+
+    def ev(self, now, muted=False, quiet=False):
+        return security.events(self.cfg, self.st, now, muted, quiet,
+                               ssh_text_fn=lambda since: self.ssh, ports_fn=lambda: set(self.ports),
+                               updates_fn=lambda: list(self.updates))
+
+    def test_parse(self):
+        acc, failed = security.parse_ssh(SSH_LOG)
+        self.assertEqual(acc, [("root", "203.0.113.5", "publickey")])
+        self.assertEqual(failed, {"198.51.100.7": 2, "198.51.100.9": 1})
+
+    def test_ports_parse(self):
+        with mock.patch.object(security, "run", return_value=SS_OUT):
+            self.assertEqual(security.listening_ports(), {"tcp/22", "tcp/8080"})
+
+    def test_ssh_new_ip_then_known(self):
+        self.ssh = SSH_LOG
+        self.assertEqual(self.ev(T0), [])          # первый запуск: только отметка времени
+        a = self.ev(T0 + 60)
+        texts = [x.text for x in a]
+        self.assertTrue(any("нового IP 203.0.113.5" in t for t in texts), texts)
+        self.assertTrue(any("Подбор пароля" in t and "198.51.100.7 (2)" in t for t in texts), texts)
+        a = self.ev(T0 + 120)                       # тот же IP — уже известен, подбор — не чаще раза в час
+        self.assertEqual(a, [])
+        self.cfg["ssh_alert_all_logins"] = True
+        self.assertTrue(any("Вход по SSH" in x.text for x in self.ev(T0 + 180)))
+
+    def test_bruteforce_hourly_and_window(self):
+        self.ssh = "Failed password for root from 1.1.1.1 port 1 ssh2\n" * 2
+        self.ev(T0)
+        self.assertEqual(self.ev(T0 + 60), [])     # 2 < 3
+        self.assertEqual(len(self.ev(T0 + 120)), 1)  # 4 >= 3
+        self.assertEqual(self.ev(T0 + 180), [])
+        self.assertEqual(self.ev(T0 + 3700), [])            # окно 10 мин: старые попытки уже не считаются
+        self.assertEqual(len(self.ev(T0 + 3760)), 1)        # снова ≥3, и прошёл час
+        self.ssh = ""
+        self.ev(T0 + 9000)
+        self.assertEqual(self.st.ssh_failed, [])   # старше 10 минут забываются
+
+    def test_ports_baseline_and_new(self):
+        self.assertEqual(self.ev(T0), [])
+        self.ports = {"tcp/22", "tcp/8080"}
+        a = self.ev(T0 + 60)
+        self.assertEqual([x.text for x in a], ["🚪 Новый открытый наружу порт: tcp/8080"])
+        self.assertEqual(self.ev(T0 + 120), [])
+
+    def test_updates_daily(self):
+        self.updates = ["openssl", "libc6"]
+        self.assertEqual(len(self.ev(T0)), 1)
+        self.assertEqual(self.ev(T0 + 7 * 3600), [])        # проверено, но напоминание раз в сутки
+        self.assertEqual(len(self.ev(T0 + 25 * 3600)), 1)
+
+    def test_muted_and_quiet(self):
+        self.ssh = SSH_LOG
+        self.ev(T0)
+        self.assertEqual(self.ev(T0 + 60, muted=True), [])
+        self.assertEqual(self.st.ssh_checked, T0 + 60)     # отметка сдвинулась, старое после тишины не прилетит
+        self.st.ssh_checked = T0 + 100
+        a = self.ev(T0 + 200, quiet=True)
+        self.assertTrue(all("Подбор" not in x.text for x in a))  # подбор ночью молчит, вход приходит
+
+    def test_heartbeat(self):
+        resp = mock.MagicMock(status=200)
+        resp.__enter__.return_value = resp
+        with mock.patch.object(security.urllib.request, "urlopen", return_value=resp):
+            self.assertTrue(security.heartbeat("https://hc-ping.com/x"))
+        with mock.patch.object(security.urllib.request, "urlopen", side_effect=OSError):
+            self.assertFalse(security.heartbeat("https://hc-ping.com/x"))
+
+
 class BotButtonsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -555,6 +650,22 @@ class BotButtonsTest(unittest.TestCase):
             upd.effective_message.reply_text.assert_not_awaited()
         finally:
             b.CFG["actions_enabled"] = True
+
+    def test_security_settings(self):
+        b = self.bot
+        b.S.reset()
+        b.STATE.known_ips = ["203.0.113.5"]
+        self.press("sec:ssh_alerts")
+        self.assertFalse(b.CFG["ssh_alerts"])
+        self.press("sec:ssh_alert_all_logins")
+        self.assertTrue(b.CFG["ssh_alert_all_logins"])
+        self.press("secthr:100")
+        self.assertEqual(b.CFG["ssh_fail_threshold"], 100)
+        q, _ = self.press("secforget")
+        self.assertEqual(b.STATE.known_ips, [])
+        q, _ = self.press("set:sec")
+        self.assertIn("Безопасность", q.edit_message_text.await_args.args[0])
+        b.S.reset()
 
     def test_stranger_blocked(self):
         b = self.bot

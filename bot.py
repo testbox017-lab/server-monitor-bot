@@ -23,6 +23,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 import actions
 import checks
 import history
+import security
 from settings import Settings
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -222,6 +223,7 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn("👁 Что отслеживать", callback_data="set:watch")],
               [Btn("🌙 Тихие часы", callback_data="set:quiet"), Btn("⏰ Напоминания", callback_data="set:remind")],
               [Btn("📋 Ежедневная сводка", callback_data="set:summary"), Btn("🐳 Docker", callback_data="set:docker")],
+              [Btn("🛡 Безопасность", callback_data="set:sec")],
               [Btn("↩️ Сбросить к config.yaml", callback_data="set:reset")])
 
 
@@ -322,6 +324,26 @@ def docker_view() -> tuple[str, InlineKeyboardMarkup]:
             "и пишет, если он остановился или перезапустился.\n"
             "Ошибки в логах: строки с Traceback, ERROR, CRITICAL, Exception, FATAL.",
             InlineKeyboardMarkup(rows))
+
+
+def security_view() -> tuple[str, InlineKeyboardMarkup]:
+    thr = CFG.get("ssh_fail_threshold", 30)
+    rows = [[Btn(f"{onoff(CFG.get('ssh_alerts', True))} Входы по SSH и подбор пароля", callback_data="sec:ssh_alerts")],
+            [Btn(f"{onoff(CFG.get('ssh_alert_all_logins'))} Сообщать о каждом входе", callback_data="sec:ssh_alert_all_logins")],
+            [Btn(("• " if thr == n else "") + f"≥{n} попыток", callback_data=f"secthr:{n}") for n in (30, 100, 300)],
+            [Btn(f"{onoff(CFG.get('port_alerts', True))} Новые открытые порты", callback_data="sec:port_alerts")],
+            [Btn(f"{onoff(CFG.get('update_alerts', True))} Обновления безопасности", callback_data="sec:update_alerts")],
+            [Btn(f"🧽 Забыть известные IP ({len(STATE.known_ips)})", callback_data="secforget")],
+            [BACK]]
+    hb = CFG.get("heartbeat_url")
+    hb_text = ("не настроен" if not hb else
+               "работает" if STATE.heartbeat_ok else "не доходит" if STATE.heartbeat_ok is False else "ждёт первой проверки")
+    text = ("🛡 <b>Безопасность</b>\n"
+            f"Известные IP для входа по SSH: {html.escape(', '.join(STATE.known_ips) or 'пока нет')}\n"
+            f"Открытые наружу порты: {html.escape(', '.join(STATE.known_ports) or 'ещё не проверены')}\n"
+            f"Внешний контроль (heartbeat_url в config.yaml): {hb_text}\n"
+            "Подбор пароля: алерт, если неудачных попыток за 10 минут больше порога, не чаще раза в час.")
+    return text, InlineKeyboardMarkup(rows)
 
 
 # ---------- Доступ и отправка ----------
@@ -512,7 +534,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 view = {"th": thresholds_view, "int": interval_view, "watch": watch_view,
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
-                        "docker": docker_view}[sub]
+                        "docker": docker_view, "sec": security_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -569,6 +591,19 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await edit(update, text, logs_kb(name, tail))
             else:
                 await send(update, text, logs_kb(name, tail))
+        elif cmd == "sec":
+            key = parts[1]
+            default = key != "ssh_alert_all_logins"
+            S.set(key, not CFG.get(key, default))
+            await edit(update, *security_view())
+        elif cmd == "secthr":
+            S.set("ssh_fail_threshold", int(parts[1]))
+            await edit(update, *security_view())
+        elif cmd == "secforget":
+            STATE.known_ips = []
+            STATE.save()
+            note = "Следующий вход с любого IP придёт как новый"
+            await edit(update, *security_view())
         elif cmd == "act":
             if not actions_on():
                 note = "Действия выключены в config.yaml"
@@ -583,7 +618,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             S.set("daily_summary", None if parts[1] == "off" else ":".join(parts[1:]))
             reschedule(ctx.application)
             await edit(update, *summary_view())
-        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk") and note is None:
+        if cmd in ("th", "thd", "int", "tg", "quiet", "remind", "summary", "dk", "sec", "secthr") and note is None:
             note = "Сохранено"
     except Exception:
         log.exception("Ошибка кнопки %s", data)
@@ -689,6 +724,11 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.to_thread(HIST.record, checks.LAST_SAMPLE)
     except Exception:
         log.exception("Не удалось записать историю")
+    if CFG.get("heartbeat_url"):
+        ok = await asyncio.to_thread(security.heartbeat, CFG["heartbeat_url"])
+        if ok != STATE.heartbeat_ok:
+            log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
+            STATE.heartbeat_ok = ok
     for a in alerts:
         markup = alert_kb(a.key) if a.kind in ("alert", "remind") or (a.key or "").startswith("log:") else None
         await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)

@@ -396,6 +396,14 @@ class AlertState:
     ctr_restarts: dict[str, int] = field(default_factory=dict)
     log_checked: dict[str, int] = field(default_factory=dict)  # до какого времени логи просмотрены
     log_alert_at: dict[str, float] = field(default_factory=dict)
+    ssh_checked: int = 0
+    known_ips: list[str] = field(default_factory=list)
+    ssh_failed: list[list] = field(default_factory=list)       # [ts, ip, n] за 10 мин
+    ssh_fail_alert_at: float = 0.0
+    known_ports: list[str] = field(default_factory=list)
+    updates_checked: float = 0.0
+    updates_alert_at: float = 0.0
+    heartbeat_ok: bool | None = None
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -551,6 +559,12 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
 
     if real:
         out += docker_events(cfg, state, now, recovered, muted, quiet)
+        import security
+        try:
+            out += security.events(cfg, state, now, muted, quiet)
+        except Exception:  # безопасность не должна ломать основную проверку
+            import logging
+            logging.getLogger("monitor_bot").exception("Ошибка проверки безопасности")
 
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]
     state.save()

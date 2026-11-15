@@ -1884,5 +1884,69 @@ class AutobanBotTest(unittest.TestCase):
         self.assertIn("Автобан: выкл", b.security_view()[0])
 
 
+class MaintenanceTest(unittest.TestCase):
+    """Этап 17: обслуживание и тихие часы 23:00–06:00."""
+
+    def test_step_silent_and_planned(self):
+        import incidents
+        inc = incidents.Incidents(Path(tempfile.mkdtemp()) / "m.db")
+        cfg = {"thresholds": {"duration_sec": 0}, "remind_min": 0, "tz": "UTC"}
+        st = checks.AlertState()
+        st.maint_until = T0 + 1800
+        with mock.patch.object(checks, "oom_kills", return_value=None):
+            out = checks.step(cfg, st, T0, results(**{"svc:ssh": "служба ssh не работает"}), None, inc)
+            self.assertEqual(out, [])                            # даже критичный алерт молчит
+            self.assertTrue(inc.recent()[0][1].startswith(checks.MAINT_MARK))
+            out = checks.step(cfg, st, T0 + 1900, results(**{"svc:ssh": "служба ssh не работает"}), None, inc)
+        self.assertEqual([a.kind for a in out], ["alert"])       # после обслуживания алерт приходит
+        inc.close("svc:ssh", T0 + 2000)
+        inc.open("cpu", "CPU 99%", T0 + 2100)
+        inc.close("cpu", T0 + 2700)
+        text = incidents.weekly_text(cfg, inc, None, T0 + 3000)
+        self.assertIn("Инцидентов: 1 ", text)                    # плановый не считается
+        self.assertIn("🔧 Во время обслуживания: 1", text)
+        self.assertIn("(обслуживание)", incidents.incidents_text(inc, cfg, T0 + 3000))
+        self.assertIn("простоя в сумме 10 мин", incidents.incidents_text(inc, cfg, T0 + 3000))
+
+    def test_quiet_23_06(self):
+        cfg = {"tz": "UTC", "quiet_hours": {"start": "23:00", "end": "06:00"}}
+        from datetime import datetime, timezone
+        ts = lambda h: datetime(2026, 11, 15, h, 30, tzinfo=timezone.utc).timestamp()
+        self.assertTrue(checks.in_quiet_hours(cfg, ts(23)))
+        self.assertTrue(checks.in_quiet_hours(cfg, ts(5)))
+        self.assertFalse(checks.in_quiet_hours(cfg, ts(6)))
+
+
+class MaintenanceBotTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def test_buttons(self):
+        b = self.bot
+        b.S.reset()
+        _, markup = b.quiet_view()
+        self.assertIn("quiet:23:00-06:00", [x.callback_data for row in markup.inline_keyboard for x in row])
+        press = BotButtonsTest.press.__get__(self)
+        press("quiet:23:00-06:00")
+        self.assertEqual(b.CFG["quiet_hours"], {"start": "23:00", "end": "06:00"})
+        cbs = [x.callback_data for row in b.alerts_kb().inline_keyboard for x in row]
+        self.assertIn("mt:1800", cbs)
+        press("mt:3600")
+        self.assertTrue(b.STATE.in_maintenance(time.time()))
+        self.assertIn("Идёт обслуживание", b.alerts_text())
+        self.assertIn("mt:off", [x.callback_data for row in b.alerts_kb().inline_keyboard for x in row])
+        press("mt:off")
+        self.assertFalse(b.STATE.in_maintenance(time.time()))
+        saved = b.STATE.since
+        b.STATE.since = {"ctr:weather-bot": time.time()}
+        self.assertIn("weather-bot", b.maint_end_text())
+        b.STATE.since = saved
+        self.assertIn("maint", [c for c, _ in b.COMMANDS])
+        b.S.reset()
+
+
 if __name__ == "__main__":
     unittest.main()

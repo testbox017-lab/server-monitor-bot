@@ -379,6 +379,7 @@ def fmt_local(cfg: dict, ts: float) -> str:
 # ---------- Алерты ----------
 
 CRITICAL_PREFIXES = ("svc:", "proc:", "ctr:", "web:")
+MAINT_MARK = "🔧 "  # инцидент начался во время обслуживания (плановые работы)
 
 
 def is_critical(key: str) -> bool:
@@ -423,6 +424,7 @@ class AlertState:
     verify_last: dict = field(default_factory=dict)            # последняя проверка копий: ts, results, err
     autobans: dict[str, float] = field(default_factory=dict)   # автобан: IP → до какого времени (0 = навсегда)
     autoban_skip: dict[str, float] = field(default_factory=dict)  # IP, которые помощник не дал заблокировать
+    maint_until: float = 0.0                                   # режим обслуживания: молчим и помечаем инциденты
 
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -449,6 +451,9 @@ class AlertState:
 
     def muted(self, now: float) -> bool:
         return now < self.mute_until
+
+    def in_maintenance(self, now: float) -> bool:
+        return now < self.maint_until
 
 
 def key_label(key: str) -> str:
@@ -541,7 +546,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     th = cfg.get("thresholds", {})
     duration = th.get("duration_sec", 300)
     remind = (cfg.get("remind_min") or 0) * 60
-    muted = state.muted(now)
+    maint = state.in_maintenance(now)
+    muted = state.muted(now) or maint
     quiet = in_quiet_hours(cfg, now)
     out: list[Alert] = []
     real = results is None
@@ -563,7 +569,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             need = smart.anomaly_duration(duration) if key.startswith("anom:") else duration
             if not (instant_keys(key) or now - state.since[key] >= need):
                 continue
-            _journal(inc, "open", key, problem, state.since[key])  # в журнал — даже в тихие часы
+            _journal(inc, "open", key, (MAINT_MARK if maint else "") + problem, state.since[key])  # даже в тихие часы
             snoozed = state.snoozed.get(key, 0) > now
             suppressed = muted or snoozed or (quiet and not is_critical(key))
             if suppressed:

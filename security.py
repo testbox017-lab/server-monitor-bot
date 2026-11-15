@@ -8,8 +8,12 @@ import subprocess
 import time
 import urllib.request
 
-ACCEPTED_RE = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port")
-FAILED_RE = re.compile(r"(?:Failed \S+ for (?:invalid user )?(\S+)|Invalid user (\S+)) from (\S+)")
+ACCEPTED_RE = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port \d+")
+# Имя пользователя пишет атакующий, в нём могут быть пробелы и «from 1.2.3.4 port 1». Поэтому IP и порт
+# берём с конца строки, а имя — всё, что между.
+FAILED_RE = re.compile(r"^Failed \S+ for (?:invalid user )?(.*) from (\S+) port (\d+)(?: ssh2)?$")
+INVALID_RE = re.compile(r"^Invalid user (.*) from (\S+) port (\d+)$")
+KNOWN_IP_DAYS = 30   # IP с успешным входом не попадает под автобан столько дней после последнего входа
 
 
 def run(cmd: list[str], timeout: int = 30) -> str | None:
@@ -34,15 +38,29 @@ def ssh_log(since: int) -> str | None:
 def parse_ssh(text: str) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
     """([(user, ip, method)], {ip: число неудачных попыток})"""
     accepted, failed = [], {}
+    failed_conns: set[tuple[str, str]] = set()   # (ip, порт) соединений, где уже была строка Failed
+    invalid: list[tuple[str, str]] = []
     for line in text.splitlines():
-        m = ACCEPTED_RE.search(line)
+        line = line.strip()
+        m = ACCEPTED_RE.match(line)
         if m:
             accepted.append((m.group(2), m.group(3), m.group(1)))
             continue
-        m = FAILED_RE.search(line)
+        m = FAILED_RE.match(line)
         if m:
-            ip = m.group(3)
+            ip = m.group(2)
             failed[ip] = failed.get(ip, 0) + 1
+            failed_conns.add((ip, m.group(3)))
+            continue
+        m = INVALID_RE.match(line)
+        if m:
+            invalid.append((m.group(2), m.group(3)))
+    # «Invalid user» и «Failed password for invalid user» — одна и та же попытка. Отдельно считаем
+    # только «Invalid user» без пароля (например, перебор только ключами).
+    for ip, port in invalid:
+        if (ip, port) not in failed_conns:
+            failed[ip] = failed.get(ip, 0) + 1
+            failed_conns.add((ip, port))
     return accepted, failed
 
 
@@ -71,11 +89,18 @@ def autoban_candidates(cfg: dict, state, now: float) -> list[tuple[str, int]]:
     for ts, ip, n in state.ssh_failed:
         if now - ts < 600:
             by_ip[ip] = by_ip.get(ip, 0) + n
-    skip = set(state.known_ips) | set(cfg.get("autoban_whitelist") or []) | set(state.autobans)
+    skip = recent_known_ips(state, now) | set(cfg.get("autoban_whitelist") or []) | set(state.autobans)
     skip |= {ip for ip, ts in state.autoban_skip.items() if now - ts < AUTOBAN_RETRY}
     out = [(ip, n) for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])
            if n >= thr and ip not in skip and public_ip(ip)]
     return out[:AUTOBAN_PER_CHECK]
+
+
+def recent_known_ips(state, now: float) -> set[str]:
+    """IP, с которых входили по SSH за последние KNOWN_IP_DAYS дней. Для старых записей без времени
+    (до появления known_ip_at) считаем временем входа момент загрузки состояния."""
+    at = getattr(state, "known_ip_at", {}) or {}
+    return {ip for ip in state.known_ips if now - at.get(ip, now) < KNOWN_IP_DAYS * 86400}
 
 
 def expired_autobans(state, now: float) -> list[str]:
@@ -136,12 +161,8 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
     from checks import Alert  # избегаем циклического импорта
 
     out: list = []
-    if muted:
-        # всё равно двигаем отметки, чтобы после тишины не пришла пачка старого
-        state.ssh_checked = int(now)
-        return out
-
-    # SSH
+    # SSH читаем всегда, даже когда уведомления выключены: иначе в это время не работал бы автобан
+    # и не запоминались бы свои IP. При выключенных уведомлениях только не шлём сообщения.
     if cfg.get("ssh_alerts", True):
         since = state.ssh_checked
         state.ssh_checked = int(now)
@@ -153,6 +174,9 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
                     new = ip not in state.known_ips
                     if new:
                         state.known_ips.append(ip)
+                    state.known_ip_at[ip] = now
+                    if muted:
+                        continue
                     if new or cfg.get("ssh_alert_all_logins"):
                         tag = "с нового IP" if new else ""
                         out.append(Alert(f"🔐 Вход по SSH: {user} {tag} {ip} ({method})".replace("  ", " "),
@@ -163,7 +187,7 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
         state.ssh_failed = [x for x in state.ssh_failed if now - x[0] < 600]
         total = sum(x[2] for x in state.ssh_failed)
         threshold = cfg.get("ssh_fail_threshold", 30)
-        if threshold and total >= threshold and not quiet and now - state.ssh_fail_alert_at >= 3600:
+        if threshold and total >= threshold and not quiet and not muted and now - state.ssh_fail_alert_at >= 3600:
             by_ip: dict[str, int] = {}
             for _, ip, n in state.ssh_failed:
                 by_ip[ip] = by_ip.get(ip, 0) + n
@@ -173,6 +197,9 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
                              f"brute:{worst}", "event"))
             state.ssh_fail_alert_at = now
             state.log.append([now, "ssh_bruteforce"])
+
+    if muted:
+        return out  # порты и обновления проверим, когда уведомления включатся
 
     # Порты
     if cfg.get("port_alerts", True):

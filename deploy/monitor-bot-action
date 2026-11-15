@@ -25,6 +25,13 @@
                              Вызывается через command= в /root/.ssh/authorized_keys, отмечает время в
                              /var/lib/monitor-bot-offsite/status.json
     backup-verify          — прочитать последние копии целиком и проверить, что архивы не повреждены (JSON)
+    docker ARGS...         — только чтение и перезапуск контейнеров, ровно в этих видах:
+                               docker ps -a --format <PS_FMT>
+                               docker inspect --format <INSPECT_FMT> NAME...
+                               docker stats --no-stream --format <STATS_FMT>
+                               docker logs --tail N NAME | docker logs --since TS NAME
+                               docker restart NAME
+                             Так пользователю бота не нужна группа docker (она равна root).
 
 Обновление ставит только код бота. Сам помощник, sudoers и файл службы не обновляются автоматически:
 так код с GitHub не может расширить права бота. Если они изменились, бот об этом напишет.
@@ -50,8 +57,8 @@ import urllib.request
 import zlib
 
 ALLOWED_FILE = "/etc/monitor-bot/allowed-services"
-PROTECTED = {"systemd", "init", "sshd", "sshd-session", "dockerd", "containerd", "systemd-journald",
-             "systemd-logind", "systemd-networkd", "systemd-resolved", "dbus-daemon", "monitor-bot"}
+PROTECTED = {"init", "dockerd", "docker-proxy", "dbus-daemon", "dbus-broker", "polkitd", "rsyslogd", "agetty",
+             "ufw", "iptables", "nft", "chronyd", "monitor-bot-act"}
 NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 JOURNAL_LIMIT = "200M"
 WATCH_FILE = "/etc/monitor-bot/backup-watch"
@@ -59,6 +66,7 @@ OUTBOX = "/run/monitor-bot-outbox"
 BOT_GROUP = "monitor"
 MAX_SEND = 45 * 1024 * 1024  # Telegram принимает от бота файлы до 50 МБ
 REPO_FILE = "/etc/monitor-bot/update-repo"
+UPDATE_BRANCH = "main"
 DEFAULT_REPO = "testbox017-lab/server-monitor-bot"
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}/[A-Za-z0-9_.-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -80,6 +88,16 @@ OWN_RE = re.compile(r"^monitor-bot-\d{4}-\d{2}-\d{2}_\d{6}\.tar\.gz$")
 OFFSITE_DIR = "/var/lib/monitor-bot-offsite"
 OFFSITE_STATUS = OFFSITE_DIR + "/status.json"
 LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]")
+# Docker: только эти форматы вывода (шаблоны Go могут показать, например, переменные окружения контейнера)
+PS_FMT = "{{.Names}}\t{{.State}}"
+INSPECT_FMT = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+               "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
+STATS_FMT = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+# Процессы, которые нельзя останавливать: ядро системы, доступ по SSH, Docker и менеджеры пакетов
+# (остановка apt/dpkg посреди установки ломает пакеты)
+PROTECTED_PREFIXES = ("systemd", "containerd", "sshd", "apt", "dpkg", "unattended-upgr")
+PROTECTED_UNITS = ("monitor-bot-update-",)   # само обновление бота
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -131,8 +149,15 @@ def kill(pid_s: str) -> None:
                 die("refused: kernel thread")
     except OSError:
         die("no such process")
-    if name in PROTECTED:
+    if name in PROTECTED or name.startswith(PROTECTED_PREFIXES):
         die(f"refused: {name} is protected")
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
+            cgroup = f.read()
+    except OSError:
+        cgroup = ""
+    if any(u in cgroup for u in PROTECTED_UNITS):
+        die("refused: bot update is running")
     os.kill(pid, signal.SIGTERM)
     print(f"SIGTERM sent to {pid} ({name})")
 
@@ -247,9 +272,12 @@ def backup_fetch(n_s: str) -> None:
     for old in os.listdir(OUTBOX):  # держим только один файл
         os.remove(os.path.join(OUTBOX, old))
     dest = os.path.join(OUTBOX, name)
-    src_fd = os.open(os.path.join(path, name), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        src = open_regular(os.path.join(path, name))
+    except OSError as e:
+        die(f"refused: {e}", 1)
     dst_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
-    with os.fdopen(src_fd, "rb") as a, os.fdopen(dst_fd, "wb") as b:
+    with src as a, os.fdopen(dst_fd, "wb") as b:
         shutil.copyfileobj(a, b)
     os.chown(dest, 0, gid())
     print(json.dumps({"file": dest, "size": size}))
@@ -276,13 +304,27 @@ def newest_copies() -> list[tuple[str, str, str, int]]:
     return out
 
 
+def hardlinks_protected() -> bool:
+    try:
+        with open("/proc/sys/fs/protected_hardlinks", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
 def open_regular(path: str):
-    """Открыть обычный файл без перехода по ссылкам."""
+    """Открыть обычный файл без перехода по ссылкам. Жёсткая ссылка допустима, только если ядро не даёт
+    обычным пользователям ссылаться на чужие файлы (fs.protected_hardlinks=1): иначе через неё можно
+    подсунуть, например, /etc/shadow."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     f = os.fdopen(fd, "rb")
-    if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+    st = os.fstat(f.fileno())
+    if not stat.S_ISREG(st.st_mode):
         f.close()
         raise OSError("not a regular file")
+    if st.st_nlink > 1 and not hardlinks_protected():
+        f.close()
+        raise OSError("hard link refused (fs.protected_hardlinks is off)")
     return f
 
 
@@ -409,12 +451,14 @@ def code_items(root: str) -> list[str]:
 def copy_code(src: str, dst: str, group: int) -> None:
     for name in code_items(src):
         s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.islink(d):
+            os.remove(d)  # не пишем через подложенную ссылку
         if os.path.isdir(s):
-            if os.path.isdir(d) and not os.path.islink(d):
+            if os.path.isdir(d):
                 shutil.rmtree(d)
             shutil.copytree(s, d, symlinks=False, ignore=shutil.ignore_patterns("__pycache__"))
         else:
-            shutil.copyfile(s, d)
+            shutil.copyfile(s, d, follow_symlinks=False)
     for base, dirs, files in os.walk(dst):
         if base.startswith(os.path.join(dst, "venv")):
             continue
@@ -442,6 +486,59 @@ def same_config(a: str, b: str) -> bool:
     if a.endswith("monitor-bot-action") or b.endswith("monitor-bot-action"):
         return False  # у программы и комментарии — часть файла, сравниваем точно
     return lines(a) == lines(b)
+
+
+def github_api(path: str) -> dict:
+    req = urllib.request.Request(f"https://api.github.com/{path}",
+                                 headers={"User-Agent": "monitor-bot-updater", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def check_in_main(sha: str, api_fn=None) -> None:
+    """Ставим только коммиты, которые уже есть в ветке main. GitHub отдаёт по адресу репозитория и коммиты
+    из чужих форков, поэтому без этой проверки можно было бы поставить чужой код."""
+    d = (api_fn or github_api)(f"repos/{repo()}/compare/{UPDATE_BRANCH}...{sha}")
+    if d.get("status") not in ("identical", "behind"):
+        raise RuntimeError(f"коммит {sha[:7]} не входит в ветку {UPDATE_BRANCH} (status {d.get('status')})")
+
+
+def unsafe_paths(root: str, limit: int = 5) -> list[str]:
+    """Файлы и папки, которые принадлежат не root или доступны на запись группе/всем.
+    Код из них выполняется от root (pip) или копируется root, поэтому так быть не должно."""
+    bad = []
+    for base, dirs, files in os.walk(root):
+        for n in [""] + dirs + files:
+            p = os.path.join(base, n) if n else base
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue  # ссылки в venv (bin/python → /usr/bin/python3) — нормально, права у ссылки не важны
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                bad.append(p)
+                if len(bad) >= limit:
+                    return bad
+    return bad
+
+
+def check_ownership() -> None:
+    bad = []
+    for p in (os.path.dirname(APP_DIR), APP_DIR):
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            bad.append(p)
+    bad += unsafe_paths(os.path.join(APP_DIR, "venv"))
+    if bad:
+        raise RuntimeError("небезопасные права (нужен владелец root и запись только для root): "
+                           + ", ".join(bad[:5]) + f". Исправить: chown -R root:root {APP_DIR}/venv; "
+                           f"chown root:root {APP_DIR}; chmod go-w {APP_DIR}")
+
+
+def pip_install(req: str) -> subprocess.CompletedProcess:
+    # только готовые wheel: при сборке из исходников setup.py пакета выполнялся бы от root
+    return run([os.path.join(APP_DIR, "venv/bin/pip"), "install", "-q", "--only-binary=:all:", "-r", req], timeout=900)
 
 
 def download(sha: str, dest_dir: str) -> str:
@@ -495,9 +592,12 @@ def update_run(sha: str) -> None:
     except FileExistsError:
         die("update already running", 1)
     old = read_version()
-    result = {"sha": sha, "from": old.get("sha"), "ok": False, "stage": "download", "notes": []}
+    result = {"sha": sha, "from": old.get("sha"), "ok": False, "stage": "check", "notes": []}
     group = gid()
     try:
+        check_ownership()
+        check_in_main(sha)
+        result["stage"] = "download"
         with tempfile.TemporaryDirectory(prefix="monitor-bot-update-") as tmp:
             os.chmod(tmp, 0o755)
             src = download(sha, tmp)
@@ -530,8 +630,7 @@ def update_run(sha: str) -> None:
             result["stage"] = "install"
             copy_code(src, APP_DIR, group)
             if req_changed:
-                r = run([os.path.join(APP_DIR, "venv/bin/pip"), "install", "-q", "-r",
-                         os.path.join(APP_DIR, "requirements.txt")], timeout=900)
+                r = pip_install(os.path.join(APP_DIR, "requirements.txt"))
                 result["notes"].append("зависимости обновлены" if r.returncode == 0 else
                                        "pip install не удался: " + (r.stderr or r.stdout).strip()[-200:])
             ver = os.path.join(APP_DIR, "VERSION")
@@ -557,6 +656,10 @@ def update_run(sha: str) -> None:
             copy_code(bak, APP_DIR, group)
             if os.path.exists(os.path.join(bak, "VERSION")):
                 shutil.copy2(os.path.join(bak, "VERSION"), ver)
+            if req_changed and os.path.exists(os.path.join(bak, "requirements.txt")):
+                r = pip_install(os.path.join(APP_DIR, "requirements.txt"))  # вернуть прежние версии пакетов
+                result["notes"].append("зависимости возвращены" if r.returncode == 0 else
+                                       "вернуть зависимости не удалось: " + (r.stderr or r.stdout).strip()[-200:])
             ok2, state2 = healthy_after_restart()
             result["stage"] = "rolled_back" if ok2 else "rollback_failed"
             if not ok2:
@@ -651,13 +754,35 @@ def parse_ip(s: str):
     return ip
 
 
+def sshd_ports() -> set[str]:
+    """Порты, которые слушает sshd (или systemd для ssh.socket). Если узнать не удалось — 22."""
+    r = run(["ss", "-H", "-tlnp"])
+    ports = set()
+    for ln in r.stdout.splitlines():
+        if '"sshd"' in ln:
+            parts = ln.split()
+            if len(parts) >= 4:
+                port = parts[3].rpartition(":")[2]
+                if port.isdigit():
+                    ports.add(port)
+    # Ubuntu по умолчанию запускает SSH через ssh.socket: тогда порт слушает systemd
+    r = run(["systemctl", "show", "ssh.socket", "-p", "Listen", "--value"])
+    for m in re.finditer(r":(\d+) \(Stream\)", r.stdout):
+        ports.add(m.group(1))
+    return ports or {"22"}
+
+
 def ssh_peers() -> set[str]:
     """IP, с которых сейчас открыты SSH-сессии: их не блокируем, чтобы не отрезать себя."""
-    r = run(["ss", "-H", "-tn", "state", "established", "( sport = :22 )"])
+    ports = sshd_ports()
+    r = run(["ss", "-H", "-tn", "state", "established"])
     peers = set()
     for ln in r.stdout.splitlines():
         parts = ln.split()
         if len(parts) >= 4:
+            local_port = parts[-2].rpartition(":")[2]
+            if local_port not in ports:
+                continue
             addr = parts[-1].rpartition(":")[0].strip("[]")
             peers.add(addr.removeprefix("::ffff:"))
     return peers
@@ -691,7 +816,9 @@ def ban_ip(s: str) -> None:
     if str(ip) in banned():
         print(f"already banned {ip}")
         return
-    r = run(["ufw", "insert", "1", "deny", "from", str(ip), "to", "any", "comment", BAN_COMMENT])
+    # prepend ставит правило первым в своём списке (IPv4 или IPv6); «insert 1» для IPv6 ufw отклоняет,
+    # если первое правило — IPv4
+    r = run(["ufw", "prepend", "deny", "from", str(ip), "to", "any", "comment", BAN_COMMENT])
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip() or "ufw failed", 1)
     print(f"banned {ip}")
@@ -707,6 +834,39 @@ def unban_ip(s: str) -> None:
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip() or "ufw failed", 1)
     print(f"unbanned {ip}")
+
+
+def docker_names(names: list[str]) -> list[str]:
+    if not names or len(names) > 50 or not all(CONTAINER_RE.match(n) for n in names):
+        die("bad container name")
+    return names
+
+
+def docker_cmd(args: list[str]) -> None:
+    """Разрешённые вызовы docker (см. описание вверху). Вывод и код возврата docker передаются как есть."""
+    timeout = 30
+    if args == ["ps", "-a", "--format", PS_FMT] or args == ["stats", "--no-stream", "--format", STATS_FMT]:
+        cmd = args
+    elif len(args) >= 4 and args[:3] == ["inspect", "--format", INSPECT_FMT]:
+        cmd = args[:3] + docker_names(args[3:])
+    elif len(args) == 4 and args[0] == "logs" and args[1] in ("--tail", "--since") and args[2].isdigit():
+        if args[1] == "--tail" and not 1 <= int(args[2]) <= 1000:
+            die("bad tail")
+        cmd = args[:3] + docker_names(args[3:])
+    elif len(args) == 2 and args[0] == "restart":
+        cmd = ["restart"] + docker_names(args[1:])
+        timeout = 120
+    else:
+        die("refused: docker command is not allowed")
+    try:
+        r = subprocess.run(["docker", *cmd], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die("docker timeout", 1)
+    except OSError as e:
+        die(f"docker: {e}", 1)
+    sys.stdout.buffer.write(r.stdout)
+    sys.stderr.buffer.write(r.stderr)
+    sys.exit(r.returncode)
 
 
 def reboot() -> None:
@@ -752,6 +912,8 @@ def main(argv: list[str]) -> None:
         pull_stream()
     elif cmd == "backup-verify" and not args:
         backup_verify()
+    elif cmd == "docker" and args:
+        docker_cmd(list(args))
     else:
         die("unknown command")
 

@@ -11,12 +11,17 @@ import psutil
 
 HELPER = "/usr/local/sbin/monitor-bot-action"
 CONFIRM_TTL = 120  # секунд на подтверждение
+# Как в помощнике monitor-bot-action: такие процессы он не останавливает
+PROTECTED = {"init", "dockerd", "docker-proxy", "dbus-daemon", "dbus-broker", "polkitd", "rsyslogd", "agetty",
+             "ufw", "iptables", "nft", "chronyd", "monitor-bot-act"}
+PROTECTED_PREFIXES = ("systemd", "containerd", "sshd", "apt", "dpkg", "unattended-upgr")
 HELPER_ERRORS = {
     "refused: this IP has an open SSH session": "с этого IP сейчас открыта SSH-сессия, не блокирую",
     "refused: local or special address": "это локальный или служебный адрес",
     "ufw is not active": "фаервол ufw выключен",
     "not banned by monitor-bot": "этот IP блокировал не бот",
     "unknown command": "помощник на сервере не обновлён (нет такой команды)",
+    "refused: bot update is running": "это процесс обновления бота, его нельзя останавливать",
 }
 
 
@@ -72,10 +77,12 @@ class Actions:
         return r.returncode == 0, out
 
     def restart_container(self, name: str) -> tuple[bool, str]:
-        try:
-            r = subprocess.run(["docker", "restart", name], capture_output=True, text=True, timeout=120)
-        except Exception as e:  # noqa: BLE001
-            return False, str(e)
+        import checks  # docker идёт через помощник, если он установлен (без группы docker)
+        if not checks.valid_container(name):
+            return False, "неверное имя контейнера"
+        r = checks.docker("restart", name, timeout=120)
+        if r is None:
+            return False, "docker недоступен"
         return r.returncode == 0, (r.stdout + r.stderr).strip()
 
     def restart_service(self, name: str) -> tuple[bool, str]:
@@ -173,8 +180,8 @@ def top_for_kill(n: int = 8) -> list[tuple[int, str, float, float]]:
     for p in procs:
         try:
             name = p.info["name"] or "?"
-            if name in ("systemd", "sshd", "sshd-session", "dockerd", "containerd", "systemd-journald"):
-                continue
+            if name in PROTECTED or name.startswith(PROTECTED_PREFIXES):
+                continue  # их помощник всё равно не остановит
             rows.append((p.info["pid"], name, p.cpu_percent(None), p.info["create_time"]))
         except psutil.Error:
             continue

@@ -72,6 +72,10 @@ try {
     $old = Get-ChildItem $Dest -Directory | Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}_\d{4}$' } |
         Sort-Object Name -Descending | Select-Object -Skip $Keep
     foreach ($d in $old) { Remove-Item $d.FullName -Recurse -Force; Log "удалена старая папка $($d.Name)" }
+    # неудачные попытки тоже не копим: оставляем 5 последних для разбора
+    $failed = Get-ChildItem $Dest -Directory | Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}_\d{4}-FAILED$' } |
+        Sort-Object Name -Descending | Select-Object -Skip 5
+    foreach ($d in $failed) { Remove-Item $d.FullName -Recurse -Force; Log "удалена старая папка $($d.Name)" }
     exit 0
 }
 catch {

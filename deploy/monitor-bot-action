@@ -21,24 +21,33 @@
     ban-ip IP              — запретить входящие с IP через ufw (не локальные адреса и не IP с открытой SSH-сессией)
     unban-ip IP            — снять запрет, поставленный ботом
     banned-list            — IP, запрещённые ботом (JSON)
+    pull-stream            — для ПК: tar с последними копиями (бот + папки backup-watch) в stdout.
+                             Вызывается через command= в /root/.ssh/authorized_keys, отмечает время в
+                             /var/lib/monitor-bot-offsite/status.json
+    backup-verify          — прочитать последние копии целиком и проверить, что архивы не повреждены (JSON)
 
 Обновление ставит только код бота. Сам помощник, sudoers и файл службы не обновляются автоматически:
 так код с GitHub не может расширить права бота. Если они изменились, бот об этом напишет.
 """
 import filecmp
 import grp
+import gzip
+import hashlib
+import io
 import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import urllib.request
+import zlib
 
 ALLOWED_FILE = "/etc/monitor-bot/allowed-services"
 PROTECTED = {"systemd", "init", "sshd", "sshd-session", "dockerd", "containerd", "systemd-journald",
@@ -66,6 +75,11 @@ NOT_AUTO = (("deploy/monitor-bot-action", "/usr/local/sbin/monitor-bot-action"),
             ("deploy/monitor-bot.service", "/etc/systemd/system/monitor-bot.service"))
 SETTLE_SEC = 30
 BAN_COMMENT = "monitor-bot"
+OWN_BACKUPS = "/var/lib/monitor_bot/backups"
+OWN_RE = re.compile(r"^monitor-bot-\d{4}-\d{2}-\d{2}_\d{6}\.tar\.gz$")
+OFFSITE_DIR = "/var/lib/monitor-bot-offsite"
+OFFSITE_STATUS = OFFSITE_DIR + "/status.json"
+LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -239,6 +253,128 @@ def backup_fetch(n_s: str) -> None:
         shutil.copyfileobj(a, b)
     os.chown(dest, 0, gid())
     print(json.dumps({"file": dest, "size": size}))
+
+
+# ---------- копии на ПК и проверка копий ----------
+
+def newest_copies() -> list[tuple[str, str, str, int]]:
+    """[(метка, папка, имя, размер)]: последняя копия бота и по одной из каждой папки backup-watch."""
+    out = []
+    own = [f for f in backup_files(OWN_BACKUPS) if OWN_RE.match(f[0])]
+    if own:
+        out.append(("monitor-bot", OWN_BACKUPS, own[0][0], own[0][1]))
+    used = {"monitor-bot"}
+    for path, _ in watch_dirs():
+        files = [f for f in backup_files(path) if not f[0].startswith("latest")] or backup_files(path)
+        if not files:
+            continue
+        label = LABEL_RE.sub("_", os.path.basename(path) or "root")[:40] or "dir"
+        while label in used:
+            label += "_"
+        used.add(label)
+        out.append((label, path, files[0][0], files[0][1]))
+    return out
+
+
+def open_regular(path: str):
+    """Открыть обычный файл без перехода по ссылкам."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    f = os.fdopen(fd, "rb")
+    if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        f.close()
+        raise OSError("not a regular file")
+    return f
+
+
+class HashReader:
+    def __init__(self, f):
+        self.f, self.h = f, hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        b = self.f.read(n)
+        self.h.update(b)
+        return b
+
+
+def write_status(data: dict) -> None:
+    if os.path.islink(OFFSITE_DIR):
+        die("bad offsite dir", 1)
+    os.makedirs(OFFSITE_DIR, mode=0o755, exist_ok=True)
+    tmp = OFFSITE_STATUS + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, OFFSITE_STATUS)
+
+
+def pull_stream() -> None:
+    """tar в stdout: <метка>/<файл> для каждой последней копии и SHA256SUMS в конце."""
+    items = newest_copies()
+    if not items:  # stdout — это поток для ПК, поэтому ошибку пишем в stderr
+        sys.stderr.write("no backups\n")
+        sys.exit(1)
+    sums, sent = [], []
+    out = sys.stdout.buffer
+    with tarfile.open(fileobj=out, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+        for label, path, name, _ in items:
+            try:
+                f = open_regular(os.path.join(path, name))
+            except OSError:
+                continue
+            with f:
+                st = os.fstat(f.fileno())
+                info = tarfile.TarInfo(f"{label}/{name}")
+                info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), 0o600
+                r = HashReader(f)
+                tar.addfile(info, r)
+            sums.append(f"{r.h.hexdigest()}  {label}/{name}")
+            sent.append({"path": path, "name": name, "size": st.st_size, "mtime": st.st_mtime})
+        data = ("\n".join(sums) + "\n").encode()
+        info = tarfile.TarInfo("SHA256SUMS")
+        info.size, info.mtime, info.mode = len(data), int(time.time()), 0o644
+        tar.addfile(info, io.BytesIO(data))
+    out.flush()
+    client = (os.environ.get("SSH_CONNECTION") or "").split(" ")[0]
+    write_status({"ts": time.time(), "files": sent, "bytes": sum(x["size"] for x in sent), "client": client})
+
+
+def verify_file(path: str, name: str) -> dict:
+    """Прочитать копию целиком: у tar — каждый файл внутри, у gzip — контрольную сумму."""
+    full = os.path.join(path, name)
+    try:
+        with open_regular(full) as f:
+            low = name.lower()
+            if ".tar" in low or low.endswith(".tgz"):
+                n = 0
+                with tarfile.open(fileobj=f, mode="r:*") as t:
+                    for m in t:
+                        if m.isfile():
+                            ex = t.extractfile(m)
+                            while ex.read(1 << 20):
+                                pass
+                        n += 1
+                return {"ok": n > 0, "members": n, "error": None if n else "архив пустой"}
+            if low.endswith(".gz"):
+                with gzip.GzipFile(fileobj=f) as g:
+                    while g.read(1 << 20):
+                        pass
+                return {"ok": True, "members": 1, "error": None}
+            while f.read(1 << 20):
+                pass
+            return {"ok": True, "members": 1, "error": None, "note": "не архив, проверено только чтение"}
+    except (OSError, EOFError, tarfile.TarError, zlib.error, gzip.BadGzipFile) as e:
+        return {"ok": False, "members": 0, "error": f"{type(e).__name__}: {e}"[:200]}
+
+
+def backup_verify() -> None:
+    res = []
+    for label, path, name, size in newest_copies():
+        r = {"label": label, "path": path, "name": name, "size": size}
+        r.update(verify_file(path, name))
+        res.append(r)
+    print(json.dumps(res, ensure_ascii=False))
 
 
 # ---------- обновление ----------
@@ -612,6 +748,10 @@ def main(argv: list[str]) -> None:
         unban_ip(args[0])
     elif cmd == "banned-list" and not args:
         print(json.dumps(banned()))
+    elif cmd == "pull-stream" and not args:
+        pull_stream()
+    elif cmd == "backup-verify" and not args:
+        backup_verify()
     else:
         die("unknown command")
 

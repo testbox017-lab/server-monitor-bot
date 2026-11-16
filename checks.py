@@ -183,17 +183,59 @@ def service_state(name: str) -> str:
     return "unknown"
 
 
-def container_states() -> dict[str, str] | None:
-    """{имя контейнера: статус} для всех контейнеров Docker, None если docker недоступен."""
-    r = docker("ps", "-a", "--format", PS_FMT)
-    if r is None or r.returncode != 0:
-        return None
+def parse_ps(text: str) -> dict[str, str]:
     out = {}
-    for line in r.stdout.splitlines():
+    for line in text.splitlines():
         if "\t" in line:
             name, state = line.split("\t", 1)
             out[name] = state
     return out
+
+
+def container_states() -> dict[str, str] | None:
+    """{имя контейнера: статус} для всех контейнеров Docker, None если docker недоступен."""
+    cached = _poll_fresh()
+    if cached is not None:
+        return dict(cached["states"])
+    r = docker("ps", "-a", "--format", PS_FMT)
+    if r is None or r.returncode != 0:
+        return None
+    return parse_ps(r.stdout)
+
+
+# Один вызов помощника «docker-poll» на проверку вместо отдельных docker ps и docker inspect:
+# каждый вызов через sudo — это несколько строк в системном журнале, а sudo-rs их не умеет отключать.
+POLL_TTL = 30
+_poll: dict = {"ts": 0.0, "states": {}, "info": {}, "unsupported_until": 0.0}
+
+
+def _poll_fresh() -> dict | None:
+    return _poll if time.time() - _poll["ts"] < POLL_TTL else None
+
+
+def docker_poll() -> bool:
+    """Обновить кеш состояния всех контейнеров одним вызовом помощника. False — помощник старый или
+    docker недоступен (тогда работают обычные вызовы)."""
+    _poll["ts"] = 0.0
+    if not docker_via_helper() or time.time() < _poll["unsupported_until"]:
+        return False
+    try:
+        r = subprocess.run(["sudo", "-n", HELPER, "docker-poll"], capture_output=True, text=True, timeout=45,
+                           encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    if r.returncode == 2 and "unknown command" in r.stdout:
+        _poll["unsupported_until"] = time.time() + DOCKER_DIRECT_RETRY
+        return False
+    if r.returncode != 0:
+        return False
+    try:
+        data = json.loads(r.stdout)
+        states, info = parse_ps(data["ps"]), parse_inspect(data["inspect"])
+    except (ValueError, KeyError, TypeError):
+        return False
+    _poll.update(ts=time.time(), states=states, info=info)
+    return True
 
 
 def container_state(name: str, states: dict[str, str] | None) -> str:
@@ -247,11 +289,18 @@ def container_info(names: list[str]) -> dict[str, dict]:
     names = [n for n in names if valid_container(n)]
     if not names:
         return {}
+    cached = _poll_fresh()
+    if cached is not None:  # в кеше все существующие контейнеры; отсутствующих нет и в docker inspect
+        return {n: dict(cached["info"][n]) for n in names if n in cached["info"]}
     r = docker("inspect", "--format", INSPECT_FMT, *names)
-    out: dict[str, dict] = {}
     if r is None:
-        return out
-    for line in r.stdout.splitlines():  # для несуществующих имён docker пишет ошибку в stderr, остальные выводит
+        return {}
+    return parse_inspect(r.stdout)
+
+
+def parse_inspect(text: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for line in text.splitlines():  # для несуществующих имён docker пишет ошибку в stderr, остальные выводит
         parts = line.split("\t")
         if len(parts) >= 4:
             try:
@@ -471,6 +520,12 @@ class AlertState:
     maint_until: float = 0.0                                   # режим обслуживания: молчим и помечаем инциденты
     known_ip_at: dict[str, float] = field(default_factory=dict)   # IP → время последнего успешного входа по SSH
     seen_missing: dict[str, float] = field(default_factory=dict)  # авто-контейнер → с какого времени его нет
+    deploy_at: float = 0.0                                     # последний вход по SSH ключом деплоя
+    net_fail_at: float = 0.0                                   # когда у бота последний раз пропадала связь
+    fail_ips: dict[str, list] = field(default_factory=dict)    # IP → [неудачных попыток за сутки, последняя]
+    ssh_daily: dict[str, dict] = field(default_factory=dict)   # «2026-11-16» → {IP: попыток} за 8 дней
+    ban_history: dict[str, list] = field(default_factory=dict)  # IP или подсеть → [сколько раз банили, когда]
+    bak_first_seen: dict[str, float] = field(default_factory=dict)  # папка бэкапов → когда бот впервые её увидел
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
@@ -609,6 +664,7 @@ class Alert:
     text: str
     key: str | None = None   # ключ проблемы, для кнопок под сообщением
     kind: str = "alert"      # alert / remind / recovered / event
+    send: str = "loud"       # loud — как обычно, quiet — без звука, journal — только в журнал инцидентов
 
 
 def step(cfg: dict, state: AlertState, now: float | None = None,
@@ -625,6 +681,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     real = results is None
     forgotten: list[str] = []
     if real:
+        if cfg.get("containers") or cfg.get("containers_auto"):
+            docker_poll()
         forgotten = update_seen_containers(state, cfg, now)
     results = evaluate(cfg, state) if real else dict(results)
     if real and hist is not None:
@@ -695,13 +753,14 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         state.oom_kills = n
 
     if real:
-        out += docker_events(cfg, state, now, recovered, muted, quiet)
+        # Сначала SSH: вход ключом деплоя должен быть известен до того, как увидим перезапуск контейнера
         import security
         try:
             out += security.events(cfg, state, now, muted, quiet)
         except Exception:  # безопасность не должна ломать основную проверку
             import logging
             logging.getLogger("monitor_bot").exception("Ошибка проверки безопасности")
+        out += docker_events(cfg, state, now, recovered, muted, quiet)
         import probes
         try:
             out += probes.ssl_events(cfg, state, now, muted, quiet)
@@ -790,6 +849,18 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
         restarted = prev_started is not None and i["started"] != prev_started
         state.ctr_started[name] = i["started"]
         state.ctr_restarts[name] = i["restarts"]
+        if restarted:
+            started = docker_time(i["started"])
+            if started is not None and state.boot_time and 0 <= started - state.boot_time < BOOT_WINDOW:
+                # контейнер поднялся вместе с сервером: об этом уже сообщение «Сервер перезагружался»
+                state.log.append([now, f"boot:{name}"])
+                continue
+            if state.deploy_at and now - state.deploy_at < DEPLOY_WINDOW:
+                # вход ключом деплоя и сразу перезапуск — это выкладка новой версии, а не сбой
+                out.append(Alert(f"🚀 Деплой: {name} перезапущен с новой версией", f"deploy:{name}", "event",
+                                 "journal"))
+                state.log.append([now, f"deploy:{name}"])
+                continue
         # перезапуск, о котором уже сообщили как «упал → восстановлено», второй раз не дублируем
         if restarted and f"ctr:{name}" not in recovered and not muted:
             extra = ""
@@ -802,10 +873,13 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
         return out
     patterns = list(cfg.get("log_patterns") or DEFAULT_LOG_PATTERNS)  # с учётом регистра: ERROR, не «error»
     every = (cfg.get("log_alert_min") or 15) * 60
+    check_every = int(cfg.get("log_check_min") or 5) * 60  # каждый просмотр логов — вызов помощника через sudo
     for name in names:
         if name not in info:
             continue
         since = state.log_checked.get(name)
+        if since is not None and now - since < check_every - 5:
+            continue  # ещё рано: в следующий раз прочитаем всё с момента since, ничего не потеряется
         state.log_checked[name] = int(now)
         if since is None:
             continue  # первый запуск: старые ошибки не присылаем
@@ -817,10 +891,44 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
         hits = [ln.strip() for ln in logs.splitlines() if any(p in ln for p in patterns)]
         if hits:
             state.log_alert_at[name] = now
-            state.log.append([now, f"logerr:{name}"])
             sample = "\n".join(h[:200] for h in hits[:3])
+            net = network_errors(logs)
+            net_at = state.net_fail_at if now - (state.net_fail_at or 0) < NET_WINDOW else 0
+            if net or net_at:
+                # сбой связи: один инцидент «🌐», без звука — контейнер сам повторит, когда связь вернётся
+                when = f" (у бота связь пропадала в {fmt_local(cfg, net_at)})" if net_at else ""
+                state.log.append([now, f"net:{name}"])
+                out.append(Alert(f"🌐 Сетевые ошибки в логах {name}: {len(hits)} строк{when}. "
+                                 f"Похоже на сбой связи, а не на ошибку в коде.\n{sample}", f"log:{name}", "event",
+                                 "quiet"))
+                continue
+            state.log.append([now, f"logerr:{name}"])
             out.append(Alert(f"⚠️ Ошибки в логах {name}: {len(hits)} строк\n{sample}", f"log:{name}", "event"))
     return out
+
+
+BOOT_WINDOW = 300    # контейнер, стартовавший в первые 5 минут после загрузки сервера, поднялся вместе с ним
+DEPLOY_WINDOW = 600  # перезапуск в течение 10 минут после входа ключом деплоя — это деплой
+NET_WINDOW = 900     # ошибки в логах в течение 15 минут после сбоя связи у самого бота
+NET_SIGNS = ("NetworkError", "TimedOut", "ConnectError", "ConnectTimeout", "ReadTimeout", "ReadError",
+             "RemoteProtocolError", "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+             "Temporary failure in name resolution", "Name or service not known", "Network is unreachable",
+             "Connection reset by peer", "Bad Gateway", "Gateway Timeout", "Service Unavailable")
+
+
+def network_errors(logs: str) -> bool:
+    """В логах ошибки, похожие на сбой сети (Telegram/HTTP недоступен), а не на ошибку в коде."""
+    return any(s in logs for s in NET_SIGNS)
+
+
+def docker_time(s: str) -> float | None:
+    """2026-11-15T17:19:51.273824495Z → unix time. Docker пишет наносекунды, datetime их не понимает."""
+    try:
+        head, _, frac = s.rstrip("Z").partition(".")
+        ts = datetime.strptime(head, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=ZoneInfo("UTC")).timestamp()
+        return ts + (float("0." + frac[:6]) if frac[:6].isdigit() else 0.0)
+    except (ValueError, AttributeError):
+        return None
 
 
 def check_reboot(state: AlertState) -> str | None:

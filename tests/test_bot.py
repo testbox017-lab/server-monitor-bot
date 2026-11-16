@@ -153,7 +153,7 @@ class StepTest(unittest.TestCase):
 
 class DockerEventsTest(unittest.TestCase):
     def setUp(self):
-        self.cfg = {"containers": ["weather-bot"], "log_alert_min": 15}
+        self.cfg = {"containers": ["weather-bot"], "log_alert_min": 15, "log_check_min": 1}
         self.st = checks.AlertState()
 
     def ev(self, now, started="t1", restarts=0, logs="", recovered=(), quiet=False):
@@ -672,7 +672,7 @@ class SecurityTest(unittest.TestCase):
 
     def test_parse(self):
         acc, failed = security.parse_ssh(SSH_LOG)
-        self.assertEqual(acc, [("root", "203.0.113.5", "publickey")])
+        self.assertEqual(acc, [("root", "203.0.113.5", "publickey", "SHA256:xx")])
         self.assertEqual(failed, {"198.51.100.7": 2, "198.51.100.9": 1})
 
     def test_ports_parse(self):
@@ -857,6 +857,7 @@ class BackupsTest(unittest.TestCase):
 
     def test_age_alerts(self):
         now = time.time()
+        self.st.bak_first_seen = {"бот": now - 2 * 86400}   # папку наблюдаем давно
         r = backups.evaluate(self.cfg, self.st, now, self.dir, self.watched(3))
         self.assertIsNone(r["bak:/var/backups/weather-bot"])
         self.assertIn("нет ни одной", r["bak:бот"])            # своих копий ещё нет
@@ -1346,7 +1347,7 @@ class BotButtonsTest(unittest.TestCase):
         alerts = [checks.Alert(f"🚨 проблема {i} <x>", f"svc:s{i}", "alert") for i in range(5)]
         sent = []
 
-        async def fake_broadcast(bot, text, markup=None):
+        async def fake_broadcast(bot, text, markup=None, silent=False):
             sent.append((text, markup))
         with mock.patch.object(checks, "step", return_value=alerts), \
              mock.patch.object(updater, "last_result", return_value=None), \
@@ -1456,7 +1457,7 @@ class BotButtonsTest(unittest.TestCase):
         b = self.bot
         sent = []
 
-        async def fake_broadcast(bot, text, markup=None):
+        async def fake_broadcast(bot, text, markup=None, silent=False):
             sent.append(text)
         res = {"ok": True, "sha": "b" * 40, "from": "a" * 40, "finished": 123.0, "notes": []}
         b.STATE.update_reported = None
@@ -1819,7 +1820,7 @@ class AutobanTest(unittest.TestCase):
                         ("80.94.95.3", 50), ("45.155.205.9", 40), ("10.0.0.5", 99))
         st.known_ips = ["80.94.95.3"]                       # с него уже входили — не трогаем
         self.assertEqual(security.autoban_candidates(cfg, st, T0), [("185.220.101.5", 12)])
-        st.ssh_failed.append([T0 - 900, "93.184.216.34", 100])  # старше 10 минут
+        st.ssh_failed.append([T0 - 4000, "93.184.216.34", 100])  # старше часа
         self.assertEqual(len(security.autoban_candidates(cfg, st, T0)), 1)
         st.autoban_skip = {"185.220.101.5": T0 - 60}         # помощник недавно отказал
         self.assertEqual(security.autoban_candidates(cfg, st, T0), [])
@@ -1845,13 +1846,47 @@ class AutobanBotTest(unittest.TestCase):
     def setUp(self):
         b = self.bot
         b.S.reset()
-        self.saved = (b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip)
-        b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip = [], [], {}, {}
+        self.saved = (b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip,
+                      b.STATE.ban_history, b.STATE.fail_ips)
+        (b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip,
+         b.STATE.ban_history, b.STATE.fail_ips) = [], [], {}, {}, {}, {}
 
     def tearDown(self):
         b = self.bot
-        b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip = self.saved
+        (b.STATE.ssh_failed, b.STATE.known_ips, b.STATE.autobans, b.STATE.autoban_skip,
+         b.STATE.ban_history, b.STATE.fail_ips) = self.saved
         b.S.reset()
+
+    def test_slow_bruteforce_subnet_and_repeat(self):
+        """Часть 4: медленный подбор (за час), подсеть /24, повторный бан — навсегда."""
+        b = self.bot
+        now = time.time()
+        # 195.178.110.217: по 1 попытке в минуту — за 10 минут мало, за час 40
+        b.STATE.ssh_failed = [[now - 60 * i, "195.178.110.217", 1] for i in range(40)]
+        b.STATE.fail_ips = {"195.178.110.26": [110, now - 3000]}          # вчерашний сосед по подсети
+        calls = []
+
+        def helper(cmd, target, timeout=0):
+            calls.append((cmd, target))
+            return True, f"banned {target}"
+        with mock.patch.object(b.ACT, "_helper", side_effect=helper):
+            banned, _ = b.autoban_step(now)
+        self.assertEqual(banned, [("195.178.110.217", 40), ("195.178.110.0/24", 2)])
+        self.assertEqual(calls[-1], ("ban-ip", "195.178.110.0/24"))
+        self.assertIn("подсеть 195.178.110.0/24", b.autoban_line("195.178.110.0/24", 2))
+        self.assertIn("за час", b.autoban_line("195.178.110.217", 40))
+        # подсеть уже в бане: отдельные IP из неё больше не баним
+        b.STATE.ssh_failed = [[now - 30, "195.178.110.5", 30]]
+        with mock.patch.object(b.ACT, "_helper", side_effect=helper):
+            self.assertEqual(b.autoban_step(now + 60), ([], []))
+        # бан истёк, подборщик вернулся — второй раз навсегда
+        b.STATE.autobans = {}
+        b.STATE.ssh_failed = [[now + 100, "91.240.118.7", 15]]
+        b.STATE.ban_history["91.240.118.7"] = [1, now - 86400]
+        with mock.patch.object(b.ACT, "_helper", side_effect=helper):
+            b.autoban_step(now + 120)
+        self.assertEqual(b.STATE.autobans["91.240.118.7"], 0)
+        self.assertIn("навсегда (уже банили)", b.autoban_line("91.240.118.7", 15))
 
     def test_step(self):
         b = self.bot
@@ -2266,6 +2301,167 @@ class ReviewFixesBotTest(unittest.TestCase):
         with mock.patch.object(b.ACT, "_helper", return_value=(False, "этот IP блокировал не бот")):
             b.autoban_step(now + 4000)
         self.assertNotIn("45.155.205.9", b.STATE.autobans)          # правила уже нет — забываем
+
+
+class Part4Test(unittest.TestCase):
+    """Часть 4: меньше шума от деплоя, перезагрузки и сбоев связи; честный недельный отчёт."""
+    DEPLOY_FP = "SHA256:RRBViC4+Wqsi4RUOvklwpOd/6ztXeUWJoabjbmasyls"
+
+    def test_deploy_login_and_restart_are_journal_only(self):
+        cfg = {"ssh_alerts": True, "port_alerts": False, "update_alerts": False, "deploy_keys": [self.DEPLOY_FP],
+               "containers": ["weather-bot"], "log_alerts": False}
+        st = checks.AlertState(ssh_checked=T0, ctr_started={"weather-bot": "2026-11-15T13:12:00Z"})
+        text = f"Accepted publickey for root from 172.200.165.147 port 61569 ssh2: ED25519 {self.DEPLOY_FP}\n"
+        self.assertEqual(security.events(cfg, st, T0 + 60, False, False, ssh_text_fn=lambda s: text), [])
+        self.assertNotIn("172.200.165.147", st.known_ips)       # не «новый IP» и не копится в своих
+        self.assertEqual(st.deploy_at, T0 + 60)
+        info = {"weather-bot": {"restarts": 0, "started": "2026-11-15T17:19:51.273824495Z", "health": ""}}
+        out = checks.docker_events(cfg, st, T0 + 70, set(), False, False, info)
+        self.assertEqual([(a.text[:8], a.send) for a in out], [("🚀 Деплой", "journal")])
+        # без деплоя тот же перезапуск — обычный алерт
+        info["weather-bot"]["started"] = "2026-11-15T18:00:00Z"
+        out = checks.docker_events(cfg, st, T0 + 60 + checks.DEPLOY_WINDOW + 1, set(), False, False, info)
+        self.assertEqual([a.send for a in out], ["loud"])
+        self.assertIn("перезапустился", out[0].text)
+        # чужой ключ — обычный вход с нового IP
+        other = "Accepted publickey for root from 9.9.9.9 port 1 ssh2: ED25519 SHA256:other\n"
+        st.ssh_checked = T0
+        out = security.events(cfg, st, T0 + 5000, False, False, ssh_text_fn=lambda s: other)
+        self.assertTrue(any("нового IP 9.9.9.9" in a.text for a in out))
+        self.assertTrue(security.is_deploy({"deploy_nets": ["20.0.0.0/8"]}, "20.171.127.98", ""))
+
+    def test_container_started_with_server_boot_is_silent(self):
+        cfg = {"containers": ["w"], "log_alerts": False}
+        boot = checks.docker_time("2026-11-15T12:47:00Z")
+        st = checks.AlertState(boot_time=boot, ctr_started={"w": "2026-11-15T10:00:00Z"})
+        info = {"w": {"restarts": 0, "started": "2026-11-15T12:47:40.5Z", "health": ""}}
+        self.assertEqual(checks.docker_events(cfg, st, boot + 100, set(), False, False, info), [])
+        self.assertEqual(st.ctr_started["w"], "2026-11-15T12:47:40.5Z")
+        self.assertAlmostEqual(checks.docker_time("2026-11-15T12:47:40.5Z") - boot, 40.5)
+        self.assertIsNone(checks.docker_time("t1"))
+
+    def test_network_errors_in_logs_are_quiet(self):
+        cfg = {"containers": ["w"], "log_check_min": 1}
+        st = checks.AlertState()
+        info = {"w": {"restarts": 0, "started": "s", "health": ""}}
+        net = "ERROR:root:ошибка рассылки\nTraceback (most recent call last):\ntelegram.error.TimedOut: Timed out\n"
+        checks.docker_events(cfg, st, T0, set(), False, False, info, lambda n, s: "")
+        out = checks.docker_events(cfg, st, T0 + 60, set(), False, False, info, lambda n, s: net)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].text.startswith("🌐 Сетевые ошибки в логах w"))
+        self.assertEqual(out[0].send, "quiet")
+        # бот сам только что терял связь — ошибки рядом по времени тоже считаем сбоем связи
+        st.net_fail_at = T0 + 1000
+        out = checks.docker_events(cfg, st, T0 + 1100, set(), False, False, info, lambda n, s: "ERROR x")
+        self.assertIn("связь пропадала", out[0].text)
+        st.net_fail_at = 0
+        out = checks.docker_events(cfg, st, T0 + 2200, set(), False, False, info, lambda n, s: "ERROR x")
+        self.assertTrue(out[0].text.startswith("⚠️ Ошибки в логах"))
+        import incidents
+        self.assertEqual(incidents.event_kind("🌐 Сетевые ошибки"), "сбои связи")
+
+    def test_logs_checked_every_5_min_by_default(self):
+        cfg = {"containers": ["w"]}
+        st = checks.AlertState()
+        info = {"w": {"restarts": 0, "started": "s", "health": ""}}
+        seen = []
+
+        def logs(n, since):
+            seen.append(since)
+            return ""
+        for i in range(11):
+            checks.docker_events(cfg, st, T0 + 60 * i, set(), False, False, info, logs)
+        self.assertEqual(seen, [T0, T0 + 300])                   # с первого просмотра ничего не теряется
+
+    def test_docker_poll_cache(self):
+        self.addCleanup(checks._poll.update, {"ts": 0.0, "unsupported_until": 0.0})
+        payload = json.dumps({"ps": "w\trunning\nx\texited\n",
+                              "inspect": "/w\t1\t2026-11-15T07:00:00Z\thealthy\t\n/x\t0\t2026-11-14T07:00:00Z\t\t\n"})
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout=payload, stderr="")
+        with mock.patch.object(checks, "docker_via_helper", return_value=True), \
+             mock.patch.object(checks.subprocess, "run", run):
+            self.assertTrue(checks.docker_poll())
+            self.assertEqual(checks.container_states(), {"w": "running", "x": "exited"})
+            self.assertEqual(checks.container_info(["w", "nope"])["w"]["restarts"], 1)
+            self.assertNotIn("nope", checks.container_info(["w", "nope"]))
+        self.assertEqual(calls, [["sudo", "-n", checks.HELPER, "docker-poll"]])   # один вызов на всё
+        # старый помощник без docker-poll: обычные вызовы, повтор не раньше чем через 10 минут
+        with mock.patch.object(checks, "docker_via_helper", return_value=True), \
+             mock.patch.object(checks.subprocess, "run",
+                               return_value=mock.Mock(returncode=2, stdout="unknown command\n", stderr="")):
+            self.assertFalse(checks.docker_poll())
+        self.assertGreater(checks._poll["unsupported_until"], time.time())
+        self.assertIsNone(checks._poll_fresh())
+
+    def test_helper_net_ban_and_poll(self):
+        h = load_helper()
+        self.assertEqual(str(h.parse_ip("195.178.110.0/24")), "195.178.110.0/24")
+        for bad in ("195.178.0.0/16", "195.178.110.1/24", "10.0.0.0/24", "2001:db8::/64"):
+            with self.assertRaises(SystemExit):
+                with mock.patch("sys.stdout", io.StringIO()):
+                    h.parse_ip(bad)
+        net = h.parse_ip("195.178.110.0/24")
+        self.assertTrue(h.covers_peer(net, {"195.178.110.9"}))
+        self.assertFalse(h.covers_peer(net, {"9.246.153.109"}))
+        self.assertTrue(h.covers_peer(h.parse_ip("8.8.8.8"), {"8.8.8.8"}))
+        ps = mock.Mock(returncode=0, stdout="w\trunning\nbad name\texited\n", stderr="")
+        insp = mock.Mock(returncode=0, stdout="/w\t0\tx\t\t\n", stderr="")
+        out = io.StringIO()
+        with mock.patch.object(h.subprocess, "run", side_effect=[ps, insp]) as run, mock.patch("sys.stdout", out):
+            h.docker_poll()
+        self.assertEqual(run.call_args_list[1].args[0], ["docker", "inspect", "--format", h.INSPECT_FMT, "w"])
+        self.assertEqual(json.loads(out.getvalue())["inspect"], "/w\t0\tx\t\t\n")
+
+    def test_weekly_partial_period_and_deploys(self):
+        import incidents
+        inc = incidents.Incidents(Path(tempfile.mkdtemp()) / "m.db")
+        h = history.History(Path(tempfile.mkdtemp()) / "h.db")
+        h.record(fake_sample(5, 40, 50, 1000, 1000), T0 - 23 * 3600)
+        h.record(fake_sample(5, 40, 50, 2000, 2000), T0 - 60)
+        inc.event("deploy:w", "🚀 Деплой: w перезапущен с новой версией", T0 - 3600)
+        inc.event("autoban", "🚫 Автобан: 1.2.3.4", T0 - 3600)
+        cfg = {"tz": "UTC", "probes": ["https://site.example"]}
+        inc.open("web:https://site.example", "x", T0 - 4 * 3600)
+        inc.close("web:https://site.example", T0 - 4 * 3600 + 828)        # 13,8 мин из 23 ч = 1%
+        text = incidents.weekly_text(cfg, inc, h, T0)
+        self.assertIn("Данные только с", text)
+        self.assertIn("23 ч", text)
+        self.assertIn("site.example: 99.00%", text)
+        self.assertIn("🗒 События: автобан IP — 1", text)
+        self.assertIn("🚀 Плановое: деплои — 1", text)
+
+    def test_ssh_stats_and_week_lines(self):
+        st = checks.AlertState(autobans={"195.178.110.0/24": 0})
+        security.record_failures(st, {"195.178.110.26": 60, "80.94.92.179": 30}, T0)
+        security.record_failures(st, {"195.178.110.217": 40}, T0 + 3600)
+        self.assertEqual(st.fail_ips["195.178.110.26"], [60, T0])
+        lines = security.ssh_week_lines(st, T0 + 7200)
+        self.assertIn("130 попыток с 3 IP", lines[0])
+        self.assertIn("195.178.110.0/24 (100)", lines[0])
+        self.assertIn("подсетей: 1", lines[1])
+        security.record_failures(st, {}, T0 + 2 * 86400)
+        self.assertEqual(st.fail_ips, {})                              # старше суток забываются
+
+    def test_backup_folder_grace(self):
+        st = checks.AlertState()
+        cfg = {"backup_alerts": True, "offsite_max_age_h": None}
+
+        def watched(now):
+            return [{"path": "/var/backups/new", "max_age_h": 26, "exists": True, "newest": None}]
+        self.assertIsNone(backups.evaluate(cfg, st, T0, None, watched)["bak:/var/backups/new"])
+        self.assertIn("нет ни одной",
+                      backups.evaluate(cfg, st, T0 + 27 * 3600, None, watched)["bak:/var/backups/new"])
+
+    def test_new_settings_defaults(self):
+        s = Settings(CONF)
+        self.assertEqual((s.cfg["autoban_hour_threshold"], s.cfg["autoban_net_ips"], s.cfg["log_check_min"]),
+                         (20, 2, 5))
+        self.assertTrue(s.cfg["autoban_repeat_forever"])
+        self.assertEqual(s.cfg["deploy_keys"], [])
 
 
 if __name__ == "__main__":

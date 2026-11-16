@@ -18,7 +18,7 @@ from pathlib import Path
 from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -35,6 +35,7 @@ from settings import Settings
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)  # иначе две строки в журнал на каждую проверку
 log = logging.getLogger("monitor_bot")
 
 CONFIG_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_name("config.yaml")
@@ -1309,10 +1310,14 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
 
 # ---------- Фоновые задачи ----------
 
-async def broadcast(bot, text: str, markup=None) -> None:
+async def broadcast(bot, text: str, markup=None, silent: bool = False) -> None:
     for chat_id in CFG["allowed_chats"]:
         try:
-            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                   disable_notification=silent)
+        except (NetworkError, TimedOut):
+            STATE.net_fail_at = time.time()  # ошибки в логах контейнеров рядом по времени — тот же сбой связи
+            log.exception("Нет связи с Telegram, сообщение в %s не отправлено", chat_id)
         except Exception:
             log.exception("Не удалось отправить сообщение в %s", chat_id)
 
@@ -1332,6 +1337,8 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ok != STATE.heartbeat_ok:
             log.info("Сигнал во внешний сервис: %s", "ok" if ok else "не доходит")
             STATE.heartbeat_ok = ok
+        if not ok:
+            STATE.net_fail_at = time.time()
     if STATE.maint_until and not STATE.in_maintenance(time.time()):
         STATE.maint_until = 0.0  # обслуживание кончилось по времени
         STATE.save()
@@ -1344,12 +1351,17 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await report_update(ctx.bot)
     except Exception:
         log.exception("Не удалось сообщить результат обновления")
+    alerts = [a for a in alerts if a.send != "journal"]  # деплой и т.п.: только в журнале инцидентов
     if CFG.get("group_alerts", True) and len(alerts) > 3:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return
     for a in alerts:
         markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
-        await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}", markup)
+        text = f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}"
+        if a.send == "quiet":
+            await broadcast(ctx.bot, text, markup, silent=True)
+        else:
+            await broadcast(ctx.bot, text, markup)
 
 
 def ban_log(ip: str, kind: str, ok: bool, out: str) -> None:
@@ -1374,22 +1386,40 @@ def autoban_step(now: float) -> tuple[list[tuple[str, int]], list[str]]:
             changed_unban = True
             log.warning("Не удалось снять автобан %s: %s", ip, out)
     banned = []
-    hours = CFG.get("autoban_hours")
-    hours = 24 if hours is None else int(hours)
-    for ip, n in security.autoban_candidates(CFG, STATE, now):
-        ok, out = ACT._helper("ban-ip", ip, timeout=30)
-        ban_log(ip, "ban", ok, f"автобан ({n} попыток): {out}")
+
+    def ban(target: str, n: int, why: str) -> None:
+        ok, out = ACT._helper("ban-ip", target, timeout=30)
+        ban_log(target, "ban", ok, f"автобан ({why}): {out}")
         if ok and not out.startswith("already banned"):  # ручной бан не превращаем во временный
-            STATE.autobans[ip] = now + hours * 3600 if hours else 0
-            banned.append((ip, n))
+            hours = security.ban_hours(CFG, STATE, target, now)  # повторно за 30 дней — навсегда
+            STATE.autobans[target] = now + hours * 3600 if hours else 0
+            security.remember_ban(STATE, target, now)
+            banned.append((target, n))
         else:  # уже заблокирован вручную или помощник отказал — час не трогаем
-            STATE.autoban_skip[ip] = now
+            STATE.autoban_skip[target] = now
             if not ok:
-                log.warning("Автобан %s не удался: %s", ip, out)
+                log.warning("Автобан %s не удался: %s", target, out)
+    for ip, n in security.autoban_candidates(CFG, STATE, now):
+        ban(ip, n, f"{n} попыток")
+    for net, ips in security.net_candidates(CFG, STATE, now):  # после IP: свежезабаненные IP тоже считаются
+        ban(net, len(ips), "подборщики из одной подсети: " + ", ".join(ips[:5]))
     STATE.autoban_skip = {ip: ts for ip, ts in STATE.autoban_skip.items() if now - ts < security.AUTOBAN_RETRY}
     if banned or lifted or changed_unban:
         STATE.save()
     return banned, lifted
+
+
+def autoban_line(target: str, n: int) -> str:
+    until = STATE.autobans.get(target)
+    if until == 0:
+        repeat = (STATE.ban_history.get(target) or [0])[0] > 1
+        dur = "навсегда" + (" (уже банили)" if repeat else "")
+    else:
+        hours = round(((until or 0) - time.time()) / 3600)
+        dur = security.ban_duration_text(max(hours, 1))
+    if "/" in target:
+        return f"подсеть {target} {dur} ({n} IP подбирали пароль)"
+    return f"{target} {dur} ({n} попыток за час)"
 
 
 async def run_autoban(bot) -> None:
@@ -1397,9 +1427,7 @@ async def run_autoban(bot) -> None:
     banned, _ = await asyncio.to_thread(autoban_step, now)
     if not banned:
         return
-    hours = CFG.get("autoban_hours")
-    dur = security.ban_duration_text(24 if hours is None else int(hours))
-    text = "🚫 Автобан " + dur + ": " + ", ".join(f"{ip} ({n} попыток за 10 мин)" for ip, n in banned)
+    text = "🚫 Автобан: " + "; ".join(autoban_line(t, n) for t, n in banned)
     try:
         await asyncio.to_thread(INC.event, "autoban", text, now)
     except Exception:
@@ -1459,6 +1487,7 @@ def weekly_extra() -> list[str]:
         n = None
     if n is not None:
         lines.append(f"🚫 Заблокировано IP ботом: {n}")
+    lines += security.ssh_week_lines(STATE, time.time())
     return lines
 
 

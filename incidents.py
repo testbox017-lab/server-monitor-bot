@@ -19,7 +19,9 @@ RETENTION_DAYS = 180
 WEEK = 7 * 86400
 EVENT_KINDS = {"🔁": "перезапуски контейнеров", "💥": "OOM killer", "🔐": "входы по SSH",
                "🛡": "подбор пароля по SSH", "🚪": "новые открытые порты", "🩹": "обновления безопасности",
-               "🔒": "SSL-сертификаты", "🚫": "автобан IP", "📈": "прогноз памяти", "⚠️": "прочие предупреждения"}
+               "🔒": "SSL-сертификаты", "🚫": "автобан IP", "📈": "прогноз памяти", "🚀": "деплои",
+               "🌐": "сбои связи", "⚠️": "прочие предупреждения"}
+PLANNED_KINDS = ("деплои",)  # плановые события: в отчёте отдельной строкой, не среди тревог
 
 _lock = threading.Lock()
 
@@ -146,6 +148,13 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
     now = now or time.time()
     since, prev = now - WEEK, now - 2 * WEEK
     lines = [f"📅 <b>Неделя {local(cfg, since, '%d.%m')}–{local(cfg, now, '%d.%m')}</b>"]
+    # Бот мог начать наблюдение посреди недели: тогда честно пишем, за какой срок данные,
+    # и доступность считаем от этого момента, а не от всей недели
+    first = hist.first_ts() if hist is not None and hasattr(hist, "first_ts") else None
+    period = WEEK
+    if first is not None and first > since + 3600:
+        period = max(now - first, 3600)
+        lines.append(f"ℹ️ Данные только с {local(cfg, first)} ({fmt_duration(period)}): бот наблюдает с этого времени")
 
     allrows = inc.between(since, now)
     rows = [r for r in allrows if not planned(r[1])]
@@ -173,7 +182,7 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
         lines.append("\n🌐 Доступность снаружи:")
         for t in targets[:8]:
             down = by_key.get(t, (0, 0.0))[1]
-            lines.append(f"  • {html.escape(t[4:])}: {availability(down, WEEK)}")
+            lines.append(f"  • {html.escape(t[4:])}: {availability(down, period)}")
 
     p = hist.peaks(WEEK, now) if hist is not None else None
     if p:
@@ -193,8 +202,13 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
         for _, text, *_ in events:
             name = event_kind(text or "")
             counts[name] = counts.get(name, 0) + 1
-        lines.append("\n🗒 События: " + ", ".join(f"{name} — {n}" for name, n in
-                                                 sorted(counts.items(), key=lambda x: -x[1])))
+        plan_ev = {k: counts.pop(k) for k in PLANNED_KINDS if k in counts}
+        if counts:
+            lines.append("\n🗒 События: " + ", ".join(f"{name} — {n}" for name, n in
+                                                     sorted(counts.items(), key=lambda x: -x[1])))
+        if plan_ev:
+            lines.append(("\n" if not counts else "") + "🚀 Плановое: "
+                         + ", ".join(f"{name} — {n}" for name, n in plan_ev.items()))
     if extra:
         lines.append("")
         lines += extra

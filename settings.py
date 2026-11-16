@@ -16,6 +16,7 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
             "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
             "autoban", "autoban_threshold", "autoban_hours", "autoban_whitelist",
+            "autoban_hour_threshold", "autoban_net_ips", "autoban_repeat_forever", "log_check_min",
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
             "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
@@ -38,6 +39,7 @@ DEFAULTS = {
     "containers_auto": False,   # отслеживать все контейнеры, которые бот видел работающими
     "log_alerts": True,         # алерт на ошибки в логах контейнеров
     "log_alert_min": 15,        # не чаще раза в N минут на контейнер
+    "log_check_min": 5,         # просматривать логи раз в N минут (каждый просмотр — вызов через sudo)
     "log_patterns": None,       # None = Traceback, ERROR, CRITICAL, Exception, FATAL
     # Безопасность
     "ssh_alerts": True,             # вход по SSH с нового IP и подбор пароля
@@ -49,6 +51,13 @@ DEFAULTS = {
     "autoban_threshold": 10,        # неудачных попыток с одного IP за 10 мин
     "autoban_hours": 24,            # на сколько (0 = навсегда)
     "autoban_whitelist": [],        # эти IP не блокировать никогда (и IP, с которых уже входили)
+    "autoban_hour_threshold": 20,   # или столько попыток с одного IP за час (медленный подбор), 0 = выкл
+    "autoban_net_ips": 2,           # столько подборщиков из одной /24 — блокировать всю подсеть (0 = выкл)
+    "autoban_repeat_forever": True, # кого уже банили за 30 дней, второй раз — навсегда
+    # Автодеплой (только config.yaml): вход этим ключом или с этих адресов — не «новый IP», а деплой,
+    # и перезапуск контейнера в следующие 10 минут не тревога, а запись в журнале
+    "deploy_keys": [],              # отпечатки ключей: SHA256:… (видно в journalctl -u ssh: Accepted publickey …)
+    "deploy_nets": [],              # подсети, например 20.0.0.0/8 (лучше ключ: у GitHub Actions адреса разные)
     # Умные алерты
     "anomaly_alerts": True,         # «необычно для этого часа» по истории за 14 дней
     "ram_trend_alerts": True,       # память стабильно растёт и скоро закончится

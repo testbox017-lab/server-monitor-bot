@@ -336,8 +336,16 @@ class HelperScriptTest(unittest.TestCase):
              mock.patch("builtins.open", mock.mock_open(read_data=b"/usr/sbin/sshd")):
             self.assertEqual(self.code("kill", "12345"), 2)
         child = subprocess.Popen(["sleep", "30"])
+        real_open = open
+
+        def plain_cgroup(path, *a, **kw):
+            # тесты идут и внутри службы monitor-bot-update-* (обновление из бота): дочерний sleep попал бы в её
+            # cgroup, и помощник правильно отказался бы его останавливать. Здесь проверяем обычный процесс.
+            if str(path).endswith("/cgroup"):
+                return mock.mock_open(read_data="0::/user.slice/session-1.scope\n")()
+            return real_open(path, *a, **kw)
         try:
-            with mock.patch("builtins.print"):
+            with mock.patch("builtins.print"), mock.patch("builtins.open", plain_cgroup):
                 self.h.main(["kill", str(child.pid)])
             self.assertEqual(child.wait(5), -15)
         finally:

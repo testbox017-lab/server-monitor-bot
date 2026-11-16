@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import psutil
+from i18n import N_, _
 
 HELPER = "/usr/local/sbin/monitor-bot-action"
 CONFIRM_TTL = 120  # секунд на подтверждение
@@ -16,12 +17,12 @@ PROTECTED = {"init", "dockerd", "docker-proxy", "dbus-daemon", "dbus-broker", "p
              "ufw", "iptables", "nft", "chronyd", "monitor-bot-act"}
 PROTECTED_PREFIXES = ("systemd", "containerd", "sshd", "apt", "dpkg", "unattended-upgr")
 HELPER_ERRORS = {
-    "refused: this IP has an open SSH session": "с этого IP сейчас открыта SSH-сессия, не блокирую",
-    "refused: local or special address": "это локальный или служебный адрес",
-    "ufw is not active": "фаервол ufw выключен",
-    "not banned by monitor-bot": "этот IP блокировал не бот",
-    "unknown command": "помощник на сервере не обновлён (нет такой команды)",
-    "refused: bot update is running": "это процесс обновления бота, его нельзя останавливать",
+    "refused: this IP has an open SSH session": N_('с этого IP сейчас открыта SSH-сессия, не блокирую'),
+    "refused: local or special address": N_('это локальный или служебный адрес'),
+    "ufw is not active": N_('фаервол ufw выключен'),
+    "not banned by monitor-bot": N_('этот IP блокировал не бот'),
+    "unknown command": N_('помощник на сервере не обновлён (нет такой команды)'),
+    "refused: bot update is running": N_('это процесс обновления бота, его нельзя останавливать'),
 }
 
 
@@ -72,17 +73,17 @@ class Actions:
             return False, str(e)
         out = (r.stdout + r.stderr).strip()
         if "a password is required" in out or "not allowed" in out:
-            out = "нет прав: на сервере не настроено правило sudo для бота (см. README)"
-        out = HELPER_ERRORS.get(out.strip(), out)
+            out = _('нет прав: на сервере не настроено правило sudo для бота (см. README)')
+        out = _(HELPER_ERRORS[out.strip()]) if out.strip() in HELPER_ERRORS else out
         return r.returncode == 0, out
 
     def restart_container(self, name: str) -> tuple[bool, str]:
         import checks  # docker идёт через помощник, если он установлен (без группы docker)
         if not checks.valid_container(name):
-            return False, "неверное имя контейнера"
+            return False, _('неверное имя контейнера')
         r = checks.docker("restart", name, timeout=120)
         if r is None:
-            return False, "docker недоступен"
+            return False, _('docker недоступен')
         return r.returncode == 0, (r.stdout + r.stderr).strip()
 
     def restart_service(self, name: str) -> tuple[bool, str]:
@@ -92,14 +93,14 @@ class Actions:
         try:
             p = psutil.Process(pid)
             if p.name() != name or abs(p.create_time() - created) > 1:
-                return False, "процесс уже завершился (PID занят другим процессом)"
+                return False, _('процесс уже завершился (PID занят другим процессом)')
         except psutil.NoSuchProcess:
-            return False, "процесс уже завершился"
+            return False, _('процесс уже завершился')
         return self._helper("kill", str(pid), timeout=15)
 
     def cleanup_estimate(self) -> str:
         ok, out = self._helper("cleanup-estimate", timeout=60)
-        return out if ok else f"оценить не удалось: {out}"
+        return out if ok else _('оценить не удалось: {out}', out=out)
 
     def cleanup(self) -> tuple[bool, str]:
         return self._helper("cleanup", timeout=600)
@@ -127,7 +128,7 @@ class Actions:
         elif p.kind == "prunebak":
             res = self._helper("prune-bak", p.arg, timeout=300)
         else:
-            res = (False, "неизвестное действие")
+            res = (False, _('неизвестное действие'))
         self.log(p, *res)
         return res
 
@@ -152,15 +153,15 @@ class Actions:
 
 def describe(p: Pending) -> str:
     return {
-        "ctr": f"перезапуск контейнера {p.arg}",
-        "svc": f"перезапуск службы {p.arg}",
-        "kill": f"остановка процесса {p.extra.get('name', '?')} (PID {p.arg})",
-        "clean": "очистка места",
-        "reboot": "перезагрузка сервера",
-        "update": f"обновление бота до {p.arg[:7]}",
-        "prunebak": "удаление старых копий кода",
-        "ban": f"блокировка IP {p.arg}",
-        "unban": f"разблокировка IP {p.arg}",
+        "ctr": _('перезапуск контейнера {arg}', arg=p.arg),
+        "svc": _('перезапуск службы {arg}', arg=p.arg),
+        "kill": _('остановка процесса {name} (PID {arg})', name=p.extra.get('name', '?'), arg=p.arg),
+        "clean": _('очистка места'),
+        "reboot": _('перезагрузка сервера'),
+        "update": _('обновление бота до {arg}', arg=p.arg[:7]),
+        "prunebak": _('удаление старых копий кода'),
+        "ban": _('блокировка IP {arg}', arg=p.arg),
+        "unban": _('разблокировка IP {arg}', arg=p.arg),
     }.get(p.kind, p.kind)
 
 

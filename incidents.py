@@ -14,14 +14,15 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from i18n import N_, _
 
 RETENTION_DAYS = 180
 WEEK = 7 * 86400
-EVENT_KINDS = {"🔁": "перезапуски контейнеров", "💥": "OOM killer", "🔐": "входы по SSH",
-               "🛡": "подбор пароля по SSH", "🚪": "новые открытые порты", "🩹": "обновления безопасности",
-               "🔒": "SSL-сертификаты", "🚫": "автобан IP", "📈": "прогноз памяти", "🚀": "деплои",
-               "🌐": "сбои связи", "⚠️": "прочие предупреждения"}
-PLANNED_KINDS = ("деплои",)  # плановые события: в отчёте отдельной строкой, не среди тревог
+EVENT_KINDS = {"🔁": N_('перезапуски контейнеров'), "💥": "OOM killer", "🔐": N_('входы по SSH'),
+               "🛡": N_('подбор пароля по SSH'), "🚪": N_('новые открытые порты'), "🩹": N_('обновления безопасности'),
+               "🔒": N_('SSL-сертификаты'), "🚫": N_('автобан IP'), "📈": N_('прогноз памяти'), "🚀": N_('деплои'),
+               "🌐": N_('сбои связи'), "⚠️": N_('прочие предупреждения')}
+PLANNED_KINDS = (N_('деплои'),)  # плановые события: в отчёте отдельной строкой, не среди тревог
 
 _lock = threading.Lock()
 
@@ -99,7 +100,7 @@ def planned(text: str | None) -> bool:
 
 def downtime_by_key(rows: list[tuple], since: float, until: float) -> dict[str, tuple[int, float]]:
     out: dict[str, tuple[int, float]] = {}
-    for k, _, dur, _ in clipped(rows, since, until):
+    for k, __, dur, __ in clipped(rows, since, until):
         n, total = out.get(k, (0, 0.0))
         out[k] = (n + 1, total + dur)
     return out
@@ -121,19 +122,22 @@ def incidents_text(inc: Incidents, cfg: dict, now: float | None = None, n: int =
     from checks import fmt_duration, key_label
     now = now or time.time()
     rows = inc.recent(n)
-    lines = ["📒 <b>Журнал инцидентов</b>"]
+    lines = [_('📒 <b>Журнал инцидентов</b>')]
     if not rows:
-        lines.append("Пока пусто: ни одна проблема не держалась дольше порога.")
+        lines.append(_('Пока пусто: ни одна проблема не держалась дольше порога.'))
         return "\n".join(lines)
     for k, text, s, e in rows:
-        label = html.escape(key_label(k)) + (" (обслуживание)" if planned(text) else "")
+        label = html.escape(key_label(k)) + (_(' (обслуживание)') if planned(text) else "")
         if e is None:
-            lines.append(f"🔴 {label}: с {local(cfg, s)}, идёт {fmt_duration(now - s)}")
+            lines.append(_('🔴 {label}: с {local}, идёт {fmt_duration}',
+                           label=label, local=local(cfg, s), fmt_duration=fmt_duration(now - s)))
         else:
             lines.append(f"• {local(cfg, s)} {label}: {fmt_duration(max(e - s, 60))}")
     week = [r for r in inc.between(now - WEEK, now) if not planned(r[1])]
-    total = sum(d for *_, d, _ in clipped(week, now - WEEK, now))
-    lines.append(f"\nЗа 7 дней: {len(week)} инцидент(ов), простоя в сумме {fmt_duration(total) if total else '0 мин'}")
+    total = sum(d for *__, d, __ in clipped(week, now - WEEK, now))
+    lines.append(_('\n'
+                   'За 7 дней: {len} инцидент(ов), простоя в сумме {v}',
+                   len=len(week), v=fmt_duration(total) if total else _('0 мин')))
     return "\n".join(lines)
 
 
@@ -147,14 +151,15 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
     from checks import fmt_bytes, fmt_duration, key_label
     now = now or time.time()
     since, prev = now - WEEK, now - 2 * WEEK
-    lines = [f"📅 <b>Неделя {local(cfg, since, '%d.%m')}–{local(cfg, now, '%d.%m')}</b>"]
+    lines = [_('📅 <b>Неделя {local}–{local2}</b>', local=local(cfg, since, '%d.%m'), local2=local(cfg, now, '%d.%m'))]
     # Бот мог начать наблюдение посреди недели: тогда честно пишем, за какой срок данные,
     # и доступность считаем от этого момента, а не от всей недели
     first = hist.first_ts() if hist is not None and hasattr(hist, "first_ts") else None
     period = WEEK
     if first is not None and first > since + 3600:
         period = max(now - first, 3600)
-        lines.append(f"ℹ️ Данные только с {local(cfg, first)} ({fmt_duration(period)}): бот наблюдает с этого времени")
+        lines.append(_('ℹ️ Данные только с {local} ({fmt_duration}): бот наблюдает с этого времени',
+                       local=local(cfg, first), fmt_duration=fmt_duration(period)))
 
     allrows = inc.between(since, now)
     rows = [r for r in allrows if not planned(r[1])]
@@ -163,52 +168,56 @@ def weekly_text(cfg: dict, inc: Incidents, hist=None, now: float | None = None, 
     by_key = downtime_by_key(rows, since, now)
     total = sum(v[1] for v in by_key.values())
     if not rows:
-        lines.append("✅ Инцидентов не было" + (f" (неделей раньше: {prev_n})" if prev_n else ""))
+        lines.append(_('✅ Инцидентов не было') + (_(' (неделей раньше: {prev_n})', prev_n=prev_n) if prev_n else ""))
     else:
-        lines.append(f"🚨 Инцидентов: {len(rows)} (неделей раньше {prev_n}), простоя в сумме {fmt_duration(total)}")
+        lines.append(_('🚨 Инцидентов: {len} (неделей раньше {prev_n}), простоя в сумме {fmt_duration}',
+                       len=len(rows), prev_n=prev_n, fmt_duration=fmt_duration(total)))
         for k, (n, dur) in sorted(by_key.items(), key=lambda x: -x[1][1])[:6]:
-            lines.append(f"  • {html.escape(key_label(k))}: {n} раз, {fmt_duration(max(dur, 60))}")
-        still = [k for k, *_, e in rows if e is None]
+            lines.append(_('  • {escape}: {n} раз, {fmt_duration}',
+                           escape=html.escape(key_label(k)), n=n, fmt_duration=fmt_duration(max(dur, 60))))
+        still = [k for k, *__, e in rows if e is None]
         if still:
-            lines.append("  Не решено сейчас: " + ", ".join(html.escape(key_label(k)) for k in still))
+            lines.append(_('  Не решено сейчас: ') + ", ".join(html.escape(key_label(k)) for k in still))
     if plan:
-        pdur = sum(d for *_, d, _ in clipped(plan, since, now))
-        lines.append(f"🔧 Во время обслуживания: {len(plan)} проблем(ы), {fmt_duration(max(pdur, 60))}, "
-                     "в простой не считаются")
+        pdur = sum(d for *__, d, __ in clipped(plan, since, now))
+        lines.append(_('🔧 Во время обслуживания: {len} проблем(ы), {fmt_duration}, в простой не считаются',
+                       len=len(plan), fmt_duration=fmt_duration(max(pdur, 60))))
 
     targets = [f"web:{p}" if isinstance(p, str) else None for p in cfg.get("probes") or []]
     targets = [t for t in targets if t]
     if targets:
-        lines.append("\n🌐 Доступность снаружи:")
+        lines.append(_('\n🌐 Доступность снаружи:'))
         for t in targets[:8]:
             down = by_key.get(t, (0, 0.0))[1]
             lines.append(f"  • {html.escape(t[4:])}: {availability(down, period)}")
 
     p = hist.peaks(WEEK, now) if hist is not None else None
     if p:
-        lines.append("\n📊 Нагрузка:")
-        lines.append(f"  CPU в среднем {p['cpu_avg']:.0f}%, пик {p['cpu'][0]:.0f}% ({local(cfg, p['cpu'][1])})")
-        lines.append(f"  RAM пик {p['ram'][0]:.0f}% ({local(cfg, p['ram'][1])})")
+        lines.append(_('\n📊 Нагрузка:'))
+        lines.append(_('  CPU в среднем {cpu_avg:.0f}%, пик {cpu:.0f}% ({local})',
+                       cpu_avg=p['cpu_avg'], cpu=p['cpu'][0], local=local(cfg, p['cpu'][1])))
+        lines.append(_('  RAM пик {ram:.0f}% ({local})', ram=p['ram'][0], local=local(cfg, p['ram'][1])))
         if p["disk_from"] is not None:
-            lines.append(f"  Диск {p['disk_from']:.1f}% → {p['disk_to']:.1f}%")
-        lines.append(f"  Трафик ↓ {fmt_bytes(p['rx'])} ↑ {fmt_bytes(p['tx'])}")
+            lines.append(_('  Диск {disk_from:.1f}% → {disk_to:.1f}%', disk_from=p['disk_from'], disk_to=p['disk_to']))
+        lines.append(_('  Трафик ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                       fmt_bytes=fmt_bytes(p['rx']), fmt_bytes2=fmt_bytes(p['tx'])))
         days = hist.disk_forecast(now)
         if days is not None and days < 365:
-            lines.append(f"  ⚠️ Диск заполнится примерно через {days:.0f} дн.")
+            lines.append(_('  ⚠️ Диск заполнится примерно через {days:.0f} дн.', days=days))
 
     events = inc.between(since, now, "event")
     if events:
         counts: dict[str, int] = {}
-        for _, text, *_ in events:
+        for __, text, *__ in events:
             name = event_kind(text or "")
             counts[name] = counts.get(name, 0) + 1
         plan_ev = {k: counts.pop(k) for k in PLANNED_KINDS if k in counts}
         if counts:
-            lines.append("\n🗒 События: " + ", ".join(f"{name} — {n}" for name, n in
+            lines.append(_('\n🗒 События: ') + ", ".join(f"{_(name)} — {n}" for name, n in
                                                      sorted(counts.items(), key=lambda x: -x[1])))
         if plan_ev:
-            lines.append(("\n" if not counts else "") + "🚀 Плановое: "
-                         + ", ".join(f"{name} — {n}" for name, n in plan_ev.items()))
+            lines.append(("\n" if not counts else "") + _('🚀 Плановое: ')
+                         + ", ".join(f"{_(name)} — {n}" for name, n in plan_ev.items()))
     if extra:
         lines.append("")
         lines += extra

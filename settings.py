@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 import yaml
+import i18n
+from i18n import _
 
 # Ключи, которые можно менять из Telegram. Всё остальное (token, allowed_chats) только в config.yaml.
 EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "processes", "disks",
@@ -20,7 +22,7 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
             "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
-            "offsite_max_age_h", "verify_backups", "weekly_report")
+            "offsite_max_age_h", "verify_backups", "weekly_report", "lang")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -36,6 +38,7 @@ DEFAULTS = {
     "daily_summary": None,      # "09:00"
     "weekly_report": "09:00",   # недельный отчёт по понедельникам (None = выкл)
     "tz": "Europe/Kyiv",
+    "lang": "ru",               # язык интерфейса: ru, uk, en (меняется в «Настройки → Язык» или /lang)
     "containers_auto": False,   # отслеживать все контейнеры, которые бот видел работающими
     "log_alerts": True,         # алерт на ошибки в логах контейнеров
     "log_alert_min": 15,        # не чаще раза в N минут на контейнер
@@ -97,7 +100,7 @@ class Settings:
             base = yaml.safe_load(f) or {}
         token = str(base.get("token") or "")
         if not token or "ВАШ" in token:
-            sys.exit(f"Укажите token в {config_path}")
+            sys.exit(_('Укажите token в {config_path}', config_path=config_path))
         self.base = copy.deepcopy(DEFAULTS)
         for k, v in base.items():
             if k == "thresholds":
@@ -127,6 +130,7 @@ class Settings:
                 cfg[k] = v
         self.cfg.clear()
         self.cfg.update(cfg)
+        i18n.set_lang(cfg.get("lang"))
 
     def set(self, key: str, value) -> None:
         """Изменить настройку и сохранить. Старый файл уходит в settings.json.bak."""

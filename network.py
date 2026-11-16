@@ -8,6 +8,7 @@ import os
 import time
 
 import psutil
+from i18n import _
 
 SKIP_IFACES = ("lo", "veth", "br-", "docker")
 
@@ -71,28 +72,30 @@ def io_top(helper_fn) -> list[dict] | None:
 
 def net_text(cfg: dict, hist=None, helper_fn=None, rates_fn=iface_rates, ips_fn=remote_ips) -> str:
     from checks import disk_paths, fmt_bytes
-    lines = ["🌐 <b>Сеть и диск</b>"]
+    lines = [_('🌐 <b>Сеть и диск</b>')]
     for name, rx, tx in rates_fn():
-        lines.append(f"{html.escape(name)}: ↓ {fmt_bytes(rx)}/с ↑ {fmt_bytes(tx)}/с")
+        lines.append(_('{escape}: ↓ {fmt_bytes}/с ↑ {fmt_bytes2}/с',
+                       escape=html.escape(name), fmt_bytes=fmt_bytes(rx), fmt_bytes2=fmt_bytes(tx)))
     if hist is not None:
-        for title, sec in (("за сутки", 86400), ("за неделю", 7 * 86400)):
+        for title, sec in ((_('за сутки'), 86400), (_('за неделю'), 7 * 86400)):
             p = hist.peaks(sec)
             if p:
-                lines.append(f"Трафик {title}: ↓ {fmt_bytes(p['rx'])} ↑ {fmt_bytes(p['tx'])}")
+                lines.append(_('Трафик {title}: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                               title=title, fmt_bytes=fmt_bytes(p['rx']), fmt_bytes2=fmt_bytes(p['tx'])))
     ips = ips_fn()
     if ips:
-        lines.append("\nБольше всего соединений:")
+        lines.append(_('\nБольше всего соединений:'))
         lines += [f"  • {html.escape(ip)}: {n}" for ip, n in ips]
     if helper_fn is not None:
         top = io_top(helper_fn)
         if top is None:
-            lines.append("\nДиск по процессам: помощник не обновлён")
+            lines.append(_('\nДиск по процессам: помощник не обновлён'))
         elif top:
-            lines.append("\nДиск сейчас (чтение / запись в секунду):")
+            lines.append(_('\nДиск сейчас (чтение / запись в секунду):'))
             lines += [f"  • {html.escape(r['name'])} ({r['pid']}): {fmt_bytes(r['read'])} / {fmt_bytes(r['write'])}"
                       for r in top[:5]]
         else:
-            lines.append("\nДиск сейчас: никто не читает и не пишет")
+            lines.append(_('\nДиск сейчас: никто не читает и не пишет'))
     for path, pct in inode_usage(disk_paths(cfg.get("disks"))).items():
-        lines.append(f"Inode на {html.escape(path)}: {pct:.0f}%")
+        lines.append(_('Inode на {escape}: {pct:.0f}%', escape=html.escape(path), pct=pct))
     return "\n".join(lines)

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from i18n import _
 
 # «Accepted publickey for root from 1.2.3.4 port 5 ssh2: ED25519 SHA256:abc» — отпечаток ключа в конце
 ACCEPTED_RE = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port \d+(?: ssh2)?(?:: \S+ (SHA256:\S+))?")
@@ -155,7 +156,7 @@ def net_candidates(cfg: dict, state, now: float) -> list[tuple[str, list[str]]]:
     for t in state.autobans:
         if "/" not in t:
             add(t)
-    for t, (_, last) in state.ban_history.items():
+    for t, (__, last) in state.ban_history.items():
         if "/" not in t and now - last < REPEAT_DAYS * 86400:
             add(t)
     protect = recent_known_ips(state, now) | set(cfg.get("autoban_whitelist") or [])
@@ -204,10 +205,13 @@ def expired_autobans(state, now: float) -> list[str]:
     return [ip for ip, until in state.autobans.items() if until and until <= now]
 
 
-def ban_duration_text(hours: int) -> str:
+def ban_duration_text(hours: int, bare: bool = False) -> str:
+    """«на 24 ч»; bare=True — «24 ч» (для кнопок)."""
     if not hours:
-        return "навсегда"
-    return f"на {hours // 24} дн." if hours >= 48 else f"на {hours} ч"
+        return _('навсегда')
+    if bare:
+        return _('{days} дн.', days=hours // 24) if hours >= 48 else _('{hours} ч', hours=hours)
+    return _('на {days} дн.', days=hours // 24) if hours >= 48 else _('на {hours} ч', hours=hours)
 
 
 # ---------- Порты ----------
@@ -223,7 +227,7 @@ def listening_ports() -> set[str] | None:
         if len(parts) < 5:
             continue
         proto, local = parts[0], parts[4]
-        addr, _, port = local.rpartition(":")
+        addr, __, port = local.rpartition(":")
         addr = addr.strip("[]").split("%")[0]
         if addr.startswith("127.") or addr == "::1":
             continue
@@ -291,9 +295,11 @@ def ssh_week_lines(state, now: float) -> list[str]:
         nets[net24(ip) or ip] = nets.get(net24(ip) or ip, 0) + n
     top = ", ".join(f"{t} ({n})" for t, n in sorted(nets.items(), key=lambda x: -x[1])[:3])
     blocked = [t for t in state.autobans]
-    lines = [f"🛡 Подбор пароля SSH: {total} попыток с {len(by_ip)} IP. Больше всего: {top}"]
+    lines = [_('🛡 Подбор пароля SSH: {total} попыток с {len} IP. Больше всего: {top}',
+               total=total, len=len(by_ip), top=top)]
     if blocked:
-        lines.append(f"  Сейчас в автобане: {len(blocked)} (подсетей: {sum('/' in t for t in blocked)})")
+        lines.append(_('  Сейчас в автобане: {len} (подсетей: {sum})',
+                       len=len(blocked), sum=sum('/' in t for t in blocked)))
     return lines
 
 
@@ -327,8 +333,9 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
                     if muted:
                         continue
                     if new or cfg.get("ssh_alert_all_logins"):
-                        tag = "с нового IP" if new else ""
-                        out.append(Alert(f"🔐 Вход по SSH: {user} {tag} {ip} ({method})".replace("  ", " "),
+                        tag = _('с нового IP') if new else ""
+                        out.append(Alert(_('🔐 Вход по SSH: {user} {tag} {ip} ({method})',
+                                           user=user, tag=tag, ip=ip, method=method).replace("  ", " "),
                                          None, "event"))
                         state.log.append([now, f"ssh:{ip}"])
                 for ip, n in failed.items():
@@ -340,11 +347,12 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
         threshold = cfg.get("ssh_fail_threshold", 30)
         if threshold and total >= threshold and not quiet and not muted and now - state.ssh_fail_alert_at >= 3600:
             by_ip: dict[str, int] = {}
-            for _, ip, n in recent:
+            for __, ip, n in recent:
                 by_ip[ip] = by_ip.get(ip, 0) + n
             top = ", ".join(f"{ip} ({n})" for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])[:3])
             worst = max(by_ip.items(), key=lambda x: x[1])[0]
-            out.append(Alert(f"🛡 Подбор пароля по SSH: {total} неудачных попыток за 10 мин. Чаще всего: {top}",
+            out.append(Alert(_('🛡 Подбор пароля по SSH: {total} неудачных попыток за 10 мин. Чаще всего: {top}',
+                               total=total, top=top),
                              f"brute:{worst}", "event"))
             state.ssh_fail_alert_at = now
             state.log.append([now, "ssh_bruteforce"])
@@ -361,7 +369,7 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
             else:
                 new = sorted(ports - set(state.known_ports))
                 for p in new:
-                    out.append(Alert(f"🚪 Новый открытый наружу порт: {p}", None, "event"))
+                    out.append(Alert(_('🚪 Новый открытый наружу порт: {p}', p=p), None, "event"))
                     state.log.append([now, f"port:{p}"])
                 if new:
                     state.known_ports = sorted(set(state.known_ports) | set(new))
@@ -372,6 +380,7 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
         pkgs = updates_fn()
         if pkgs and not quiet and now - state.updates_alert_at >= 86400:
             state.updates_alert_at = now
-            names = ", ".join(pkgs[:8]) + (" и др." if len(pkgs) > 8 else "")
-            out.append(Alert(f"🩹 Доступны обновления безопасности Ubuntu: {len(pkgs)} ({names})", None, "event"))
+            names = ", ".join(pkgs[:8]) + (_(' и др.') if len(pkgs) > 8 else "")
+            out.append(Alert(_('🩹 Доступны обновления безопасности Ubuntu: {len} ({names})',
+                               len=len(pkgs), names=names), None, "event"))
     return out

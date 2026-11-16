@@ -8,10 +8,11 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from i18n import N_, _
 
 RETENTION_DAYS = 30
 PERIODS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}
-PERIOD_NAMES = {"1h": "1 час", "24h": "24 часа", "7d": "7 дней"}
+PERIOD_NAMES = {"1h": N_('1 час'), "24h": N_('24 часа'), "7d": N_('7 дней')}
 
 _lock = threading.Lock()
 
@@ -204,7 +205,7 @@ def chart_png(hist: History, period: str, tz, host: str, now: float | None = Non
     ax.set_ylim(0, 100)
     ax.set_ylabel("%")
     ax.legend(loc="upper left", frameon=False, ncol=2)
-    ax.set_title(f"{host}: последние {PERIOD_NAMES[period]}", loc="left", fontsize=12)
+    ax.set_title(_('{host}: последние {period}', host=host, period=_(PERIOD_NAMES[period])), loc="left", fontsize=12)
 
     ax = axes[1]
     disk = [r[3] for r in rows]
@@ -213,14 +214,14 @@ def chart_png(hist: History, period: str, tz, host: str, now: float | None = Non
     hi = max((d for d in disk if d is not None), default=100)
     pad = max(2, (hi - lo) * 0.3)
     ax.set_ylim(max(0, lo - pad), min(100, hi + pad))
-    ax.set_ylabel("Диск, %")
+    ax.set_ylabel(_('Диск, %'))
 
     ax = axes[2]
     if net_t:
-        ax.plot(net_t, rx_rate, color=blue, lw=1.2, label="Входящий")
-        ax.plot(net_t, tx_rate, color=orange, lw=1.2, label="Исходящий")
+        ax.plot(net_t, rx_rate, color=blue, lw=1.2, label=_('Входящий'))
+        ax.plot(net_t, tx_rate, color=orange, lw=1.2, label=_('Исходящий'))
         ax.legend(loc="lower right", bbox_to_anchor=(1, 1), frameon=False, ncol=2, borderaxespad=0.2)
-    ax.set_ylabel("Мбит/с")
+    ax.set_ylabel(_('Мбит/с'))
     ax.set_ylim(bottom=0)
 
     fmt = "%H:%M" if period != "7d" else "%d.%m"
@@ -239,12 +240,13 @@ def chart_png(hist: History, period: str, tz, host: str, now: float | None = Non
 def chart_caption(hist: History, period: str, now: float | None = None) -> str:
     p = hist.peaks(PERIODS[period], now)
     if not p:
-        return "Данных пока нет"
+        return _('Данных пока нет')
     from checks import fmt_bytes
-    parts = [f"Пик CPU {p['cpu'][0]:.0f}%, в среднем {p['cpu_avg']:.0f}%",
-             f"пик RAM {p['ram'][0]:.0f}%",
-             f"трафик ↓ {fmt_bytes(p['rx'])} ↑ {fmt_bytes(p['tx'])}"]
+    parts = [_('Пик CPU {cpu:.0f}%, в среднем {cpu_avg:.0f}%', cpu=p['cpu'][0], cpu_avg=p['cpu_avg']),
+             _('пик RAM {ram:.0f}%', ram=p['ram'][0]),
+             _('трафик ↓ {fmt_bytes} ↑ {fmt_bytes2}', fmt_bytes=fmt_bytes(p['rx']), fmt_bytes2=fmt_bytes(p['tx']))]
     days = hist.disk_forecast(now)
     if days is not None:
-        parts.append(f"диск заполнится примерно через {days:.0f} дн." if days < 365 else "диск растёт очень медленно")
+        parts.append(_('диск заполнится примерно через {days:.0f} дн.',
+                       days=days) if days < 365 else _('диск растёт очень медленно'))
     return ", ".join(parts)

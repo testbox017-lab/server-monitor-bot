@@ -1147,7 +1147,8 @@ class BotButtonsTest(unittest.TestCase):
                 if q.edit_message_text.await_args:
                     markup = q.edit_message_text.await_args.kwargs.get("reply_markup")
                     if markup and d.startswith(("set", "add")):
-                        todo += [x for x in self.all_callbacks(markup) if not x.startswith(("tg", "th:", "int"))]
+                        # язык проверяет test_i18n: здесь он сменил бы язык ответов посреди обхода
+                        todo += [x for x in self.all_callbacks(markup) if not x.startswith(("tg", "th:", "int", "lang:"))]
         self.assertGreater(len(seen), 15)
 
     def test_settings_changes(self):

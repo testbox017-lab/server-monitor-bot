@@ -6,6 +6,7 @@ import re
 import time
 import urllib.request
 from pathlib import Path
+from i18n import _
 
 APP_DIR = Path(__file__).resolve().parent
 RESULT_FILE = Path("/run/monitor-bot-update.json")
@@ -34,7 +35,7 @@ def current(app_dir: Path = APP_DIR) -> dict:
 
 
 def short(sha: str | None) -> str:
-    return sha[:7] if sha else "неизвестна"
+    return sha[:7] if sha else _('неизвестна')
 
 
 def api(path: str, timeout: int = 15) -> dict:
@@ -70,15 +71,17 @@ def result_text(res: dict) -> str:
     sha = short(res.get("sha"))
     notes = "".join(f"\n⚠️ {n}" for n in res.get("notes") or [])
     if res.get("ok"):
-        return f"✅ Бот обновлён до {sha} (было {short(res.get('from'))}).{notes}"
+        return _('✅ Бот обновлён до {sha} (было {short}).{notes}', sha=sha, short=short(res.get('from')), notes=notes)
     if res.get("stage") == "rolled_back":
-        return f"↩️ Обновление до {sha} не удалось: {res.get('error')}. Работает прежняя версия.{notes}"
-    tests = f"\nТесты: {res['tests']}" if res.get("tests") and not res.get("ok") else ""
-    return f"❌ Обновление до {sha} не удалось: {res.get('error') or res.get('stage')}.{tests}{notes}"
+        return _('↩️ Обновление до {sha} не удалось: {error}. Работает прежняя версия.{notes}',
+                 sha=sha, error=res.get('error'), notes=notes)
+    tests = _('\nТесты: {tests}', tests=res['tests']) if res.get("tests") and not res.get("ok") else ""
+    return _('❌ Обновление до {sha} не удалось: {v}.{tests}{notes}',
+             sha=sha, v=res.get('error') or res.get('stage'), tests=tests, notes=notes)
 
 
 def age_text(ts: float | None, now: float | None = None) -> str:
     if not ts:
         return ""
     days = int(((now or time.time()) - ts) // 86400)
-    return "сегодня" if days == 0 else f"{days} дн. назад"
+    return _('сегодня') if days == 0 else _('{days} дн. назад', days=days)

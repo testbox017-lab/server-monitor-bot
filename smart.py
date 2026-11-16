@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 
 import psutil
+from i18n import _
 
 ANOM_MIN_DELTA = 25        # насколько процентов выше нормы, минимум
 ANOM_SIGMAS = 3            # и не меньше чем на 3 разброса
@@ -43,8 +44,9 @@ def anomaly_results(cfg: dict, sample: dict | None, hist, now: float, tzinfo, pr
         limit = max(mean + ANOM_SIGMAS * std, mean + ANOM_MIN_DELTA)
         over_threshold = th.get(metric) is not None and value >= th[metric]
         if value >= limit and not over_threshold:  # выше порога — уже придёт обычный алерт
-            res[f"anom:{metric}"] = (f"🧐 Необычно высокая {NAMES[metric]} для этого времени: {value:.0f}%, "
-                                     f"обычно в этот час около {mean:.0f}%")
+            res[f"anom:{metric}"] = (_('🧐 Необычно высокая {NAMES} для этого времени: {value:.0f}%, обычно в этот '
+                                       'час около {mean:.0f}%',
+                                       NAMES=NAMES[metric], value=value, mean=mean))
     return res
 
 
@@ -79,11 +81,12 @@ def ram_trend_events(cfg: dict, state, hist, now: float, muted: bool, quiet: boo
         return []
     state.ram_trend_at = now
     state.log.append([now, "ram_trend"])
-    text = (f"📈 Память растёт: +{per_hour * RAM_TREND_WINDOW / 3600:.0f}% за 6 ч, сейчас {last:.0f}%. "
-            f"При таком темпе закончится примерно через {max(hours, 0.5):.0f} ч.")
+    text = (_('📈 Память растёт: +{v:.0f}% за 6 ч, сейчас {last:.0f}%. При таком темпе закончится примерно через '
+              '{max:.0f} ч.',
+              v=per_hour * RAM_TREND_WINDOW / 3600, last=last, max=max(hours, 0.5)))
     top = top_fn()
     if top:
-        text += f" Больше всех памяти занимает {top[0]} ({fmt_bytes(top[1])})."
+        text += _(' Больше всех памяти занимает {top} ({fmt_bytes}).', top=top[0], fmt_bytes=fmt_bytes(top[1]))
     return [Alert(text, None, "event")]
 
 

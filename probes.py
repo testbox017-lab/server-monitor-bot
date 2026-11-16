@@ -20,6 +20,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from i18n import _
 
 SCHEMES = ("http", "https", "tcp", "ping", "dns")
 SSL_STEPS = (14, 7, 3, 1, 0)       # за сколько дней до окончания предупреждать
@@ -53,7 +54,7 @@ def parse(raw: str) -> Target | None:
     else:
         raw_url = raw
     if "://" not in raw_url:
-        host, _, port = raw_url.rpartition(":")
+        host, __, port = raw_url.rpartition(":")
         raw_url = f"tcp://{raw_url}" if host and port.isdigit() else f"https://{raw_url}"
     try:
         u = urlsplit(raw_url)
@@ -95,7 +96,7 @@ def check_http(t: Target, timeout: float) -> tuple[bool, str]:
             if t.expect:
                 body = r.read(MAX_BODY).decode("utf-8", "replace")
                 if t.expect not in body:
-                    return False, f"HTTP {code}, но на странице нет «{t.expect}»"
+                    return False, _('HTTP {code}, но на странице нет «{expect}»', code=code, expect=t.expect)
             return True, f"HTTP {code}"
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
@@ -108,21 +109,21 @@ def check_http(t: Target, timeout: float) -> tuple[bool, str]:
 def check_tcp(t: Target, timeout: float) -> tuple[bool, str]:
     try:
         with socket.create_connection((t.host, t.port), timeout=timeout):
-            return True, "порт открыт"
+            return True, _('порт открыт')
     except Exception as e:  # noqa: BLE001
         return False, short_error(e)
 
 
 def check_ping(t: Target, timeout: float) -> tuple[bool, str]:
     if not shutil.which("ping"):
-        return False, "нет команды ping"
+        return False, _('нет команды ping')
     w = str(max(1, int(timeout)))
     try:
         r = subprocess.run(["ping", "-c", "1", "-W", w, t.host], capture_output=True, text=True,
                            timeout=timeout + 5)
     except Exception as e:  # noqa: BLE001
         return False, short_error(e)
-    return (True, "отвечает") if r.returncode == 0 else (False, "не отвечает на ping")
+    return (True, _('отвечает')) if r.returncode == 0 else (False, _('не отвечает на ping'))
 
 
 def check_dns(t: Target, timeout: float) -> tuple[bool, str]:
@@ -139,13 +140,13 @@ CHECKS = {"http": check_http, "https": check_http, "tcp": check_tcp, "ping": che
 
 def short_error(e) -> str:
     if isinstance(e, socket.timeout) or "timed out" in str(e):
-        return "нет ответа (таймаут)"
+        return _('нет ответа (таймаут)')
     if isinstance(e, socket.gaierror):
-        return "имя не найдено в DNS"
+        return _('имя не найдено в DNS')
     if isinstance(e, ConnectionRefusedError):
-        return "соединение отклонено"
+        return _('соединение отклонено')
     if isinstance(e, ssl.SSLCertVerificationError):
-        return f"ошибка SSL-сертификата: {getattr(e, 'verify_message', '') or e}"[:150]
+        return _('ошибка SSL-сертификата: {v}', v=getattr(e, 'verify_message', '') or e)[:150]
     return str(e)[:150] or e.__class__.__name__
 
 
@@ -158,13 +159,13 @@ def run_one(t: Target, timeout: float) -> tuple[bool, str, int]:
 def run_all(raws: list[str], timeout: float = 10, check_fn=None) -> dict[str, tuple[bool, str, int]]:
     """{строка цели: (ok, подробности, мс)} — все цели параллельно."""
     targets = [(r, parse(r)) for r in raws]
-    out: dict[str, tuple[bool, str, int]] = {r: (False, "непонятная цель", 0) for r, t in targets if t is None}
+    out: dict[str, tuple[bool, str, int]] = {r: (False, _('непонятная цель'), 0) for r, t in targets if t is None}
     good = [(r, t) for r, t in targets if t is not None]
     if not good:
         return out
     fn = check_fn or run_one
     with ThreadPoolExecutor(max_workers=min(8, len(good))) as ex:
-        for r, res in zip([r for r, _ in good], ex.map(lambda rt: fn(rt[1], timeout), good)):
+        for r, res in zip([r for r, __ in good], ex.map(lambda rt: fn(rt[1], timeout), good)):
             out[r] = res
     return out
 
@@ -212,14 +213,14 @@ def evaluate(cfg: dict, state, now: float, run_fn=run_all) -> dict[str, str | No
     need = max(1, int(cfg.get("probe_fail_count") or 2))
     results = run_fn(raws, float(cfg.get("probe_timeout") or 10))
     for raw in raws:
-        ok, detail, ms = results.get(raw, (False, "нет результата", 0))
+        ok, detail, ms = results.get(raw, (False, _('нет результата'), 0))
         fails = 0 if ok else state.probe_fails.get(raw, 0) + 1
         state.probe_fails[raw] = fails
         state.probe_last[raw] = [ok, detail, ms, now]
         if ok or fails < need:
             res[f"web:{raw}"] = None
         else:
-            res[f"web:{raw}"] = f"🌐 Не отвечает {raw}: {detail}"
+            res[f"web:{raw}"] = _('🌐 Не отвечает {raw}: {detail}', raw=raw, detail=detail)
     for raw in list(state.probe_fails):
         if raw not in raws:
             state.probe_fails.pop(raw, None)
@@ -267,9 +268,9 @@ def ssl_events(cfg: dict, state, now: float, muted: bool, quiet: bool, days_fn=s
         state.ssl_alerted[k] = step_now
         state.log.append([now, f"ssl:{k}"])
         if days <= 0:
-            text = f"🔒 SSL-сертификат {k} истёк! Браузеры уже показывают ошибку."
+            text = _('🔒 SSL-сертификат {k} истёк! Браузеры уже показывают ошибку.', k=k)
         else:
-            text = f"🔒 SSL-сертификат {k} истекает через {days:.0f} дн. Пора продлить."
+            text = _('🔒 SSL-сертификат {k} истекает через {days:.0f} дн. Пора продлить.', k=k, days=days)
         out.append(Alert(text, None, "event"))
     return out
 
@@ -278,20 +279,20 @@ def probes_text(cfg: dict, state) -> str:
     raws = list(cfg.get("probes") or [])
     if not raws:
         return ""
-    lines = ["🌐 <b>Проверки снаружи</b>"]
+    lines = [_('🌐 <b>Проверки снаружи</b>')]
     import html
     for raw in raws:
         last = state.probe_last.get(raw)
         if not last:
-            lines.append(f"⏳ {html.escape(raw)} — ждёт проверки")
+            lines.append(_('⏳ {escape} — ждёт проверки', escape=html.escape(raw)))
             continue
         ok, detail, ms = last[0], last[1], last[2]
         icon = "✅" if ok else "❌"
-        extra = f", {ms} мс" if ok and ms else ""
+        extra = _(', {ms} мс', ms=ms) if ok and ms else ""
         t = parse(raw)
         if t and t.scheme == "https":
             d = state.ssl_days.get(host_key(t.host, t.port))
             if d is not None:
-                extra += f", SSL ещё {d:.0f} дн."
+                extra += _(', SSL ещё {d:.0f} дн.', d=d)
         lines.append(f"{icon} {html.escape(raw)} — {html.escape(detail)}{extra}")
     return "\n".join(lines)

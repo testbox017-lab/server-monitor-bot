@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 import smart
+from i18n import _
 
 IS_WINDOWS = platform.system() == "Windows"
 _save_lock = threading.RLock()
@@ -26,24 +27,24 @@ LAST_SAMPLE: dict | None = None  # последний снимок из evaluate
 # ---------- Метрики ----------
 
 def fmt_bytes(n: float) -> str:
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+    for unit in (_('Б'), _('КБ'), _('МБ'), _('ГБ'), _('ТБ')):
         if abs(n) < 1024:
             return f"{n:.1f} {unit}"
         n /= 1024
-    return f"{n:.1f} ПБ"
+    return _('{n:.1f} ПБ', n=n)
 
 
 def fmt_duration(sec: float) -> str:
     sec = int(sec)
     d, sec = divmod(sec, 86400)
     h, sec = divmod(sec, 3600)
-    m, _ = divmod(sec, 60)
+    m, __ = divmod(sec, 60)
     parts = []
     if d:
-        parts.append(f"{d} д")
+        parts.append(_('{d} д', d=d))
     if h or d:
-        parts.append(f"{h} ч")
-    parts.append(f"{m} мин")
+        parts.append(_('{h} ч', h=h))
+    parts.append(_('{m} мин', m=m))
     return " ".join(parts)
 
 
@@ -103,23 +104,26 @@ def status_text(cfg: dict) -> str:
     s = collect(cfg)
     lines = [
         f"🖥 <b>{s['host']}</b> ({s['os']})",
-        f"⏱ Аптайм: {fmt_duration(s['uptime'])}",
-        f"🧠 CPU: {s['cpu']:.0f}% ({s['cpu_count']} ядер)",
+        _('⏱ Аптайм: {fmt_duration}', fmt_duration=fmt_duration(s['uptime'])),
+        _('🧠 CPU: {cpu:.0f}% ({cpu_count} ядер)', cpu=s['cpu'], cpu_count=s['cpu_count']),
     ]
     if s["load"]:
         lines.append("📈 Load avg: " + " / ".join(f"{x:.2f}" for x in s["load"]))
     r = s["ram"]
-    lines.append(f"💾 RAM: {r.percent:.0f}% ({fmt_bytes(r.used)} из {fmt_bytes(r.total)})")
+    lines.append(_('💾 RAM: {percent:.0f}% ({fmt_bytes} из {fmt_bytes2})',
+                   percent=r.percent, fmt_bytes=fmt_bytes(r.used), fmt_bytes2=fmt_bytes(r.total)))
     if s["swap"].total:
         lines.append(f"🔁 Swap: {s['swap'].percent:.0f}%")
     for path, d in s["disks"].items():
-        lines.append(f"🗄 Диск {path}: {d.percent:.0f}% (свободно {fmt_bytes(d.free)})")
+        lines.append(_('🗄 Диск {path}: {percent:.0f}% (свободно {fmt_bytes})',
+                       path=path, percent=d.percent, fmt_bytes=fmt_bytes(d.free)))
     for name, t in list(s["temps"].items())[:4]:
         lines.append(f"🌡 {name}: {t:.0f}°C")
-    lines.append(f"🌐 Сеть: ↓ {fmt_bytes(s['net'].bytes_recv)} ↑ {fmt_bytes(s['net'].bytes_sent)}")
+    lines.append(_('🌐 Сеть: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                   fmt_bytes=fmt_bytes(s['net'].bytes_recv), fmt_bytes2=fmt_bytes(s['net'].bytes_sent)))
     stats = container_stats()
     if stats:
-        lines.append("🐳 Контейнеры:")
+        lines.append(_('🐳 Контейнеры:'))
         for name, cpu, mem in stats:
             lines.append(f"  • {html.escape(name)}: CPU {html.escape(cpu)}, RAM {html.escape(mem)}")
     return "\n".join(lines)
@@ -142,7 +146,7 @@ def top_processes(n: int = 10, by: str = "cpu") -> str:
     key = 0 if by == "cpu" else 1
     rows.sort(key=lambda r: r[key], reverse=True)
     title = "CPU" if by == "cpu" else "RAM"
-    out = [f"🔝 <b>Топ-{n} процессов по {title}</b>", "<pre>  CPU%  RAM%    PID  Имя"]
+    out = [_('🔝 <b>Топ-{n} процессов по {title}</b>', n=n, title=title), _('<pre>  CPU%  RAM%    PID  Имя')]
     for cpu, mem, pid, name in rows[:n]:
         out.append(f"{cpu:6.1f} {mem:5.1f} {pid:6d}  {html.escape((name or '?')[:28])}")
     out.append("</pre>")
@@ -240,7 +244,7 @@ def docker_poll() -> bool:
 
 def container_state(name: str, states: dict[str, str] | None) -> str:
     if states is None:
-        return "docker недоступен"
+        return _('docker недоступен')
     return states.get(name, "not found")
 
 
@@ -353,11 +357,13 @@ def container_logs(name: str, tail: int = 30, since: int | None = None) -> str |
 def logs_text(name: str, tail: int = 30) -> str:
     logs = container_logs(name, tail)
     if logs is None:
-        return f"📜 Не удалось получить логи {html.escape(name)} (нет контейнера или доступа к docker)"
-    logs = logs.strip() or "(пусто)"
+        return _('📜 Не удалось получить логи {escape} (нет контейнера или доступа к docker)', escape=html.escape(name))
+    logs = logs.strip() or _('(пусто)')
     if len(logs) > 3500:
         logs = "…" + logs[-3500:]
-    return f"📜 <b>{html.escape(name)}</b>, последние {tail} строк\n<pre>{html.escape(logs)}</pre>"
+    return _('📜 <b>{escape}</b>, последние {tail} строк\n'
+             '<pre>{escape2}</pre>',
+             escape=html.escape(name), tail=tail, escape2=html.escape(logs))
 
 
 def watched_containers(cfg: dict, state: "AlertState | None" = None) -> list[str]:
@@ -371,15 +377,17 @@ def watched_containers(cfg: dict, state: "AlertState | None" = None) -> list[str
 
 
 def services_text(cfg: dict, state: "AlertState | None" = None) -> str:
-    lines = ["⚙️ <b>Службы и процессы</b>"]
+    lines = [_('⚙️ <b>Службы и процессы</b>')]
     for svc in cfg.get("services", []) or []:
         st = service_state(svc)
         icon = "✅" if st == "running" else "❌"
-        lines.append(f"{icon} служба {html.escape(svc)}: {html.escape(st)}")
+        lines.append(_('{icon} служба {escape}: {escape2}',
+                       icon=icon, escape=html.escape(svc), escape2=html.escape(st)))
     for proc in cfg.get("processes", []) or []:
         n = process_running(proc)
         icon = "✅" if n else "❌"
-        lines.append(f"{icon} процесс {html.escape(proc)}: {'запущен (' + str(n) + ')' if n else 'не найден'}")
+        lines.append(_('{icon} процесс {escape}: {v}',
+                       icon=icon, escape=html.escape(proc), v=_('запущен ({n})', n=n) if n else _('не найден')))
     containers = watched_containers(cfg, state)
     if containers:
         states = container_states()
@@ -391,12 +399,13 @@ def services_text(cfg: dict, state: "AlertState | None" = None) -> str:
             if i.get("health"):
                 extra.append(i["health"])
             if i.get("restarts"):
-                extra.append(f"перезапусков: {i['restarts']}")
+                extra.append(_('перезапусков: {restarts}', restarts=i['restarts']))
             ok = st == "running" and i.get("health") != "unhealthy"
             tail = f" ({', '.join(extra)})" if extra else ""
-            lines.append(f"{'✅' if ok else '❌'} контейнер {html.escape(c)}: {html.escape(st)}{html.escape(tail)}")
+            lines.append(_('{v} контейнер {escape}: {escape2}{escape3}',
+                           v='✅' if ok else '❌', escape=html.escape(c), escape2=html.escape(st), escape3=html.escape(tail)))
     if len(lines) == 1:
-        lines.append("Список пуст. Добавьте services / processes в config.yaml.")
+        lines.append(_('Список пуст. Добавьте services / processes в config.yaml.'))
     if state is not None and cfg.get("probes"):
         import probes
         lines += ["", probes.probes_text(cfg, state)]
@@ -549,7 +558,8 @@ class AlertState:
                 os.replace(path, bad)
             except OSError:
                 bad = path
-            st.load_error = f"{path.name} был повреждён ({type(e).__name__}), сохранён как {bad.name}"
+            st.load_error = _('{name} был повреждён ({name2}), сохранён как {name3}',
+                              name=path.name, name2=type(e).__name__, name3=bad.name)
         st.path = path
         now = time.time()
         for ip in st.known_ips:  # состояние из прошлой версии: времени входа ещё нет
@@ -583,9 +593,9 @@ class AlertState:
 
 def key_label(key: str) -> str:
     if key.startswith("anom:"):
-        return "необычная нагрузка " + smart.NAMES.get(key[5:], key[5:])
+        return _('необычная нагрузка ') + smart.NAMES.get(key[5:], key[5:])
     if key == "bak:pc":
-        return "копии на ПК"
+        return _('копии на ПК')
     return key.split(":", 1)[-1]
 
 
@@ -600,27 +610,28 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
     def check(key, value, limit, label):
         if limit is None:
             return
-        res[key] = f"{label}: {value:.0f}% (порог {limit}%)" if value >= limit else None
+        res[key] = _('{label}: {value:.0f}% (порог {limit}%)',
+                     label=label, value=value, limit=limit) if value >= limit else None
 
-    check("cpu", s["cpu"], th.get("cpu"), "🔥 Высокая загрузка CPU")
-    check("ram", s["ram"].percent, th.get("ram"), "💾 Мало свободной памяти, RAM")
+    check("cpu", s["cpu"], th.get("cpu"), _('🔥 Высокая загрузка CPU'))
+    check("ram", s["ram"].percent, th.get("ram"), _('💾 Мало свободной памяти, RAM'))
     if s["swap"].total:
-        check("swap", s["swap"].percent, th.get("swap"), "🔁 Активный swap")
+        check("swap", s["swap"].percent, th.get("swap"), _('🔁 Активный swap'))
     for path, d in s["disks"].items():
-        check(f"disk:{path}", d.percent, th.get("disk"), f"🗄 Заканчивается место на {path}")
+        check(f"disk:{path}", d.percent, th.get("disk"), _('🗄 Заканчивается место на {path}', path=path))
     if th.get("inode") is not None:
         import network
         for path, pct in network.inode_usage(list(s["disks"])).items():
-            check(f"inode:{path}", pct, th["inode"], f"🗂 Заканчиваются inode (файлы) на {path}")
+            check(f"inode:{path}", pct, th["inode"], _('🗂 Заканчиваются inode (файлы) на {path}', path=path))
     if th.get("temp") is not None:
         for name, t in s["temps"].items():
-            res[f"temp:{name}"] = (f"🌡 Перегрев {name}: {t:.0f}°C (порог {th['temp']}°C)"
+            res[f"temp:{name}"] = (_('🌡 Перегрев {name}: {t:.0f}°C (порог {temp}°C)', name=name, t=t, temp=th['temp'])
                                    if t >= th["temp"] else None)
     for svc in cfg.get("services", []) or []:
         st = service_state(svc)
-        res[f"svc:{svc}"] = None if st == "running" else f"❌ Служба {svc} не работает ({st})"
+        res[f"svc:{svc}"] = None if st == "running" else _('❌ Служба {svc} не работает ({st})', svc=svc, st=st)
     for proc in cfg.get("processes", []) or []:
-        res[f"proc:{proc}"] = None if process_running(proc) else f"❌ Процесс {proc} не найден"
+        res[f"proc:{proc}"] = None if process_running(proc) else _('❌ Процесс {proc} не найден', proc=proc)
     containers = watched_containers(cfg, state)
     if containers:
         states = container_states()
@@ -629,28 +640,28 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             st = container_state(c, states)
             health = info.get(c, {}).get("health")
             if st != "running":
-                res[f"ctr:{c}"] = f"❌ Контейнер {c} не работает ({st})"
+                res[f"ctr:{c}"] = _('❌ Контейнер {c} не работает ({st})', c=c, st=st)
             elif health == "unhealthy":
                 why = info.get(c, {}).get("reason")
-                res[f"ctr:{c}"] = (f"❌ Контейнер {c} работает, но завис или не в порядке (healthcheck)"
+                res[f"ctr:{c}"] = (_('❌ Контейнер {c} работает, но завис или не в порядке (healthcheck)', c=c)
                                    + (f": {why}" if why else ""))
             else:
                 res[f"ctr:{c}"] = None
-    res["reboot_required"] = "♻️ Серверу нужна перезагрузка после обновлений" if reboot_required() else None
+    res["reboot_required"] = _('♻️ Серверу нужна перезагрузка после обновлений') if reboot_required() else None
     if state is not None:
         import backups
         try:
             res.update(backups.evaluate(cfg, state, time.time(), state.path.parent if state.path else None))
         except Exception:
             import logging
-            logging.getLogger("monitor_bot").exception("Ошибка проверки бэкапов")
+            logging.getLogger("monitor_bot").exception('Ошибка проверки бэкапов')
     if state is not None and cfg.get("probes"):
         import probes
         try:
             res.update(probes.evaluate(cfg, state, time.time()))
         except Exception:  # внешние проверки не должны ломать основную
             import logging
-            logging.getLogger("monitor_bot").exception("Ошибка внешних проверок")
+            logging.getLogger("monitor_bot").exception('Ошибка внешних проверок')
     return res
 
 
@@ -690,7 +701,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             results.update(smart.anomaly_results(cfg, LAST_SAMPLE, hist, now, tz(cfg)))
         except Exception:
             import logging
-            logging.getLogger("monitor_bot").exception("Ошибка расчёта нормы")
+            logging.getLogger("monitor_bot").exception('Ошибка расчёта нормы')
     smart.clean(state, now)
     recovered: set[str] = set()
 
@@ -715,7 +726,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 state.last_sent[key] = now
                 state.problems[key] = problem
                 mins = int((now - state.since[key]) // 60)
-                out.append(Alert(f"⏰ Всё ещё не решено ({mins} мин): {problem}", key, "remind"))
+                out.append(Alert(_('⏰ Всё ещё не решено ({mins} мин): {problem}',
+                                   mins=mins, problem=problem), key, "remind"))
         else:
             state.since.pop(key, None)
             _journal(inc, "close", key, now)
@@ -727,7 +739,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 if key in state.acked:
                     state.acked.remove(key)
                 if not muted:
-                    out.append(Alert(f"✅ Восстановлено: {key_label(key)}", key, "recovered"))
+                    out.append(Alert(_('✅ Восстановлено: {key_label}', key_label=key_label(key)), key, "recovered"))
 
     # Ключи, которых больше нет в проверке (убрали из настроек) — забываем молча
     if inc is not None:
@@ -747,8 +759,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     n = oom_kills()
     if n is not None:
         if state.oom_kills is not None and n > state.oom_kills and not muted:
-            out.append(Alert(f"💥 OOM killer убил процесс(ы): {n - state.oom_kills}. "
-                             "Не хватило памяти (swap на сервере нет).", None, "event"))
+            out.append(Alert(_('💥 OOM killer убил процесс(ы): {v}. Не хватило памяти (swap на сервере нет).',
+                               v=n - state.oom_kills), None, "event"))
             state.log.append([now, "oom"])
         state.oom_kills = n
 
@@ -759,16 +771,16 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             out += security.events(cfg, state, now, muted, quiet)
         except Exception:  # безопасность не должна ломать основную проверку
             import logging
-            logging.getLogger("monitor_bot").exception("Ошибка проверки безопасности")
+            logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности')
         out += docker_events(cfg, state, now, recovered, muted, quiet)
         import probes
         try:
             out += probes.ssl_events(cfg, state, now, muted, quiet)
         except Exception:
             import logging
-            logging.getLogger("monitor_bot").exception("Ошибка проверки SSL")
+            logging.getLogger("monitor_bot").exception('Ошибка проверки SSL')
         if forgotten and cfg.get("containers_auto") and not muted:
-            out.append(Alert("🗑 Контейнеры удалены больше суток назад, больше не слежу: " + ", ".join(forgotten),
+            out.append(Alert(_('🗑 Контейнеры удалены больше суток назад, больше не слежу: ') + ", ".join(forgotten),
                              None, "event"))
         if state.bak_events and not muted:
             out += [Alert(t, None, "event") for t in state.bak_events]
@@ -778,7 +790,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 out += smart.ram_trend_events(cfg, state, hist, now, muted, quiet)
             except Exception:
                 import logging
-                logging.getLogger("monitor_bot").exception("Ошибка прогноза памяти")
+                logging.getLogger("monitor_bot").exception('Ошибка прогноза памяти')
 
     for a in out:
         if a.kind == "event":
@@ -796,7 +808,7 @@ def _journal(inc, op: str, *args) -> None:
         getattr(inc, op)(*args)
     except Exception:
         import logging
-        logging.getLogger("monitor_bot").exception("Журнал инцидентов: %s", op)
+        logging.getLogger("monitor_bot").exception('Журнал инцидентов: %s', op)
 
 
 SEEN_FORGET_SEC = 24 * 3600  # авто-контейнер, которого нет столько времени, больше не отслеживаем
@@ -857,7 +869,8 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
                 continue
             if state.deploy_at and now - state.deploy_at < DEPLOY_WINDOW:
                 # вход ключом деплоя и сразу перезапуск — это выкладка новой версии, а не сбой
-                out.append(Alert(f"🚀 Деплой: {name} перезапущен с новой версией", f"deploy:{name}", "event",
+                out.append(Alert(_('🚀 Деплой: {name} перезапущен с новой версией',
+                                   name=name), f"deploy:{name}", "event",
                                  "journal"))
                 state.log.append([now, f"deploy:{name}"])
                 continue
@@ -865,8 +878,9 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
         if restarted and f"ctr:{name}" not in recovered and not muted:
             extra = ""
             if prev_restarts is not None and i["restarts"] > prev_restarts:
-                extra = f" (автоперезапуск Docker, всего {i['restarts']})"
-            out.append(Alert(f"🔁 Контейнер {name} перезапустился{extra}", f"log:{name}", "event"))
+                extra = _(' (автоперезапуск Docker, всего {restarts})', restarts=i['restarts'])
+            out.append(Alert(_('🔁 Контейнер {name} перезапустился{extra}',
+                               name=name, extra=extra), f"log:{name}", "event"))
             state.log.append([now, f"restart:{name}"])
 
     if not cfg.get("log_alerts", True):
@@ -896,14 +910,18 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
             net_at = state.net_fail_at if now - (state.net_fail_at or 0) < NET_WINDOW else 0
             if net or net_at:
                 # сбой связи: один инцидент «🌐», без звука — контейнер сам повторит, когда связь вернётся
-                when = f" (у бота связь пропадала в {fmt_local(cfg, net_at)})" if net_at else ""
+                when = _(' (у бота связь пропадала в {fmt_local})', fmt_local=fmt_local(cfg, net_at)) if net_at else ""
                 state.log.append([now, f"net:{name}"])
-                out.append(Alert(f"🌐 Сетевые ошибки в логах {name}: {len(hits)} строк{when}. "
-                                 f"Похоже на сбой связи, а не на ошибку в коде.\n{sample}", f"log:{name}", "event",
+                out.append(Alert(_('🌐 Сетевые ошибки в логах {name}: {len} строк{when}. Похоже на сбой связи, а не '
+                                   'на ошибку в коде.\n'
+                                   '{sample}',
+                                   name=name, len=len(hits), when=when, sample=sample), f"log:{name}", "event",
                                  "quiet"))
                 continue
             state.log.append([now, f"logerr:{name}"])
-            out.append(Alert(f"⚠️ Ошибки в логах {name}: {len(hits)} строк\n{sample}", f"log:{name}", "event"))
+            out.append(Alert(_('⚠️ Ошибки в логах {name}: {len} строк\n'
+                               '{sample}',
+                               name=name, len=len(hits), sample=sample), f"log:{name}", "event"))
     return out
 
 
@@ -924,7 +942,7 @@ def network_errors(logs: str) -> bool:
 def docker_time(s: str) -> float | None:
     """2026-11-15T17:19:51.273824495Z → unix time. Docker пишет наносекунды, datetime их не понимает."""
     try:
-        head, _, frac = s.rstrip("Z").partition(".")
+        head, __, frac = s.rstrip("Z").partition(".")
         ts = datetime.strptime(head, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=ZoneInfo("UTC")).timestamp()
         return ts + (float("0." + frac[:6]) if frac[:6].isdigit() else 0.0)
     except (ValueError, AttributeError):
@@ -936,7 +954,7 @@ def check_reboot(state: AlertState) -> str | None:
     boot = psutil.boot_time()
     msg = None
     if state.boot_time and abs(boot - state.boot_time) > 60:
-        msg = f"🔄 Сервер перезагружался, аптайм {fmt_duration(time.time() - boot)}"
+        msg = _('🔄 Сервер перезагружался, аптайм {fmt_duration}', fmt_duration=fmt_duration(time.time() - boot))
         state.oom_kills = None  # счётчик обнулился вместе с ядром
     state.boot_time = boot
     state.save()
@@ -946,27 +964,29 @@ def check_reboot(state: AlertState) -> str | None:
 def summary_text(cfg: dict, state: AlertState, now: float | None = None, hist=None) -> str:
     now = now or time.time()
     day = [x for x in state.log if now - x[0] < 24 * 3600]
-    lines = ["📋 <b>Сводка за сутки</b>", status_text(cfg), ""]
+    lines = [_('📋 <b>Сводка за сутки</b>'), status_text(cfg), ""]
     p = hist.peaks(86400, now) if hist else None
     if p:
-        lines.append(f"Пик CPU: {p['cpu'][0]:.0f}% в {fmt_local(cfg, p['cpu'][1])}, в среднем {p['cpu_avg']:.0f}%")
-        lines.append(f"Пик RAM: {p['ram'][0]:.0f}% в {fmt_local(cfg, p['ram'][1])}")
+        lines.append(_('Пик CPU: {cpu:.0f}% в {fmt_local}, в среднем {cpu_avg:.0f}%',
+                       cpu=p['cpu'][0], fmt_local=fmt_local(cfg, p['cpu'][1]), cpu_avg=p['cpu_avg']))
+        lines.append(_('Пик RAM: {ram:.0f}% в {fmt_local}', ram=p['ram'][0], fmt_local=fmt_local(cfg, p['ram'][1])))
         if p["disk_from"] is not None:
-            lines.append(f"Диск: {p['disk_from']:.1f}% → {p['disk_to']:.1f}%")
-        lines.append(f"Трафик за сутки: ↓ {fmt_bytes(p['rx'])} ↑ {fmt_bytes(p['tx'])}")
+            lines.append(_('Диск: {disk_from:.1f}% → {disk_to:.1f}%', disk_from=p['disk_from'], disk_to=p['disk_to']))
+        lines.append(_('Трафик за сутки: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                       fmt_bytes=fmt_bytes(p['rx']), fmt_bytes2=fmt_bytes(p['tx'])))
         days = hist.disk_forecast(now)
         if days is not None and days < 365:
-            lines.append(f"⚠️ При текущем темпе диск заполнится примерно через {days:.0f} дн.")
-    restarts = [k for _, k in day if k.startswith("restart:")]
+            lines.append(_('⚠️ При текущем темпе диск заполнится примерно через {days:.0f} дн.', days=days))
+    restarts = [k for __, k in day if k.startswith("restart:")]
     if restarts:
-        lines.append(f"Перезапусков контейнеров: {len(restarts)}")
-    lines.append(f"Алертов за 24 ч: {len(day)}")
+        lines.append(_('Перезапусков контейнеров: {len}', len=len(restarts)))
+    lines.append(_('Алертов за 24 ч: {len}', len=len(day)))
     if day:
         counts: dict[str, int] = {}
-        for _, k in day:
+        for __, k in day:
             counts[k] = counts.get(k, 0) + 1
         for k, c in sorted(counts.items(), key=lambda x: -x[1])[:8]:
             lines.append(f"  • {html.escape(key_label(k))}: {c}")
     if state.active:
-        lines.append("Сейчас активны: " + ", ".join(html.escape(key_label(k)) for k in state.active))
+        lines.append(_('Сейчас активны: ') + ", ".join(html.escape(key_label(k)) for k in state.active))
     return "\n".join(lines)

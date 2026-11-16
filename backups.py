@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from i18n import _
 
 HELPER = "/usr/local/sbin/monitor-bot-action"
 OFFSITE_STATUS = Path("/var/lib/monitor-bot-offsite/status.json")  # пишет помощник, когда ПК забрал копии
@@ -81,7 +82,7 @@ def own_files(data_dir: Path) -> list[tuple[str, int, float]]:
 
 def own_status(cfg: dict, data_dir: Path) -> dict:
     files = own_files(data_dir)
-    return {"path": "бот", "own": True, "max_age_h": 26 if cfg.get("backup_time") else None, "exists": True,
+    return {"path": _('бот'), "own": True, "max_age_h": 26 if cfg.get("backup_time") else None, "exists": True,
             "count": len(files), "total": sum(f[1] for f in files),
             "newest": list(files[0]) if files else None, "previous": list(files[1]) if len(files) > 1 else None}
 
@@ -117,10 +118,10 @@ def fetch(index: int, helper_fn=helper) -> tuple[Path | None, str]:
     ok, out = helper_fn("backup-fetch", str(index), timeout=300)
     if not ok:
         if "too big" in out:
-            return None, "файл больше 45 МБ, Telegram его не примет"
+            return None, _('файл больше 45 МБ, Telegram его не примет')
         if "no backups" in out:
-            return None, "в папке нет копий"
-        return None, out or "помощник не ответил"
+            return None, _('в папке нет копий')
+        return None, out or _('помощник не ответил')
     try:
         return Path(json.loads(out)["file"]), ""
     except (ValueError, KeyError):
@@ -142,12 +143,12 @@ def offsite_text(cfg: dict, now: float, status_fn=offsite_status) -> str:
     from checks import fmt_duration
     st = status_fn()
     if st is None:
-        return "💻 На ПК: копии ещё ни разу не забирались (см. README, «Копии на ПК»)"
+        return _('💻 На ПК: копии ещё ни разу не забирались (см. README, «Копии на ПК»)')
     age = now - st["ts"]
     limit = cfg.get("offsite_max_age_h")
     bad = limit and age > limit * 3600
-    return (f"{'❌' if bad else '✅'} На ПК: забраны {fmt_duration(age)} назад, "
-            f"{len(st.get('files') or [])} файл(а), {fmt(st.get('bytes') or 0)}")
+    return (_('{v} На ПК: забраны {fmt_duration} назад, {len} файл(а), {fmt}',
+              v='❌' if bad else '✅', fmt_duration=fmt_duration(age), len=len(st.get('files') or []), fmt=fmt(st.get('bytes') or 0)))
 
 
 # ---------- проверка, что копии восстанавливаются ----------
@@ -156,19 +157,19 @@ def verify_own(data_dir: Path) -> dict:
     """Распаковать последнюю копию бота во временную папку и проверить config.yaml и metrics.db."""
     files = own_files(data_dir)
     if not files:
-        return {"label": "monitor-bot", "path": "бот", "ok": False, "error": "копий нет"}
-    name, size, _ = files[0]
-    res = {"label": "monitor-bot", "path": "бот", "name": name, "size": size}
+        return {"label": "monitor-bot", "path": _('бот'), "ok": False, "error": _('копий нет')}
+    name, size, __ = files[0]
+    res = {"label": "monitor-bot", "path": _('бот'), "name": name, "size": size}
     try:
         with tempfile.TemporaryDirectory(dir=own_dir(data_dir)) as tmp, \
                 tarfile.open(own_dir(data_dir) / name, "r:gz") as tar:
             names = tar.getnames()
             if "config.yaml" not in names:
-                return {**res, "ok": False, "error": "в копии нет config.yaml"}
+                return {**res, "ok": False, "error": _('в копии нет config.yaml')}
             import yaml
             cfg = yaml.safe_load(tar.extractfile("config.yaml").read())
             if not isinstance(cfg, dict) or not cfg.get("token"):
-                return {**res, "ok": False, "error": "config.yaml в копии без токена"}
+                return {**res, "ok": False, "error": _('config.yaml в копии без токена')}
             notes = []
             if "data/metrics.db" in names:
                 db = Path(tmp) / "metrics.db"
@@ -182,8 +183,8 @@ def verify_own(data_dir: Path) -> dict:
                 finally:
                     c.close()
                 if check != "ok":
-                    return {**res, "ok": False, "error": f"metrics.db повреждена: {check}"}
-                notes.append(f"история: {rows} записей")
+                    return {**res, "ok": False, "error": _('metrics.db повреждена: {check}', check=check)}
+                notes.append(_('история: {rows} записей', rows=rows))
             return {**res, "ok": True, "members": len(names), "error": None, "note": ", ".join(notes)}
     except (OSError, EOFError, tarfile.TarError, sqlite3.Error, ValueError) as e:
         return {**res, "ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
@@ -199,7 +200,7 @@ def verify_all(data_dir: Path, helper_fn=helper) -> tuple[list[dict], str | None
     except ValueError:
         others = None
     if others is None:
-        err = out or "помощник не ответил"
+        err = out or _('помощник не ответил')
     else:
         res += [r for r in others if r.get("label") != "monitor-bot"]
     return res, err
@@ -207,17 +208,17 @@ def verify_all(data_dir: Path, helper_fn=helper) -> tuple[list[dict], str | None
 
 def verify_text(results: list[dict], err: str | None, when: str | None = None) -> str:
     import html
-    lines = ["🧪 <b>Проверка резервных копий</b>" + (f" ({when})" if when else "")]
+    lines = [_('🧪 <b>Проверка резервных копий</b>') + (f" ({when})" if when else "")]
     for r in results:
         title = html.escape(str(r.get("path")))
         if r.get("ok"):
             extra = f", {html.escape(r['note'])}" if r.get("note") else ""
-            lines.append(f"✅ {title}: {html.escape(str(r.get('name')))} читается целиком "
-                         f"({r.get('members', 0)} файл(ов), {fmt(r.get('size') or 0)}{extra})")
+            lines.append(_('✅ {title}: {escape} читается целиком ({members} файл(ов), {fmt}{extra})',
+                           title=title, escape=html.escape(str(r.get('name'))), members=r.get('members', 0), fmt=fmt(r.get('size') or 0), extra=extra))
         else:
             lines.append(f"❌ {title}: {html.escape(str(r.get('error')))}")
     if err:
-        lines.append(f"⚠️ Чужие копии не проверены: {html.escape(err[:200])}")
+        lines.append(_('⚠️ Чужие копии не проверены: {escape}', escape=html.escape(err[:200])))
     return "\n".join(lines)
 
 
@@ -241,8 +242,9 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None, watched_fn=wat
     off = offsite_fn() if limit else None
     if off is not None:  # пока ПК ни разу не забирал копии, не шумим
         age = (now - off["ts"]) / 3600
-        res["bak:pc"] = (f"💻 ПК не забирал резервные копии уже {age:.0f} ч (норма до {limit:.0f} ч). "
-                         "Включён ли компьютер и работает ли задача «monitor-bot-pull»?") if age > limit else None
+        res["bak:pc"] = (_('💻 ПК не забирал резервные копии уже {age:.0f} ч (норма до {limit:.0f} ч). Включён ли '
+                           'компьютер и работает ли задача «monitor-bot-pull»?',
+                           age=age, limit=limit)) if age > limit else None
     statuses = []
     if data_dir is not None and cfg.get("backup_time"):
         statuses.append(own_status(cfg, data_dir))
@@ -256,21 +258,23 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None, watched_fn=wat
         seen = getattr(state, "bak_first_seen", None)
         first = seen.setdefault(st["path"], now) if isinstance(seen, dict) else None
         if not st.get("exists"):
-            res[key] = f"💾 Папки с бэкапами {st['path']} нет"
+            res[key] = _('💾 Папки с бэкапами {path} нет', path=st['path'])
         elif age is None:
             # папку только что добавили под наблюдение: первая копия появится по своему расписанию
             fresh = first is not None and now - first < max(24.0, float(limit)) * 3600
-            res[key] = None if fresh else f"💾 В {st['path']} нет ни одной резервной копии"
+            res[key] = None if fresh else _('💾 В {path} нет ни одной резервной копии', path=st['path'])
         elif age > limit:
-            res[key] = f"💾 Последней резервной копии в {st['path']} уже {age:.0f} ч (норма до {limit:.0f} ч)"
+            res[key] = _('💾 Последней резервной копии в {path} уже {age:.0f} ч (норма до {limit:.0f} ч)',
+                         path=st['path'], age=age, limit=limit)
         else:
             res[key] = None
         new, prev = st.get("newest"), st.get("previous")
         if new and prev and prev[1] > 1024 and new[1] < prev[1] * SIZE_DROP:
             if state.bak_small.get(st["path"]) != new[0]:
                 state.bak_small[st["path"]] = new[0]
-                state.bak_events.append(f"⚠️ Новая копия в {st['path']} намного меньше прошлой: "
-                                        f"{fmt(new[1])} против {fmt(prev[1])}. Проверьте, всё ли в неё попало.")
+                state.bak_events.append(_('⚠️ Новая копия в {path} намного меньше прошлой: {fmt} против {fmt2}. '
+                                          'Проверьте, всё ли в неё попало.',
+                                          path=st['path'], fmt=fmt(new[1]), fmt2=fmt(prev[1])))
     return res
 
 
@@ -284,27 +288,30 @@ def status_text(cfg: dict, data_dir: Path, now: float | None = None, watched_fn=
     import html
     from checks import fmt_duration
     now = now or time.time()
-    lines = ["💾 <b>Резервные копии</b>"]
+    lines = [_('💾 <b>Резервные копии</b>')]
 
     def describe(title: str, st: dict) -> str:
         age = age_h(st, now)
         if not st.get("exists"):
-            return f"❌ {title}: папки нет"
+            return _('❌ {title}: папки нет', title=title)
         if age is None:
-            return f"❌ {title}: копий нет" if st.get("max_age_h") else f"▫️ {title}: копий пока нет"
+            return _('❌ {title}: копий нет', title=title) if st.get("max_age_h") else _('▫️ {title}: копий пока нет',
+                                                                                        title=title)
         bad = st.get("max_age_h") and age > st["max_age_h"]
-        return (f"{'❌' if bad else '✅'} {title}: последняя {fmt_duration(age * 3600)} назад, "
-                f"{fmt(st['newest'][1])}, всего {st['count']} шт. ({fmt(st['total'])})")
+        return (_('{v} {title}: последняя {fmt_duration} назад, {fmt}, всего {count} шт. ({fmt2})',
+                  v='❌' if bad else '✅', title=title, fmt_duration=fmt_duration(age * 3600), fmt=fmt(st['newest'][1]), count=st['count'], fmt2=fmt(st['total'])))
 
     t = cfg.get("backup_time")
-    lines.append(describe("Бот (настройки, состояние, история)", own_status(cfg, data_dir))
-                 + (f"\n   Каждый день в {t}, храню {cfg.get('backup_keep') or 14} шт." if t else "\n   По расписанию: выкл"))
+    lines.append(describe(_('Бот (настройки, состояние, история)'), own_status(cfg, data_dir))
+                 + (_('\n'
+                      '   Каждый день в {t}, храню {v} шт.',
+                      t=t, v=cfg.get('backup_keep') or 14) if t else _('\n   По расписанию: выкл')))
     lines.append(offsite_text(cfg, now, offsite_fn))
     watched = watched_fn(now)
     if watched is None:
-        lines.append("Чужие бэкапы: помощник не настроен (см. README, раздел «Резервные копии»)")
+        lines.append(_('Чужие бэкапы: помощник не настроен (см. README, раздел «Резервные копии»)'))
     for st in watched or []:
         lines.append(describe(html.escape(st["path"]), st))
     if cfg.get("backup_send_daily"):
-        lines.append("📤 Каждый день присылаю копии сюда, в Telegram")
+        lines.append(_('📤 Каждый день присылаю копии сюда, в Telegram'))
     return "\n".join(lines)

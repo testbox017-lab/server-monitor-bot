@@ -37,9 +37,9 @@ class Pending:
 
 
 class Actions:
-    def __init__(self, log_path: Path, helper: str = HELPER):
+    def __init__(self, log_path: Path, helper: str | None = None):
         self.log_path = log_path
-        self.helper = helper
+        self.helper = helper or HELPER  # при вызове, а не при импорте: тесты подменяют HELPER
         self.pending: dict[str, Pending] = {}
 
     # ---------- подтверждения ----------

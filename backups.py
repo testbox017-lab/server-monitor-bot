@@ -253,10 +253,14 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None, watched_fn=wat
         if not limit:
             continue
         age = age_h(st, now)
+        seen = getattr(state, "bak_first_seen", None)
+        first = seen.setdefault(st["path"], now) if isinstance(seen, dict) else None
         if not st.get("exists"):
             res[key] = f"💾 Папки с бэкапами {st['path']} нет"
         elif age is None:
-            res[key] = f"💾 В {st['path']} нет ни одной резервной копии"
+            # папку только что добавили под наблюдение: первая копия появится по своему расписанию
+            fresh = first is not None and now - first < max(24.0, float(limit)) * 3600
+            res[key] = None if fresh else f"💾 В {st['path']} нет ни одной резервной копии"
         elif age > limit:
             res[key] = f"💾 Последней резервной копии в {st['path']} уже {age:.0f} ч (норма до {limit:.0f} ч)"
         else:

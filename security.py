@@ -8,7 +8,8 @@ import subprocess
 import time
 import urllib.request
 
-ACCEPTED_RE = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port \d+")
+# «Accepted publickey for root from 1.2.3.4 port 5 ssh2: ED25519 SHA256:abc» — отпечаток ключа в конце
+ACCEPTED_RE = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port \d+(?: ssh2)?(?:: \S+ (SHA256:\S+))?")
 # Имя пользователя пишет атакующий, в нём могут быть пробелы и «from 1.2.3.4 port 1». Поэтому IP и порт
 # берём с конца строки, а имя — всё, что между.
 FAILED_RE = re.compile(r"^Failed \S+ for (?:invalid user )?(.*) from (\S+) port (\d+)(?: ssh2)?$")
@@ -35,8 +36,8 @@ def ssh_log(since: int) -> str | None:
                 "-o", "cat", "--no-pager"])
 
 
-def parse_ssh(text: str) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
-    """([(user, ip, method)], {ip: число неудачных попыток})"""
+def parse_ssh(text: str) -> tuple[list[tuple[str, str, str, str]], dict[str, int]]:
+    """([(user, ip, method, отпечаток ключа или "")], {ip: число неудачных попыток})"""
     accepted, failed = [], {}
     failed_conns: set[tuple[str, str]] = set()   # (ip, порт) соединений, где уже была строка Failed
     invalid: list[tuple[str, str]] = []
@@ -44,7 +45,7 @@ def parse_ssh(text: str) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
         line = line.strip()
         m = ACCEPTED_RE.match(line)
         if m:
-            accepted.append((m.group(2), m.group(3), m.group(1)))
+            accepted.append((m.group(2), m.group(3), m.group(1), m.group(4) or ""))
             continue
         m = FAILED_RE.match(line)
         if m:
@@ -79,21 +80,117 @@ def public_ip(ip: str) -> bool:
                 or a.is_reserved)
 
 
+FAIL_KEEP = 3600          # сколько помним отдельные попытки (окна 10 мин и 1 ч)
+REPEAT_DAYS = 30          # повторный бан в течение стольких дней — сразу навсегда
+NET_MIN_FAILS = 5         # IP считается подборщиком для правила подсети, если за сутки у него столько попыток
+
+
+def _hour_threshold(cfg: dict) -> int:
+    v = cfg.get("autoban_hour_threshold")
+    return 20 if v is None else int(v)
+
+
+def _in_banned_net(ip: str, state) -> bool:
+    for t in state.autobans:
+        if "/" in t:
+            try:
+                if ipaddress.ip_address(ip) in ipaddress.ip_network(t, strict=False):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def autoban_candidates(cfg: dict, state, now: float) -> list[tuple[str, int]]:
-    """[(ip, попыток за 10 мин)], которые пора заблокировать. Никогда — IP, с которых уже входили по SSH,
-    и IP из autoban_whitelist."""
+    """[(ip, попыток за час)], которые пора заблокировать: autoban_threshold попыток за 10 минут
+    (быстрый подбор) или autoban_hour_threshold за час (медленный, «под порогом»). Никогда — IP,
+    с которых уже входили по SSH, и IP из autoban_whitelist."""
     if not cfg.get("autoban", True) or not cfg.get("ssh_alerts", True):
         return []
     thr = int(cfg.get("autoban_threshold") or 10)
-    by_ip: dict[str, int] = {}
+    hthr = _hour_threshold(cfg)
+    by10: dict[str, int] = {}
+    by60: dict[str, int] = {}
     for ts, ip, n in state.ssh_failed:
-        if now - ts < 600:
-            by_ip[ip] = by_ip.get(ip, 0) + n
+        if now - ts < 3600:
+            by60[ip] = by60.get(ip, 0) + n
+            if now - ts < 600:
+                by10[ip] = by10.get(ip, 0) + n
     skip = recent_known_ips(state, now) | set(cfg.get("autoban_whitelist") or []) | set(state.autobans)
     skip |= {ip for ip, ts in state.autoban_skip.items() if now - ts < AUTOBAN_RETRY}
-    out = [(ip, n) for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])
-           if n >= thr and ip not in skip and public_ip(ip)]
+    out = [(ip, n) for ip, n in sorted(by60.items(), key=lambda x: -x[1])
+           if (by10.get(ip, 0) >= thr or (hthr and n >= hthr))
+           and ip not in skip and public_ip(ip) and not _in_banned_net(ip, state)]
     return out[:AUTOBAN_PER_CHECK]
+
+
+def net24(ip: str) -> str | None:
+    """Подсеть /24 для IPv4, для IPv6 — None (подсетями IPv6 не баним)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if a.version != 4:
+        return None
+    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+
+
+def net_candidates(cfg: dict, state, now: float) -> list[tuple[str, list[str]]]:
+    """[(подсеть /24, [IP-подборщики в ней])]: из одной /24 подбирают пароль сразу несколько адресов
+    (autoban_net_ips, по умолчанию 2) — блокируем всю подсеть. Подборщик — IP, забаненный сейчас или за
+    последние 30 дней, или сделавший за сутки 5+ неудачных попыток. Подсеть не трогаем, если в ней есть
+    IP, с которого входили, или IP из autoban_whitelist."""
+    need = int(cfg.get("autoban_net_ips") or 0) if cfg.get("autoban_net_ips") is not None else 2
+    if not cfg.get("autoban", True) or not cfg.get("ssh_alerts", True) or need < 2:
+        return []
+    bad: dict[str, set[str]] = {}
+
+    def add(ip: str) -> None:
+        net = net24(ip)
+        if net and public_ip(ip):
+            bad.setdefault(net, set()).add(ip)
+    for ip, (n, last) in state.fail_ips.items():
+        if now - last < 86400 and n >= NET_MIN_FAILS:
+            add(ip)
+    for t in state.autobans:
+        if "/" not in t:
+            add(t)
+    for t, (_, last) in state.ban_history.items():
+        if "/" not in t and now - last < REPEAT_DAYS * 86400:
+            add(t)
+    protect = recent_known_ips(state, now) | set(cfg.get("autoban_whitelist") or [])
+    protected_nets = {net24(ip) for ip in protect}
+    skip = set(state.autobans) | {t for t, ts in state.autoban_skip.items() if now - ts < AUTOBAN_RETRY}
+    out = [(net, sorted(ips)) for net, ips in sorted(bad.items())
+           if len(ips) >= need and net not in skip and net not in protected_nets]
+    return out[:AUTOBAN_PER_CHECK]
+
+
+def ban_hours(cfg: dict, state, target: str, now: float) -> int:
+    """На сколько часов банить (0 = навсегда). Кого уже банили за последние 30 дней — сразу навсегда."""
+    hours = cfg.get("autoban_hours")
+    hours = 24 if hours is None else int(hours)
+    prev = state.ban_history.get(target)
+    if prev and now - prev[1] < REPEAT_DAYS * 86400 and cfg.get("autoban_repeat_forever", True):
+        return 0
+    return hours
+
+
+def remember_ban(state, target: str, now: float) -> None:
+    n = (state.ban_history.get(target) or [0, 0])[0]
+    state.ban_history[target] = [n + 1, now]
+    state.ban_history = {t: v for t, v in state.ban_history.items() if now - v[1] < REPEAT_DAYS * 86400}
+
+
+def is_deploy(cfg: dict, ip: str, fingerprint: str) -> bool:
+    """Вход по SSH от автодеплоя: ключ из deploy_keys (отпечаток SHA256:…) или адрес из deploy_nets."""
+    if fingerprint and fingerprint in (cfg.get("deploy_keys") or []):
+        return True
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in ipaddress.ip_network(n, strict=False) for n in cfg.get("deploy_nets") or [])
+    except ValueError:
+        return False
 
 
 def recent_known_ips(state, now: float) -> set[str]:
@@ -154,6 +251,52 @@ def heartbeat(url: str) -> bool:
         return False
 
 
+# ---------- Статистика попыток ----------
+
+DAILY_KEEP = 8      # дней статистики для недельного отчёта
+DAILY_MAX_IPS = 300  # больше адресов за день не храним (оставляем самых активных)
+
+
+def record_failures(state, failed: dict[str, int], now: float) -> None:
+    """Счётчики для правила подсети (сутки) и для недельного отчёта (по дням UTC)."""
+    for ip, n in failed.items():
+        cur = state.fail_ips.get(ip)
+        total = cur[0] if cur and now - cur[1] < 86400 else 0
+        state.fail_ips[ip] = [total + n, now]
+    state.fail_ips = {ip: v for ip, v in state.fail_ips.items() if now - v[1] < 86400}
+    if failed:
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        d = state.ssh_daily.setdefault(day, {})
+        for ip, n in failed.items():
+            d[ip] = d.get(ip, 0) + n
+        if len(d) > DAILY_MAX_IPS:
+            state.ssh_daily[day] = dict(sorted(d.items(), key=lambda x: -x[1])[:DAILY_MAX_IPS])
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - DAILY_KEEP * 86400))
+    state.ssh_daily = {k: v for k, v in state.ssh_daily.items() if k > cutoff}
+
+
+def ssh_week_lines(state, now: float) -> list[str]:
+    """Строки для недельного отчёта: сколько было попыток подбора, откуда, сколько заблокировано."""
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(now - 7 * 86400))
+    by_ip: dict[str, int] = {}
+    for day, d in state.ssh_daily.items():
+        if day > cutoff:
+            for ip, n in d.items():
+                by_ip[ip] = by_ip.get(ip, 0) + n
+    if not by_ip:
+        return []
+    total = sum(by_ip.values())
+    nets: dict[str, int] = {}
+    for ip, n in by_ip.items():
+        nets[net24(ip) or ip] = nets.get(net24(ip) or ip, 0) + n
+    top = ", ".join(f"{t} ({n})" for t, n in sorted(nets.items(), key=lambda x: -x[1])[:3])
+    blocked = [t for t in state.autobans]
+    lines = [f"🛡 Подбор пароля SSH: {total} попыток с {len(by_ip)} IP. Больше всего: {top}"]
+    if blocked:
+        lines.append(f"  Сейчас в автобане: {len(blocked)} (подсетей: {sum('/' in t for t in blocked)})")
+    return lines
+
+
 # ---------- Итерация ----------
 
 def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
@@ -170,7 +313,13 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
             text = ssh_text_fn(since)
             if text:
                 accepted, failed = parse_ssh(text)
-                for user, ip, method in accepted:
+                for user, ip, method, fp in accepted:
+                    if is_deploy(cfg, ip, fp):
+                        # автодеплой: адрес каждый раз новый (GitHub Actions), в «свои» IP его не записываем
+                        # и не шумим; перезапуск контейнера следом будет считаться деплоем
+                        state.deploy_at = now
+                        state.log.append([now, "deploy"])
+                        continue
                     new = ip not in state.known_ips
                     if new:
                         state.known_ips.append(ip)
@@ -184,12 +333,14 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
                         state.log.append([now, f"ssh:{ip}"])
                 for ip, n in failed.items():
                     state.ssh_failed.append([now, ip, n])
-        state.ssh_failed = [x for x in state.ssh_failed if now - x[0] < 600]
-        total = sum(x[2] for x in state.ssh_failed)
+                record_failures(state, failed, now)
+        state.ssh_failed = [x for x in state.ssh_failed if now - x[0] < FAIL_KEEP]
+        recent = [x for x in state.ssh_failed if now - x[0] < 600]
+        total = sum(x[2] for x in recent)
         threshold = cfg.get("ssh_fail_threshold", 30)
         if threshold and total >= threshold and not quiet and not muted and now - state.ssh_fail_alert_at >= 3600:
             by_ip: dict[str, int] = {}
-            for _, ip, n in state.ssh_failed:
+            for _, ip, n in recent:
                 by_ip[ip] = by_ip.get(ip, 0) + n
             top = ", ".join(f"{ip} ({n})" for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])[:3])
             worst = max(by_ip.items(), key=lambda x: x[1])[0]

@@ -18,8 +18,10 @@
     bak-list               — старые копии кода /opt/monitor_bot.bak-* и их размер (JSON)
     prune-bak KEEP         — удалить старые копии кода, оставить KEEP самых новых
     io-top                 — процессы с наибольшим чтением/записью на диск за 2 секунды (JSON)
-    ban-ip IP              — запретить входящие с IP через ufw (не локальные адреса и не IP с открытой SSH-сессией)
-    unban-ip IP            — снять запрет, поставленный ботом
+    ban-ip IP|NET          — запретить входящие с IP или подсети IPv4 не шире /24 через ufw (не локальные адреса
+                             и не адреса с открытой SSH-сессией)
+    unban-ip IP|NET        — снять запрет, поставленный ботом
+    docker-poll            — docker ps -a и docker inspect всех контейнеров одним вызовом (JSON)
     banned-list            — IP, запрещённые ботом (JSON)
     pull-stream            — для ПК: tar с последними копиями (бот + папки backup-watch) в stdout.
                              Вызывается через command= в /root/.ssh/authorized_keys, отмечает время в
@@ -745,13 +747,36 @@ def io_top() -> None:
 
 
 def parse_ip(s: str):
-    try:
-        ip = ipaddress.ip_address(s)
-    except ValueError:
-        die("bad ip")
+    """IP или подсеть IPv4 не шире /24 (автобан подсети, из которой подбирают пароль с разных адресов)."""
+    if "/" in s:
+        try:
+            net = ipaddress.ip_network(s, strict=True)
+        except ValueError:
+            die("bad ip")
+        if net.version != 4 or net.prefixlen < 24:
+            die("refused: only IPv4 networks /24 or smaller")
+        ip = net
+    else:
+        try:
+            ip = ipaddress.ip_address(s)
+        except ValueError:
+            die("bad ip")
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
         die("refused: local or special address")
     return ip
+
+
+def covers_peer(target, peers: set[str]) -> bool:
+    """Правило задело бы открытую SSH-сессию."""
+    if isinstance(target, ipaddress.IPv4Network):
+        for p in peers:
+            try:
+                if ipaddress.ip_address(p) in target:
+                    return True
+            except ValueError:
+                continue
+        return False
+    return str(target) in peers
 
 
 def sshd_ports() -> set[str]:
@@ -809,7 +834,7 @@ def banned() -> list[str]:
 
 def ban_ip(s: str) -> None:
     ip = parse_ip(s)
-    if str(ip) in ssh_peers():
+    if covers_peer(ip, ssh_peers()):
         die("refused: this IP has an open SSH session")
     if not ufw_active():
         die("ufw is not active", 1)
@@ -834,6 +859,26 @@ def unban_ip(s: str) -> None:
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip() or "ufw failed", 1)
     print(f"unbanned {ip}")
+
+
+def docker_poll() -> None:
+    """docker ps и docker inspect всех контейнеров одним вызовом (JSON {"ps": ..., "inspect": ...}):
+    бот проверяет Docker каждую минуту, и каждый вызов через sudo оставляет строки в системном журнале."""
+    def dk(args: list[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            die("docker timeout", 1)
+        except OSError as e:
+            die(f"docker: {e}", 1)
+    ps = dk(["ps", "-a", "--format", PS_FMT])
+    if ps.returncode != 0:
+        sys.stderr.write(ps.stderr)
+        sys.exit(ps.returncode or 1)
+    names = [ln.split("\t", 1)[0] for ln in ps.stdout.splitlines() if "\t" in ln]
+    names = [n for n in names if CONTAINER_RE.match(n)][:200]
+    inspect = dk(["inspect", "--format", INSPECT_FMT, *names]).stdout if names else ""
+    print(json.dumps({"ps": ps.stdout, "inspect": inspect}))
 
 
 def docker_names(names: list[str]) -> list[str]:
@@ -914,6 +959,8 @@ def main(argv: list[str]) -> None:
         backup_verify()
     elif cmd == "docker" and args:
         docker_cmd(list(args))
+    elif cmd == "docker-poll" and not args:
+        docker_poll()
     else:
         die("unknown command")
 

@@ -51,6 +51,12 @@ class History:
                 c.execute("DELETE FROM m WHERE ts < ?", (now - RETENTION_DAYS * 86400,))
                 self._last_cleanup = now
 
+    def first_ts(self) -> float | None:
+        """Время самой старой записи: с какого момента бот вообще наблюдает за сервером."""
+        with _lock, self._conn() as c:
+            row = c.execute("SELECT MIN(ts) FROM m").fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def rows(self, since: float, until: float | None = None) -> list[tuple]:
         until = until or time.time()
         with _lock, self._conn() as c:

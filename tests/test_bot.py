@@ -33,6 +33,8 @@ T0 = 1_800_000_000
 backups.OFFSITE_STATUS = TMP / "no-offsite-status.json"  # тесты не читают настоящий файл сервера
 # На сервере помощник установлен, и docker пошёл бы через sudo. Тесты не должны зависеть от этого.
 checks.HELPER = str(TMP / "no-helper")
+import actions  # noqa: E402
+backups.HELPER = actions.HELPER = checks.HELPER  # и бэкапы, и действия: на сервере sudo к настоящему помощнику работает
 
 
 def fake_sample(cpu, ram, disk, rx, tx):

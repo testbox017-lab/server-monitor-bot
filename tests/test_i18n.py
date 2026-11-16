@@ -126,7 +126,7 @@ class LanguageOutputTest(unittest.TestCase):
         import security
         inc = incidents.Incidents(Path(tempfile.mkdtemp()) / "m.db")
         i18n.set_lang("en")
-        cfg = {"tz": "UTC", "thresholds": {"duration_sec": 300}, "remind_min": 0, "probes": ["https://site.example"]}
+        cfg = {"tz": "UTC", "thresholds": {"duration_sec": 300}, "remind_min": 0}  # без probes: никакой сети
         st = checks.AlertState()
         t0 = 1_800_000_000
         res = {"cpu": None, "ram": None, "reboot_required": None, "svc:ssh": "❌ Service ssh is not running (dead)"}
@@ -215,7 +215,6 @@ class LanguageButtonsTest(unittest.TestCase):
     def test_text_in_all_languages(self):
         b = self.bot
         i18n.set_lang("en")
-        b.HIST.peaks = mock.MagicMock(return_value=None)
         views = [b.settings_text(), b.alerts_text(), b.thresholds_view()[0], b.security_view()[0],
                  b.smart_view()[0], b.summary_view()[0], b.docker_view()[0], b.probes_view()[0]]
         for markup in (b.settings_kb(), b.alerts_kb(), b.alert_kb("ctr:web", True), b.status_kb(),

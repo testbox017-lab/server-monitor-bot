@@ -379,6 +379,8 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
         state.updates_checked = now
         pkgs = updates_fn() or []
         sec = [p.name for p in pkgs if p.security]
+        if not sec:
+            pkgs = [p for p in pkgs if not p.held]  # отложенные Ubuntu поставить всё равно нельзя — не напоминаем
         if (sec or (pkgs and cfg.get("update_alerts_all"))) and not quiet and now - state.updates_alert_at >= 86400:
             state.updates_alert_at = now
             if sec:

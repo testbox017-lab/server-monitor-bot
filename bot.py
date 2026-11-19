@@ -614,7 +614,9 @@ def pkg_view() -> tuple[str, InlineKeyboardMarkup]:
         sec = sum(p.security for p in pkgs)
         if sec:
             rows.append([Btn(_('🛡 Установить обновления безопасности ({n})', n=sec), callback_data="pkg:go:security")])
-        rows.append([Btn(_('⬆️ Установить все ({n})', n=len(pkgs)), callback_data="pkg:go:all")])
+        n_all = len(pkgupdates.installable(pkgs, "all"))
+        if n_all:
+            rows.append([Btn(_('⬆️ Установить все ({n})', n=n_all), callback_data="pkg:go:all")])
     if actions_on() and reboot is not None:
         rows.append([Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
     lines.append(_('\n🛡 — обновление безопасности. Установка идёт через помощник с подтверждением; настройки '
@@ -632,6 +634,10 @@ async def report_apt(bot) -> None:
     STATE.save()
     if first:
         return  # старый результат (например, после обновления бота) не присылаем
+    if res.get("left") and "phased" not in res:
+        # какие из оставшихся Ubuntu выпускает поэтапно: они не ошибка, придут позже
+        h = await asyncio.to_thread(pkgupdates.held)
+        res["phased"] = [n for n in res["left"] if h.get(n) == "phased"]
     rows = [[Btn(_('📦 Обновления пакетов'), callback_data="pkg:view:new")]]
     if res.get("reboot_required") and actions_on():
         rows.append([Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
@@ -1456,7 +1462,7 @@ async def handle_pkg(update: Update, parts: list[str]) -> str | None:
         if pkgupdates.running():
             return _('установка обновлений уже идёт')
         pkgs = await asyncio.to_thread(pkgupdates.upgradable) or []
-        chosen = [p for p in pkgs if p.security] if mode == "security" else pkgs
+        chosen = pkgupdates.installable(pkgs, mode)
         if not chosen:
             return _('Нечего устанавливать')
         token = ACT.ask("apt", mode, update.effective_chat.id)

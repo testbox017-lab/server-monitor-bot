@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from i18n import _
 
@@ -34,6 +34,7 @@ class Pkg:
     new: str
     old: str
     suites: str
+    held: str = field(default="", compare=False)  # phased — Ubuntu выпускает поэтапно, kept — apt держит
 
     @property
     def security(self) -> bool:
@@ -50,16 +51,58 @@ def parse(text: str) -> list[Pkg]:
     return sorted(out, key=lambda p: (not p.security, p.name))
 
 
+# Заголовки в выводе apt-get upgrade, после которых идут имена пакетов с отступом
+HELD_HEADERS = {"The following upgrades have been deferred due to phasing:": "phased",
+                "The following packages have been kept back:": "kept"}
+
+
+def parse_held(text: str) -> dict[str, str]:
+    """{пакет: phased|kept} из вывода apt-get upgrade (настоящего или -s)."""
+    out: dict[str, str] = {}
+    kind = None
+    for ln in text.splitlines():
+        if ln.strip() in HELD_HEADERS:
+            kind = HELD_HEADERS[ln.strip()]
+        elif kind and ln[:1] == " ":
+            for n in ln.split():
+                out.setdefault(n.split(":")[0], kind)
+        else:
+            kind = None
+    return out
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60, encoding="utf-8",
+                              errors="replace", env={**os.environ, "LC_ALL": "C"})
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def held() -> dict[str, str]:
+    """Что apt-get upgrade сейчас не поставит. Симуляция (-s) работает без root."""
+    r = _run(["apt-get", "-s", "-q", "upgrade"]) if shutil.which("apt-get") else None
+    return parse_held(r.stdout) if r and r.returncode == 0 else {}
+
+
 def upgradable() -> list[Pkg] | None:
     """Доступные обновления. None — apt недоступен (не Debian/Ubuntu) или не ответил."""
     if not shutil.which("apt"):
         return None
-    try:
-        r = subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True, timeout=60,
-                           encoding="utf-8", errors="replace", env={**os.environ, "LC_ALL": "C"})
-    except Exception:  # noqa: BLE001
+    r = _run(["apt", "list", "--upgradable"])
+    if r is None or r.returncode != 0:
         return None
-    return parse(r.stdout) if r.returncode == 0 else None
+    pkgs = parse(r.stdout)
+    if pkgs:
+        h = held()
+        for p in pkgs:
+            p.held = h.get(p.name, "")
+    return pkgs
+
+
+def installable(pkgs: list[Pkg], mode: str) -> list[Pkg]:
+    """Что реально поставит установка: для «всех» — без отложенных Ubuntu и удержанных apt."""
+    return [p for p in pkgs if p.security] if mode == "security" else [p for p in pkgs if not p.held]
 
 
 def lists_age() -> float | None:
@@ -96,7 +139,7 @@ def last_result(path: Path | None = None) -> dict | None:
 
 def pkg_line(p: Pkg) -> str:
     old = f"{p.old} → " if p.old else ""
-    return f"{'🛡' if p.security else '•'} {p.name} {old}{p.new}"
+    return f"{'🛡' if p.security else '⏸' if p.held else '•'} {p.name} {old}{p.new}"
 
 
 def view_lines(pkgs: list[Pkg] | None) -> list[str]:
@@ -110,6 +153,12 @@ def view_lines(pkgs: list[Pkg] | None) -> list[str]:
     lines += [pkg_line(p) for p in pkgs[:LIST_MAX]]
     if len(pkgs) > LIST_MAX:
         lines.append(_('…и ещё {n}', n=len(pkgs) - LIST_MAX))
+    if any(p.held == "phased" for p in pkgs):
+        lines.append(_('⏸ — Ubuntu выпускает это обновление поэтапно, до этого сервера очередь ещё не дошла. '
+                       'Когда дойдёт (обычно за несколько дней), его поставит «Установить все».'))
+    if any(p.held == "kept" for p in pkgs):
+        lines.append(_('⏸ — apt держит обновление: ему нужны новые пакеты (часто так бывает с ядром). Ставится '
+                       'вручную: apt full-upgrade.'))
     return lines
 
 
@@ -136,7 +185,12 @@ def result_text(res: dict) -> str:
         lines.append(_('❌ Установка ({what}) не удалась: {error}', what=what, error=res.get("error") or "?"))
         if done:
             lines.append(_('Успели обновиться: {len} пак. ({names})', len=len(done), names=names_short(done)))
-    left = res.get("left") or []
+    phased = set(res.get("phased") or [])
+    left = [n for n in res.get("left") or [] if n not in phased]
+    later = [n for n in res.get("left") or [] if n in phased]
+    if later:
+        lines.append(_('⏸ Отложены Ubuntu (поэтапный выпуск, придут позже): {len} ({names})',
+                       len=len(later), names=names_short(later)))
     if left:
         lines.append(_('Остались без обновления: {len} ({names})', len=len(left), names=names_short(left)))
     if res.get("restarted"):

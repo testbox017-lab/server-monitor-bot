@@ -755,6 +755,8 @@ class SecurityTest(unittest.TestCase):
         self.cfg["update_alerts_all"] = True
         a = self.ev(T0 + 7 * 3600)
         self.assertEqual([x.text for x in a], ["📦 Доступны обновления Ubuntu: 1 (vim)"])
+        self.updates = [pkgupdates.Pkg("distro-info", "2", "1", "noble-updates", "phased")]
+        self.assertEqual(self.ev(T0 + 40 * 3600), [])         # поэтапные поставить нельзя — не напоминаем
 
     def test_muted_and_quiet(self):
         self.ssh = SSH_LOG
@@ -2575,6 +2577,24 @@ class PackageUpdatesTest(unittest.TestCase):
         t = pkgupdates.result_text({"mode": "all", "ok": True, "upgraded": []})
         self.assertIn("новых версий не было", t)
 
+    def test_phased_and_kept(self):
+        sim = ("Calculating upgrade...\nThe following upgrades have been deferred due to phasing:\n"
+               "  distro-info python3-distro-info\nThe following packages have been kept back:\n"
+               "  linux-generic\n0 upgraded, 0 newly installed, 0 to remove and 3 not upgraded.\n")
+        self.assertEqual(pkgupdates.parse_held(sim), {"distro-info": "phased", "python3-distro-info": "phased",
+                                                      "linux-generic": "kept"})
+        pk = pkgupdates.parse(APT_LIST + "distro-info/resolute-updates 1.15ubuntu0.1 amd64 [upgradable from: 1.15]\n")
+        for p in pk:
+            p.held = pkgupdates.parse_held(sim).get(p.name, "")
+        self.assertEqual([p.name for p in pkgupdates.installable(pk, "all")], ["libc6", "openssl", "vim"])
+        lines = pkgupdates.view_lines(pk)
+        self.assertIn("⏸ distro-info 1.15 → 1.15ubuntu0.1", lines)
+        self.assertTrue(any("поэтапно" in ln for ln in lines))
+        t = pkgupdates.result_text({"mode": "all", "ok": True, "upgraded": [], "left": ["distro-info", "vim"],
+                                    "phased": ["distro-info"]})
+        self.assertIn("⏸ Отложены Ubuntu (поэтапный выпуск, придут позже): 1 (distro-info)", t)
+        self.assertIn("Остались без обновления: 1 (vim)", t)
+
     def test_last_result_and_reboot(self):
         f = TMP / "apt-result.json"
         self.assertIsNone(pkgupdates.last_result(f))
@@ -2747,6 +2767,31 @@ class BotPackagesTest(unittest.TestCase):
         self.pk = []
         q, __ = self.press("pkg:view")
         self.assertIn("Все пакеты обновлены", q.edit_message_text.await_args.args[0])
+
+    def test_only_phased_left(self):
+        for p in self.pk:
+            p.held = "" if p.security else "phased"
+        self.pk = [p for p in self.pk if not p.security]
+        q, __ = self.press("pkg:view")
+        cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+        self.assertNotIn("pkg:go:all", cbs)                    # ставить нечего, кнопку не показываем
+        self.assertIn("поэтапно", q.edit_message_text.await_args.args[0])
+        q, __ = self.press("pkg:go:all")
+        self.assertEqual(q.answer.await_args.args[0], "Нечего устанавливать")
+
+    def test_report_marks_phased(self):
+        b = self.bot
+        f = TMP / "apt-report-phased.json"
+        f.write_text(json.dumps({"mode": "all", "ok": True, "upgraded": [], "left": ["distro-info"],
+                                 "finished": time.time()}))
+        bot_api = mock.MagicMock()
+        bot_api.send_message = mock.AsyncMock()
+        b.STATE.apt_reported = 1.0
+        with mock.patch.object(pkgupdates, "RESULT_FILE", f), mock.patch.object(b.STATE, "save"), \
+                mock.patch.object(pkgupdates, "held", return_value={"distro-info": "phased"}):
+            asyncio.run(b.report_apt(bot_api))
+        self.assertIn("Отложены Ubuntu", bot_api.send_message.await_args.args[1])
+        self.assertNotIn("Остались без обновления", bot_api.send_message.await_args.args[1])
 
     def test_refresh(self):
         with mock.patch.object(self.bot.ACT, "_helper", return_value=(False, "помощник на сервере не обновлён")) as hp:

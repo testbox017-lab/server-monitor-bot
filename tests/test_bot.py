@@ -78,6 +78,15 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(s2.cfg["services"], ["ssh"])
 
 
+class HostNameTest(unittest.TestCase):
+    def test_server_name_from_config(self):
+        with mock.patch.object(checks.platform, "node", return_value="ubuntu-1gb-hel1-1"):
+            self.assertEqual(checks.host_name({}), "ubuntu-1gb-hel1-1")
+            self.assertEqual(checks.host_name({"server_name": None}), "ubuntu-1gb-hel1-1")
+            self.assertEqual(checks.host_name({"server_name": "  "}), "ubuntu-1gb-hel1-1")
+            self.assertEqual(checks.host_name({"server_name": " prod-1 "}), "prod-1")
+
+
 class StepTest(unittest.TestCase):
     def setUp(self):
         self.cfg = {"thresholds": {"duration_sec": 300}, "remind_min": 60, "tz": "Europe/Kyiv"}

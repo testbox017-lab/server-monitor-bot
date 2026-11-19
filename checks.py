@@ -61,6 +61,11 @@ def disk_paths(cfg_disks: list[str] | None) -> list[str]:
     return sorted(set(paths))
 
 
+def host_name(cfg: dict) -> str:
+    """Имя сервера в сообщениях: server_name из config.yaml, иначе hostname системы."""
+    return str(cfg.get("server_name") or "").strip() or platform.node()
+
+
 def collect(cfg: dict) -> dict:
     """Снимок текущего состояния сервера."""
     vm = psutil.virtual_memory()
@@ -86,7 +91,7 @@ def collect(cfg: dict) -> dict:
             pass
     net = psutil.net_io_counters()
     return {
-        "host": platform.node(),
+        "host": host_name(cfg),
         "os": f"{platform.system()} {platform.release()}",
         "cpu": psutil.cpu_percent(interval=1),
         "cpu_count": psutil.cpu_count(),

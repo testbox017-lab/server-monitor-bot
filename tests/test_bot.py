@@ -35,6 +35,10 @@ backups.OFFSITE_STATUS = TMP / "no-offsite-status.json"  # тесты не чи�
 checks.HELPER = str(TMP / "no-helper")
 import actions  # noqa: E402
 import pkgupdates  # noqa: E402
+# На сервере есть настоящие /run/monitor-bot-apt.json и замок установки: тесты их читать не должны
+pkgupdates.RESULT_FILE = TMP / "no-apt-result.json"
+pkgupdates.LOCK_FILE = TMP / "no-apt-lock"
+pkgupdates.REBOOT_FILE = TMP / "no-reboot-required"
 backups.HELPER = actions.HELPER = checks.HELPER  # и бэкапы, и действия: на сервере sudo к настоящему помощнику работает
 
 

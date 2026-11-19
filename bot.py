@@ -47,7 +47,7 @@ STATE = checks.AlertState.load(S.dir / "state.json")
 HIST = history.History(S.dir / "metrics.db")
 ACT = actions.Actions(S.dir / "actions.log")
 INC = incidents.Incidents(S.dir / "metrics.db")
-HOST = checks.platform.node()
+HOST = checks.host_name(CFG)
 
 # ---------- Клавиатуры ----------
 

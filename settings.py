@@ -22,7 +22,7 @@ EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "proce
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
             "anomaly_alerts", "ram_trend_alerts", "group_alerts",
             "backup_time", "backup_keep", "backup_send_daily", "backup_alerts",
-            "offsite_max_age_h", "verify_backups", "weekly_report", "lang")
+            "offsite_max_age_h", "verify_backups", "weekly_report", "lang", "server_name")
 
 DEFAULTS = {
     "check_interval_sec": 60,
@@ -156,6 +156,12 @@ class Settings:
             on = True
         self.set(key, items)
         return on
+
+    def unset(self, key: str) -> None:
+        """Убрать изменение из Telegram: снова действует значение из config.yaml."""
+        if self.overrides.pop(key, None) is not None:
+            self._save()
+        self._merge()
 
     def reset(self) -> None:
         self.overrides = {}

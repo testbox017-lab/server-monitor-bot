@@ -66,6 +66,11 @@ def host_name(cfg: dict) -> str:
     return str(cfg.get("server_name") or "").strip() or platform.node()
 
 
+def valid_server_name(name: str, max_len: int = 64) -> bool:
+    """Имя для подписи сообщений: буквы, цифры, пробел, . _ - ( ). Без HTML и спецсимволов графика."""
+    return 0 < len(name) <= max_len and all(c.isalnum() or c in " ._-()" for c in name)
+
+
 def collect(cfg: dict) -> dict:
     """Снимок текущего состояния сервера."""
     vm = psutil.virtual_memory()

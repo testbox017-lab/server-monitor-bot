@@ -1002,6 +1002,20 @@ UK = {
         "сьогодні",
     "{days} дн. назад":
         "{days} дн. тому",
+    "Имя сервера: {name}":
+        "Ім'я сервера: {name}",
+    "🏷 Имя сервера":
+        "🏷 Ім'я сервера",
+    "🏷 <b>Имя сервера</b>: {name}\nОно стоит в начале каждого сообщения бота.\n\nЧтобы сменить, отправьте: <code>/name новое-имя</code>":
+        "🏷 <b>Ім'я сервера</b>: {name}\nВоно стоїть на початку кожного повідомлення бота.\n\nЩоб змінити, надішліть: <code>/name нове-ім'я</code>",
+    "↩️ Как в config.yaml":
+        "↩️ Як у config.yaml",
+    "Имя может содержать буквы, цифры, пробел и знаки . _ - ( ), не длиннее {n} символов.":
+        "Ім'я може містити літери, цифри, пробіл і знаки . _ - ( ), не довше {n} символів.",
+    "✅ Имя сервера: {name}":
+        "✅ Ім'я сервера: {name}",
+    "Имя как в config.yaml: {name}":
+        "Ім'я як у config.yaml: {name}",
 }
 
 EN = {
@@ -2003,4 +2017,18 @@ EN = {
         "today",
     "{days} дн. назад":
         "{days} days ago",
+    "Имя сервера: {name}":
+        "Server name: {name}",
+    "🏷 Имя сервера":
+        "🏷 Server name",
+    "🏷 <b>Имя сервера</b>: {name}\nОно стоит в начале каждого сообщения бота.\n\nЧтобы сменить, отправьте: <code>/name новое-имя</code>":
+        "🏷 <b>Server name</b>: {name}\nIt is shown at the start of every bot message.\n\nTo change it, send: <code>/name new-name</code>",
+    "↩️ Как в config.yaml":
+        "↩️ As in config.yaml",
+    "Имя может содержать буквы, цифры, пробел и знаки . _ - ( ), не длиннее {n} символов.":
+        "The name may contain letters, digits, spaces and . _ - ( ), up to {n} characters.",
+    "✅ Имя сервера: {name}":
+        "✅ Server name: {name}",
+    "Имя как в config.yaml: {name}":
+        "Name as in config.yaml: {name}",
 }

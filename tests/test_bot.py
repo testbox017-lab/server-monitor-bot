@@ -86,6 +86,12 @@ class HostNameTest(unittest.TestCase):
             self.assertEqual(checks.host_name({"server_name": "  "}), "ubuntu-1gb-hel1-1")
             self.assertEqual(checks.host_name({"server_name": " prod-1 "}), "prod-1")
 
+    def test_valid_server_name(self):
+        self.assertTrue(checks.valid_server_name("ubuntu-cx23"))
+        self.assertTrue(checks.valid_server_name("Прод (Hetzner) 1.2_a"))
+        for bad in ("", "<b>x</b>", "a&b", "$x$", "a\nb", "x" * 65):
+            self.assertFalse(checks.valid_server_name(bad), bad)
+
 
 class StepTest(unittest.TestCase):
     def setUp(self):
@@ -1304,6 +1310,34 @@ class BotButtonsTest(unittest.TestCase):
         self.assertEqual(b.STATE.known_ips, [])
         q, _ = self.press("set:sec")
         self.assertIn("Безопасность", q.edit_message_text.await_args.args[0])
+        b.S.reset()
+
+    def test_server_name_from_telegram(self):
+        b = self.bot
+        b.S.reset()
+        upd = mock.MagicMock()
+        upd.effective_chat.id = 42
+        upd.effective_chat.type = "private"
+        upd.effective_message.reply_text = mock.AsyncMock()
+        ctx = mock.MagicMock()
+        with mock.patch.object(checks.platform, "node", return_value="old-host"):
+            self.assertEqual(b.host(), "old-host")
+            ctx.args = ["ubuntu-cx23"]
+            asyncio.run(b.cmd_name(upd, ctx))
+            self.assertEqual(b.host(), "ubuntu-cx23")  # сразу, без перезапуска
+            saved = json.loads((TMP / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["server_name"], "ubuntu-cx23")
+            self.assertIn("ubuntu-cx23", b.group_text([NS(text="x")]))
+            ctx.args = ["<b>bad</b>"]
+            asyncio.run(b.cmd_name(upd, ctx))
+            self.assertIn("Имя может содержать", upd.effective_message.reply_text.await_args.args[0])
+            self.assertEqual(b.host(), "ubuntu-cx23")
+            q, _ = self.press("set:name")
+            self.assertIn("ubuntu-cx23", q.edit_message_text.await_args.args[0])
+            self.assertIn("name:reset", self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"]))
+            self.press("name:reset")
+            self.assertEqual(b.host(), "old-host")
+            self.assertNotIn("server_name", b.S.overrides)
         b.S.reset()
 
     def test_probe_command_and_buttons(self):

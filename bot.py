@@ -47,7 +47,12 @@ STATE = checks.AlertState.load(S.dir / "state.json")
 HIST = history.History(S.dir / "metrics.db")
 ACT = actions.Actions(S.dir / "actions.log")
 INC = incidents.Incidents(S.dir / "metrics.db")
-HOST = checks.host_name(CFG)
+
+
+def host() -> str:
+    """Имя сервера в сообщениях: из «Настройки → Имя сервера» или config.yaml, иначе hostname."""
+    return checks.host_name(CFG)
+
 
 # ---------- Клавиатуры ----------
 
@@ -138,7 +143,7 @@ def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMar
 
 
 def group_text(alerts: list) -> str:
-    lines = [f"<b>{html.escape(HOST)}</b>", _('Сразу {len} событий:', len=len(alerts))]
+    lines = [f"<b>{html.escape(host())}</b>", _('Сразу {len} событий:', len=len(alerts))]
     for a in alerts:
         lines.append("• " + html.escape(a.text[:300]))
     text = "\n".join(lines)
@@ -187,7 +192,7 @@ def chart_kb(period: str) -> InlineKeyboardMarkup:
 
 
 async def make_chart(period: str) -> tuple[bytes | None, str]:
-    png = await asyncio.to_thread(history.chart_png, HIST, period, checks.tz(CFG), HOST)
+    png = await asyncio.to_thread(history.chart_png, HIST, period, checks.tz(CFG), host())
     caption = await asyncio.to_thread(history.chart_caption, HIST, period)
     return png, caption
 
@@ -277,6 +282,7 @@ def settings_text() -> str:
         _('Проверок снаружи: {len}', len=len(CFG.get('probes') or []))
         + (_(', SSL предупреждать за {v} дн.',
              v=CFG.get('ssl_warn_days') or 14) if CFG.get("ssl_alerts", True) else ""),
+        _('Имя сервера: {name}', name=html.escape(host())),
         _('Часовой пояс: {tz}', tz=CFG.get('tz')),
         _('Версия бота: {short}', short=updater.short(updater.current().get('sha'))),
         _('Язык: {name}', name=i18n.LANGS[i18n.lang()]),
@@ -324,11 +330,42 @@ def settings_kb() -> InlineKeyboardMarkup:
               [Btn(_('🛡 Безопасность'), callback_data="set:sec"), Btn(_('🌐 Сайты и порты'), callback_data="set:probes")],
               [Btn(_('🧠 Умные алерты'), callback_data="set:smart"), Btn(_('💾 Бэкапы'), callback_data="set:backup")],
               [Btn(_('⬆️ Обновление бота'), callback_data="set:update"), Btn(LANG_BTN, callback_data="set:lang")],
+              [Btn(_('🏷 Имя сервера'), callback_data="set:name")],
               [Btn(_('↩️ Сбросить к config.yaml'), callback_data="set:reset")])
 
 
 def back() -> Btn:
     return Btn(_('⬅️ Назад'), callback_data="set")
+
+
+SERVER_NAME_MAX = 64
+
+
+def name_view() -> tuple[str, InlineKeyboardMarkup]:
+    text = _('🏷 <b>Имя сервера</b>: {name}\n'
+             'Оно стоит в начале каждого сообщения бота.\n'
+             '\n'
+             'Чтобы сменить, отправьте: <code>/name новое-имя</code>',
+             name=html.escape(host()))
+    rows = []
+    if "server_name" in S.overrides:
+        rows.append([Btn(_('↩️ Как в config.yaml'), callback_data="name:reset")])
+    return text, InlineKeyboardMarkup(rows + [[back()]])
+
+
+async def cmd_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    name = " ".join(ctx.args or []).strip()
+    if not name:
+        await send(update, *name_view())
+        return
+    if not checks.valid_server_name(name, SERVER_NAME_MAX):
+        await send(update, _('Имя может содержать буквы, цифры, пробел и знаки . _ - ( ), не длиннее {n} символов.',
+                             n=SERVER_NAME_MAX))
+        return
+    S.set("server_name", name)
+    await send(update, _('✅ Имя сервера: {name}', name=html.escape(host())), None)
 
 
 def thresholds_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -546,7 +583,7 @@ async def report_update(bot) -> None:
         return
     STATE.update_reported = res.get("finished")
     STATE.save()
-    await broadcast(bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(updater.result_text(res))}")
+    await broadcast(bot, f"<b>{html.escape(host())}</b>\n{html.escape(updater.result_text(res))}")
 
 
 BACKUP_TIMES = (None, "03:45", "05:00")
@@ -614,7 +651,7 @@ async def send_backups(bot, chat_ids: list[int], own: Path | None = None, watche
         own = backups.own_dir(S.dir) / files[0][0] if files else None
     if own is not None:
         for c in chat_ids:
-            await send_file(bot, c, own, _('💾 Копия бота {HOST}. Внутри токен, не пересылайте.', HOST=HOST))
+            await send_file(bot, c, own, _('💾 Копия бота {HOST}. Внутри токен, не пересылайте.', HOST=host()))
     if watched:
         for i, st in enumerate(await asyncio.to_thread(backups.watched_status) or []):
             path, err = await asyncio.to_thread(backups.fetch, i)
@@ -622,7 +659,7 @@ async def send_backups(bot, chat_ids: list[int], own: Path | None = None, watche
                 errors.append(f"{st['path']}: {err}")
                 continue
             for c in chat_ids:
-                await send_file(bot, c, path, _('💾 {path} на {HOST}', path=st['path'], HOST=HOST))
+                await send_file(bot, c, path, _('💾 {path} на {HOST}', path=st['path'], HOST=host()))
     return errors
 
 
@@ -874,7 +911,7 @@ def set_maint(until: float) -> str:
 
 
 def maint_end_text() -> str:
-    lines = [f"<b>{html.escape(HOST)}</b>", _('✅ Обслуживание закончилось, алерты снова приходят.')]
+    lines = [f"<b>{html.escape(host())}</b>", _('✅ Обслуживание закончилось, алерты снова приходят.')]
     probs = [k for k, s in STATE.since.items()]
     if probs:
         lines.append(_('Сейчас есть проблемы, алерты по ним придут в ближайшие минуты: ')
@@ -1005,7 +1042,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         "quiet": quiet_view, "remind": remind_view, "summary": summary_view,
                         "docker": docker_view, "sec": security_view, "probes": probes_view,
                         "smart": smart_view, "backup": backup_view,
-                        "update": update_view, "lang": lang_view}[sub]
+                        "update": update_view, "lang": lang_view, "name": name_view}[sub]
                 await edit(update, *view())
         elif cmd == "th":
             key, delta = parts[1], int(parts[2])
@@ -1129,7 +1166,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     if path is None:
                         await send(update, _('Не удалось: {escape}', escape=html.escape(err)))
                     else:
-                        await send_file(ctx.bot, chat[0], path, _('💾 {name} с {HOST}', name=path.name, HOST=HOST))
+                        await send_file(ctx.bot, chat[0], path, _('💾 {name} с {HOST}', name=path.name, HOST=host()))
             elif sub == "verify":
                 await q.answer(_('Проверяю копии, это может занять пару минут…'))
                 answered = True
@@ -1206,6 +1243,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await handle_act(update, parts)
         elif cmd in ("do", "no"):
             note = await handle_confirm(update, cmd, parts[1])
+        elif cmd == "name":
+            if parts[1] == "reset":
+                S.unset("server_name")
+                note = _('Имя как в config.yaml: {name}', name=host())
+            await edit(update, *name_view())
         elif cmd == "lang":
             if parts[1] in i18n.LANGS:
                 await set_language(update, ctx, parts[1])
@@ -1452,7 +1494,7 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     for a in alerts:
         markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
-        text = f"<b>{html.escape(HOST)}</b>\n{html.escape(a.text)}"
+        text = f"<b>{html.escape(host())}</b>\n{html.escape(a.text)}"
         if a.send == "quiet":
             await broadcast(ctx.bot, text, markup, silent=True)
         else:
@@ -1530,7 +1572,7 @@ async def run_autoban(bot) -> None:
     if STATE.muted(now) or checks.in_quiet_hours(CFG, now):
         return  # не критично: видно в журнале, в «Заблокированных IP» и в недельном отчёте
     btns = [[b] for b in (act_btn(_('✅ Разблокировать {ip}', ip=ip), f"act:unban:{ip}") for ip, __ in banned[:5]) if b]
-    await broadcast(bot, f"<b>{html.escape(HOST)}</b>\n{html.escape(text)}", InlineKeyboardMarkup(btns) if btns else None)
+    await broadcast(bot, f"<b>{html.escape(host())}</b>\n{html.escape(text)}", InlineKeyboardMarkup(btns) if btns else None)
 
 
 async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1542,7 +1584,7 @@ async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Не удалось сделать копию бота")
         await broadcast(ctx.bot, _('<b>{escape}</b>\n'
                                    '❌ Не удалось сделать копию бота: {escape2}',
-                                   escape=html.escape(HOST), escape2=html.escape(str(e))))
+                                   escape=html.escape(host()), escape2=html.escape(str(e))))
         return
     if CFG.get("backup_send_daily"):
         try:
@@ -1569,12 +1611,12 @@ async def verify_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Ошибка проверки копий")
         await broadcast(ctx.bot, _('<b>{escape}</b>\n'
                                    '❌ Не удалось проверить копии: {escape2}',
-                                   escape=html.escape(HOST), escape2=html.escape(str(e))))
+                                   escape=html.escape(host()), escape2=html.escape(str(e))))
         return
     v = STATE.verify_last
     log.info("Проверка копий: %s", "есть ошибки" if backups.verify_failed(v["results"]) else "ok")
     if backups.verify_failed(v["results"]) or v.get("err"):
-        await broadcast(ctx.bot, f"<b>{html.escape(HOST)}</b>\n{text}")
+        await broadcast(ctx.bot, f"<b>{html.escape(host())}</b>\n{text}")
 
 
 def weekly_extra() -> list[str]:
@@ -1595,13 +1637,13 @@ async def send_weekly(bot, chat_ids: list[int]) -> None:
         now = time.time()
         text = incidents.weekly_text(CFG, INC, HIST, now, weekly_extra())
         try:
-            png = history.chart_png(HIST, "7d", checks.tz(CFG), HOST, now)
+            png = history.chart_png(HIST, "7d", checks.tz(CFG), host(), now)
         except Exception:
             log.exception("Не удалось построить график для отчёта")
             png = None
         return text, png
     text, png = await asyncio.to_thread(build)
-    text = f"<b>{html.escape(HOST)}</b>\n{text}"
+    text = f"<b>{html.escape(host())}</b>\n{text}"
     for c in chat_ids:
         try:
             await bot.send_message(c, text, parse_mode=ParseMode.HTML)
@@ -1644,7 +1686,7 @@ def reschedule(app: Application) -> None:
 COMMANDS = [("status", N_('📊 Состояние сервера')), ("procs", N_('🔝 Процессы по CPU')), ("mem", N_('💾 Процессы по памяти')),
             ("services", N_('⚙️ Службы и контейнеры')), ("net", N_('🌐 Сеть и диск')), ("alerts", N_('🚨 Активные алерты')), ("incidents", N_('📒 Журнал инцидентов')), ("chart", N_('📈 График за сутки')),
             ("logs", N_('📜 Логи контейнера')), ("probe", N_('🌐 Сайты и порты')), ("backup", N_('🗄 Резервные копии')),
-            ("actions", N_('🧰 Действия с сервером')), ("settings", N_('🛠 Настройки')), ("mute", N_('🔕 Выключить уведомления на 1 ч')),
+            ("actions", N_('🧰 Действия с сервером')), ("settings", N_('🛠 Настройки')), ("name", N_('🏷 Имя сервера')), ("mute", N_('🔕 Выключить уведомления на 1 ч')),
             ("unmute", N_('🔔 Включить уведомления')),
             ("maint", N_('🔧 Обслуживание 30 мин (/maint 2h, /maint off)',
                          )), ("lang", LANG_BTN), ("start", N_('👋 Клавиатура и помощь'))]
@@ -1663,7 +1705,7 @@ async def on_startup(app: Application) -> None:
     reboot_msg = checks.check_reboot(STATE)
     parts = []
     if CFG.get("notify_on_start", True):
-        parts.append(_('▶️ Мониторинг запущен на {escape}', escape=html.escape(HOST)))
+        parts.append(_('▶️ Мониторинг запущен на {escape}', escape=html.escape(host())))
     if reboot_msg:
         parts.append(reboot_msg)
     if STATE.load_error:
@@ -1685,7 +1727,7 @@ def build_app() -> Application:
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
                      ("probe", cmd_probe), ("backup", cmd_backup), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
-                     ("unmute", cmd_unmute), ("maint", cmd_maint), ("lang", cmd_lang)]:
+                     ("unmute", cmd_unmute), ("maint", cmd_maint), ("lang", cmd_lang), ("name", cmd_name)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

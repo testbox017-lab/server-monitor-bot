@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import psutil
+import pkgupdates
 from i18n import N_, _
 
 HELPER = "/usr/local/sbin/monitor-bot-action"
@@ -23,6 +24,9 @@ HELPER_ERRORS = {
     "not banned by monitor-bot": N_('этот IP блокировал не бот'),
     "unknown command": N_('помощник на сервере не обновлён (нет такой команды)'),
     "refused: bot update is running": N_('это процесс обновления бота, его нельзя останавливать'),
+    "refused: package upgrade is running": N_('это установка обновлений пакетов, её нельзя прерывать'),
+    "package upgrade is already running": N_('установка обновлений уже идёт'),
+    "package upgrade is running": N_('идёт установка обновлений, списки обновлю после неё'),
 }
 
 
@@ -125,6 +129,8 @@ class Actions:
             res = self._helper("ban-ip", p.arg, timeout=30)
         elif p.kind == "unban":
             res = self._helper("unban-ip", p.arg, timeout=30)
+        elif p.kind == "apt":
+            res = self._helper("apt-upgrade", p.arg, timeout=30)
         elif p.kind == "prunebak":
             res = self._helper("prune-bak", p.arg, timeout=300)
         else:
@@ -160,6 +166,7 @@ def describe(p: Pending) -> str:
         "reboot": _('перезагрузка сервера'),
         "update": _('обновление бота до {arg}', arg=p.arg[:7]),
         "prunebak": _('удаление старых копий кода'),
+        "apt": _('установка обновлений пакетов: {what}', what=pkgupdates.mode_text(p.arg)),
         "ban": _('блокировка IP {arg}', arg=p.arg),
         "unban": _('разблокировка IP {arg}', arg=p.arg),
     }.get(p.kind, p.kind)

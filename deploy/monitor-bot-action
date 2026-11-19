@@ -21,6 +21,10 @@
     ban-ip IP|NET          — запретить входящие с IP или подсети IPv4 не шире /24 через ufw (не локальные адреса
                              и не адреса с открытой SSH-сессией)
     unban-ip IP|NET        — снять запрет, поставленный ботом
+    apt-refresh            — обновить списки пакетов (apt-get update)
+    apt-upgrade MODE       — установить обновления пакетов: MODE = security (только из -security) или all
+                             (apt-get upgrade, без удаления пакетов). Идёт в отдельной службе systemd,
+                             результат в /run/monitor-bot-apt.json, полный вывод в /var/log/monitor-bot-apt.log
     docker-poll            — docker ps -a и docker inspect всех контейнеров одним вызовом (JSON)
     banned-list            — IP, запрещённые ботом (JSON)
     pull-stream            — для ПК: tar с последними копиями (бот + папки backup-watch) в stdout.
@@ -100,6 +104,19 @@ CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 # (остановка apt/dpkg посреди установки ломает пакеты)
 PROTECTED_PREFIXES = ("systemd", "containerd", "sshd", "apt", "dpkg", "unattended-upgr")
 PROTECTED_UNITS = ("monitor-bot-update-",)   # само обновление бота
+APT_UNIT = "monitor-bot-apt-"                # установка обновлений пакетов
+APT_RESULT = "/run/monitor-bot-apt.json"
+APT_LOCK = "/run/monitor-bot-apt.lock"
+APT_LOG = "/var/log/monitor-bot-apt.log"
+APT_MODES = ("security", "all")
+PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,127}$")
+APT_LINE_RE = re.compile(r"^(\S+?)/(\S+)\s+(\S+)")
+# Без вопросов, конфиги пакетов не трогаем (оставляем свои), службы на старых библиотеках перезапускает
+# needrestart. Ждём, пока apt занят другим процессом (например, unattended-upgrades), до 5 минут.
+APT_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
+           "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "a", "APT_LISTCHANGES_FRONTEND": "none"}
+APT_OPTS = ["-y", "-q", "-o", "DPkg::Lock::Timeout=300", "-o", "Dpkg::Options::=--force-confdef",
+            "-o", "Dpkg::Options::=--force-confold"]
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -160,6 +177,8 @@ def kill(pid_s: str) -> None:
         cgroup = ""
     if any(u in cgroup for u in PROTECTED_UNITS):
         die("refused: bot update is running")
+    if APT_UNIT in cgroup:
+        die("refused: package upgrade is running")
     os.kill(pid, signal.SIGTERM)
     print(f"SIGTERM sent to {pid} ({name})")
 
@@ -687,6 +706,126 @@ def update(sha: str) -> None:
     print(f"started {unit}")
 
 
+# ---------- Обновления пакетов ----------
+
+def apt_upgradable() -> dict[str, tuple[str, bool]] | None:
+    """{пакет: (новая версия, из -security)} по apt list --upgradable. None — apt не ответил."""
+    try:
+        r = subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True, timeout=120,
+                           env=APT_ENV, encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for ln in r.stdout.splitlines():
+        m = APT_LINE_RE.match(ln.strip())
+        if m and PKG_RE.match(m.group(1)):
+            out[m.group(1)] = (m.group(3), "-security" in m.group(2))
+    return out
+
+
+def apt_refresh() -> None:
+    if os.path.exists(APT_LOCK):
+        die("package upgrade is running", 1)
+    r = subprocess.run(["apt-get", "-q", "-o", "DPkg::Lock::Timeout=120", "update"], capture_output=True,
+                       text=True, timeout=600, env=APT_ENV)
+    if r.returncode != 0:
+        die("\n".join((r.stderr or r.stdout).strip().splitlines()[-5:]) or "apt-get update failed", 1)
+    pk = apt_upgradable() or {}
+    print(f"upgradable {len(pk)}, security {sum(s for __, s in pk.values())}")
+
+
+def write_apt_result(data: dict) -> None:
+    data["finished"] = time.time()
+    tmp = APT_RESULT + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, APT_RESULT)
+
+
+def restarted_services(log: str) -> list[str]:
+    """Службы, которые перезапустил needrestart: строки « systemctl restart a.service b.service»."""
+    out = []
+    for ln in log.splitlines():
+        ln = ln.strip()
+        if ln.startswith("systemctl restart "):
+            out += [u for u in ln.split()[2:] if NAME_RE.match(u) and u not in out]
+    return out
+
+
+def apt_upgrade_run(mode: str) -> None:
+    """Выполняется в отдельной службе systemd: перезапуск служб (и самого бота) её не прервёт."""
+    if mode not in APT_MODES:
+        die("bad mode")
+    try:
+        lock = os.open(APT_LOCK, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        die("package upgrade is already running", 1)
+    result = {"mode": mode, "ok": False, "started": time.time(), "upgraded": [], "left": []}
+    try:
+        before = apt_upgradable()
+        if before is None:
+            result["error"] = "apt list failed"
+            return
+        if mode == "security":
+            names = sorted(n for n, (__, sec) in before.items() if sec)
+            if not names:
+                result["ok"] = True
+                return
+            cmd = ["apt-get", *APT_OPTS, "install", "--only-upgrade", "--", *names]
+        else:
+            names = sorted(before)
+            if not names:
+                result["ok"] = True
+                return
+            cmd = ["apt-get", *APT_OPTS, "upgrade"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=APT_ENV,
+                           encoding="utf-8", errors="replace")
+        log = (r.stdout or "") + (r.stderr or "")
+        try:
+            fd = os.open(APT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd[:12])}\n{log}")
+        except OSError:
+            pass
+        after = apt_upgradable() or {}
+        result["upgraded"] = [n for n in names if after.get(n, (None,))[0] != before[n][0]]
+        result["left"] = [n for n in names if n in after]
+        result["restarted"] = restarted_services(log)
+        result["log_tail"] = "\n".join(log.strip().splitlines()[-8:])[-1000:]
+        if r.returncode != 0:
+            result["error"] = f"apt-get exit {r.returncode}"
+        else:
+            result["ok"] = True
+    except Exception as e:  # noqa: BLE001
+        result["error"] = str(e)[:300]
+    finally:
+        result["reboot_required"] = os.path.exists("/var/run/reboot-required")
+        try:
+            with open("/var/run/reboot-required.pkgs", encoding="utf-8") as f:
+                result["reboot_pkgs"] = sorted({ln.strip() for ln in f if ln.strip()})[:20]
+        except OSError:
+            result["reboot_pkgs"] = []
+        write_apt_result(result)
+        os.close(lock)
+        os.remove(APT_LOCK)
+
+
+def apt_upgrade(mode: str) -> None:
+    if mode not in APT_MODES:
+        die("bad mode")
+    if os.path.exists(APT_LOCK):
+        die("package upgrade is already running", 1)
+    unit = APT_UNIT + time.strftime("%Y%m%d-%H%M%S")
+    r = run(["systemd-run", f"--unit={unit}", "--collect", "--quiet", "/usr/bin/python3", "-I",
+             os.path.realpath(__file__), "apt-upgrade-run", mode], timeout=30)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or "systemd-run failed", 1)
+    print(f"started {unit}")
+
+
 def bak_dirs() -> list[tuple[str, float]]:
     parent = os.path.dirname(APP_DIR)
     out = []
@@ -959,6 +1098,12 @@ def main(argv: list[str]) -> None:
         backup_verify()
     elif cmd == "docker" and args:
         docker_cmd(list(args))
+    elif cmd == "apt-refresh" and not args:
+        apt_refresh()
+    elif cmd == "apt-upgrade" and len(args) == 1:
+        apt_upgrade(args[0])
+    elif cmd == "apt-upgrade-run" and len(args) == 1:
+        apt_upgrade_run(args[0])
     elif cmd == "docker-poll" and not args:
         docker_poll()
     else:

@@ -16,7 +16,7 @@ from i18n import _
 EDITABLE = ("thresholds", "check_interval_sec", "services", "containers", "processes", "disks",
             "quiet_hours", "remind_min", "daily_summary", "tz", "notify_on_start",
             "containers_auto", "log_alerts", "log_alert_min", "log_patterns",
-            "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts",
+            "ssh_alerts", "ssh_alert_all_logins", "ssh_fail_threshold", "port_alerts", "update_alerts", "update_alerts_all",
             "autoban", "autoban_threshold", "autoban_hours", "autoban_whitelist",
             "autoban_hour_threshold", "autoban_net_ips", "autoban_repeat_forever", "log_check_min",
             "probes", "probe_fail_count", "ssl_alerts", "ssl_warn_days",
@@ -50,6 +50,7 @@ DEFAULTS = {
     "ssh_fail_threshold": 30,       # неудачных попыток за 10 мин для алерта (0 = выкл)
     "port_alerts": True,            # новый открытый наружу порт
     "update_alerts": True,          # обновления безопасности Ubuntu
+    "update_alerts_all": False,     # сообщать и об обычных обновлениях (не только безопасности)
     "autoban": True,                # сам блокировать IP, который подбирает пароль SSH
     "autoban_threshold": 10,        # неудачных попыток с одного IP за 10 мин
     "autoban_hours": 24,            # на сколько (0 = навсегда)

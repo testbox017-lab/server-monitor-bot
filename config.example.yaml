@@ -79,7 +79,8 @@ ssh_alerts: true            # вход по SSH с нового IP и подбо
 ssh_alert_all_logins: false
 ssh_fail_threshold: 30      # неудачных попыток за 10 минут для алерта
 port_alerts: true           # новый открытый наружу порт
-update_alerts: true         # обновления безопасности Ubuntu
+update_alerts: true         # обновления безопасности Ubuntu (список и установка: /updates)
+update_alerts_all: false    # сообщать и об обычных обновлениях пакетов
 
 # Умные алерты (переключаются и кнопками в «Настройки → 🧠 Умные алерты»)
 anomaly_alerts: true        # CPU/RAM намного выше обычного для этого часа (нужно 3 дня истории)

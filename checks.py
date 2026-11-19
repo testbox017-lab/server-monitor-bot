@@ -533,6 +533,7 @@ class AlertState:
     bak_small: dict[str, str] = field(default_factory=dict)    # о какой маленькой копии уже писали
     bak_events: list[str] = field(default_factory=list)
     update_reported: float | None = None                       # о каком обновлении уже сообщили
+    apt_reported: float | None = None                          # о какой установке пакетов уже сообщили
     verify_last: dict = field(default_factory=dict)            # последняя проверка копий: ts, results, err
     autobans: dict[str, float] = field(default_factory=dict)   # автобан: IP → до какого времени (0 = навсегда)
     autoban_skip: dict[str, float] = field(default_factory=dict)  # IP, которые помощник не дал заблокировать

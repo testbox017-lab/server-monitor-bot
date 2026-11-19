@@ -39,6 +39,7 @@ import pkgupdates  # noqa: E402
 pkgupdates.RESULT_FILE = TMP / "no-apt-result.json"
 pkgupdates.LOCK_FILE = TMP / "no-apt-lock"
 pkgupdates.REBOOT_FILE = TMP / "no-reboot-required"
+pkgupdates._CACHE.update(t=float("inf"), pkgs=[])  # карточка статуса в тестах не вызывает настоящий apt
 backups.HELPER = actions.HELPER = checks.HELPER  # и бэкапы, и действия: на сервере sudo к настоящему помощнику работает
 
 
@@ -2598,6 +2599,22 @@ class PackageUpdatesTest(unittest.TestCase):
                                     "phased": ["distro-info"]})
         self.assertIn("⏸ Отложены Ubuntu (поэтапный выпуск, придут позже): 1 (distro-info)", t)
         self.assertIn("Остались без обновления: 1 (vim)", t)
+
+    def test_status_lines(self):
+        pk = pkgupdates.parse(APT_LIST)
+        pk[2].held = "phased"
+        with mock.patch.object(pkgupdates, "upgradable", return_value=pk) as up, \
+                mock.patch.dict(pkgupdates._CACHE, {"t": 0.0, "pkgs": None}):
+            self.assertEqual(pkgupdates.status_lines(),
+                             ["📦 Обновления: 3 (🛡 безопасности: 2, ⏸ отложено: 1)"])
+            pkgupdates._CACHE.update(t=time.time(), pkgs=pk)
+            pkgupdates.status_lines()
+            up.assert_called_once()                              # второй раз из кэша
+            pkgupdates._CACHE.update(t=time.time(), pkgs=[])
+            self.assertEqual(pkgupdates.status_lines(), ["📦 Обновления: нет"])
+            pkgupdates.invalidate()
+            up.return_value = None
+            self.assertEqual(pkgupdates.status_lines(), [])     # apt недоступен — строки нет
 
     def test_last_result_and_reboot(self):
         f = TMP / "apt-result.json"

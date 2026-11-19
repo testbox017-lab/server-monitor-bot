@@ -136,6 +136,9 @@ def status_text(cfg: dict) -> str:
         lines.append(_('🐳 Контейнеры:'))
         for name, cpu, mem in stats:
             lines.append(f"  • {html.escape(name)}: CPU {html.escape(cpu)}, RAM {html.escape(mem)}")
+    if cfg.get("update_alerts", True):
+        import pkgupdates
+        lines += pkgupdates.status_lines()
     return "\n".join(lines)
 
 

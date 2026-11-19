@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from i18n import _
@@ -97,7 +98,41 @@ def upgradable() -> list[Pkg] | None:
         h = held()
         for p in pkgs:
             p.held = h.get(p.name, "")
+    _CACHE.update(t=time.time(), pkgs=pkgs)
     return pkgs
+
+
+_CACHE: dict = {"t": 0.0, "pkgs": None}
+CACHE_SEC = 600  # карточка статуса не дёргает apt при каждом нажатии «Обновить»
+
+
+def cached(max_age: float = CACHE_SEC) -> list[Pkg] | None:
+    """Последний список не старше max_age секунд, иначе спрашиваем apt заново."""
+    if _CACHE["pkgs"] is not None and time.time() - _CACHE["t"] < max_age:
+        return _CACHE["pkgs"]
+    return upgradable()
+
+
+def invalidate() -> None:
+    _CACHE.update(t=0.0, pkgs=None)
+
+
+def status_lines() -> list[str]:
+    """Строки для карточки статуса сервера: сколько обновлений и нужна ли перезагрузка."""
+    pkgs = cached()
+    out = []
+    if pkgs is not None:
+        if not pkgs:
+            out.append(_('📦 Обновления: нет'))
+        else:
+            sec = sum(p.security for p in pkgs)
+            held_n = sum(bool(p.held) for p in pkgs)
+            extra = [x for x in (_('🛡 безопасности: {n}', n=sec) if sec else "",
+                                 _('⏸ отложено: {n}', n=held_n) if held_n else "") if x]
+            out.append(_('📦 Обновления: {len}', len=len(pkgs)) + (f" ({', '.join(extra)})" if extra else ""))
+    if reboot_info() is not None:
+        out.append(_('♻️ Серверу нужна перезагрузка'))
+    return out
 
 
 def installable(pkgs: list[Pkg], mode: str) -> list[Pkg]:

@@ -1098,6 +1098,16 @@ UK = {
         '⏸ — apt утримує оновлення: йому потрібні нові пакети (часто так буває з ядром). Встановлюється вручну: apt full-upgrade.',
     '⏸ Отложены Ubuntu (поэтапный выпуск, придут позже): {len} ({names})':
         '⏸ Відкладені Ubuntu (поетапний випуск, прийдуть пізніше): {len} ({names})',
+    '📦 Обновления: нет':
+        '📦 Оновлення: немає',
+    '🛡 безопасности: {n}':
+        '🛡 безпеки: {n}',
+    '⏸ отложено: {n}':
+        '⏸ відкладено: {n}',
+    '📦 Обновления: {len}':
+        '📦 Оновлення: {len}',
+    '📦 Обновления':
+        '📦 Оновлення',
 }
 
 EN = {
@@ -2195,4 +2205,14 @@ EN = {
         '⏸ — apt is holding this update back: it needs new packages (common with the kernel). Install manually: apt full-upgrade.',
     '⏸ Отложены Ubuntu (поэтапный выпуск, придут позже): {len} ({names})':
         '⏸ Deferred by Ubuntu (phased rollout, will come later): {len} ({names})',
+    '📦 Обновления: нет':
+        '📦 Updates: none',
+    '🛡 безопасности: {n}':
+        '🛡 security: {n}',
+    '⏸ отложено: {n}':
+        '⏸ deferred: {n}',
+    '📦 Обновления: {len}':
+        '📦 Updates: {len}',
+    '📦 Обновления':
+        '📦 Updates',
 }

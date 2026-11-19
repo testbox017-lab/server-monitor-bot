@@ -75,7 +75,7 @@ def kb(*rows) -> InlineKeyboardMarkup:
 def status_kb() -> InlineKeyboardMarkup:
     return kb([Btn(_('🔄 Обновить'), callback_data="status"), Btn(_('📈 График'), callback_data="chart:24h")],
               [Btn(_('🔝 Процессы'), callback_data="procs:cpu:10"), Btn(_('⚙️ Службы'), callback_data="services")],
-              [Btn(_('🌐 Сеть и диск'), callback_data="net")])
+              [Btn(_('🌐 Сеть и диск'), callback_data="net"), Btn(_('📦 Обновления'), callback_data="pkg:view:new")])
 
 
 def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
@@ -632,6 +632,7 @@ async def report_apt(bot) -> None:
     first = STATE.apt_reported is None and time.time() - (res.get("finished") or 0) > 3600
     STATE.apt_reported = res.get("finished")
     STATE.save()
+    pkgupdates.invalidate()  # после установки список в карточке статуса устарел
     if first:
         return  # старый результат (например, после обновления бота) не присылаем
     if res.get("left") and "phased" not in res:

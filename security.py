@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import pkgupdates
 from i18n import _
 
 # «Accepted publickey for root from 1.2.3.4 port 5 ssh2: ED25519 SHA256:abc» — отпечаток ключа в конце
@@ -238,10 +239,8 @@ def listening_ports() -> set[str] | None:
 # ---------- Обновления ----------
 
 def security_updates() -> list[str] | None:
-    out = run(["apt", "list", "--upgradable"], timeout=60)
-    if out is None:
-        return None
-    return sorted({ln.split("/")[0] for ln in out.splitlines() if "-security" in ln})
+    pkgs = pkgupdates.upgradable()
+    return None if pkgs is None else [p.name for p in pkgs if p.security]
 
 
 # ---------- Сигнал «я жив» ----------
@@ -306,7 +305,7 @@ def ssh_week_lines(state, now: float) -> list[str]:
 # ---------- Итерация ----------
 
 def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
-           ssh_text_fn=ssh_log, ports_fn=listening_ports, updates_fn=security_updates) -> list:
+           ssh_text_fn=ssh_log, ports_fn=listening_ports, updates_fn=pkgupdates.upgradable) -> list:
     from checks import Alert  # избегаем циклического импорта
 
     out: list = []
@@ -374,13 +373,21 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool,
                 if new:
                     state.known_ports = sorted(set(state.known_ports) | set(new))
 
-    # Обновления безопасности — раз в 6 часов, напоминание не чаще раза в сутки
+    # Обновления пакетов — раз в 6 часов, напоминание не чаще раза в сутки. По умолчанию пишем, только если
+    # есть обновления безопасности; update_alerts_all — и об обычных. Под сообщением кнопка со списком.
     if cfg.get("update_alerts", True) and now - state.updates_checked >= 6 * 3600:
         state.updates_checked = now
-        pkgs = updates_fn()
-        if pkgs and not quiet and now - state.updates_alert_at >= 86400:
+        pkgs = updates_fn() or []
+        sec = [p.name for p in pkgs if p.security]
+        if (sec or (pkgs and cfg.get("update_alerts_all"))) and not quiet and now - state.updates_alert_at >= 86400:
             state.updates_alert_at = now
-            names = ", ".join(pkgs[:8]) + (_(' и др.') if len(pkgs) > 8 else "")
-            out.append(Alert(_('🩹 Доступны обновления безопасности Ubuntu: {len} ({names})',
-                               len=len(pkgs), names=names), None, "event"))
+            if sec:
+                text = _('🩹 Доступны обновления безопасности Ubuntu: {len} ({names})',
+                         len=len(sec), names=pkgupdates.names_short(sec))
+                if len(pkgs) > len(sec):
+                    text += _('. Всего обновлений: {len}', len=len(pkgs))
+            else:
+                text = _('📦 Доступны обновления Ubuntu: {len} ({names})',
+                         len=len(pkgs), names=pkgupdates.names_short([p.name for p in pkgs]))
+            out.append(Alert(text, "apt:updates", "event"))
     return out

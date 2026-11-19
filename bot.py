@@ -28,6 +28,7 @@ import checks
 import history
 import incidents
 import network
+import pkgupdates
 import probes
 import security
 import updater
@@ -163,6 +164,7 @@ def actions_menu() -> tuple[str, InlineKeyboardMarkup]:
     rows += [svcs[i:i + 3] for i in range(0, len(svcs), 3)]
     rows.append([Btn(_('🧹 Очистить место'), callback_data="act:clean"),
                  Btn(_('⛔ Остановить процесс'), callback_data="act:killmenu")])
+    rows.append([Btn(_('📦 Обновления пакетов'), callback_data="pkg:view")])
     rows.append([Btn(_('📜 Журнал действий'), callback_data="act:log"),
                  Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
     text = (_('🧰 <b>Действия</b>\n'
@@ -504,6 +506,9 @@ def security_view() -> tuple[str, InlineKeyboardMarkup]:
                    onoff=onoff(CFG.get('port_alerts', True))), callback_data="sec:port_alerts")],
             [Btn(_('{onoff} Обновления безопасности',
                    onoff=onoff(CFG.get('update_alerts', True))), callback_data="sec:update_alerts")],
+            [Btn(_('{onoff} И обычные обновления пакетов',
+                   onoff=onoff(CFG.get('update_alerts_all'))), callback_data="sec:update_alerts_all"),
+             Btn(_('📦 Список'), callback_data="pkg:view:new")],
             [Btn(_('🧽 Забыть известные IP ({len})', len=len(STATE.known_ips)), callback_data="secforget")],
             [b for b in [act_btn(_('🚫 Заблокированные IP'), "act:banned")] if b],
             [back()]]
@@ -584,6 +589,54 @@ async def report_update(bot) -> None:
     STATE.update_reported = res.get("finished")
     STATE.save()
     await broadcast(bot, f"<b>{html.escape(host())}</b>\n{html.escape(updater.result_text(res))}")
+
+
+def pkg_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Доступные обновления пакетов Ubuntu и кнопки установки. Блокирующая (apt), вызывать в потоке."""
+    pkgs = pkgupdates.upgradable()
+    busy = pkgupdates.running()
+    reboot = pkgupdates.reboot_info()
+    lines = [_('📦 <b>Обновления пакетов</b>')] + [html.escape(ln) for ln in pkgupdates.view_lines(pkgs)]
+    text = "\n".join(lines)
+    if len(text) > 3000:
+        text = text[:3000] + "\n…"
+    lines = [text]
+    age = pkgupdates.lists_age()
+    if age:
+        lines.append(_('Списки пакетов обновлены: {local_dt}', local_dt=local_dt(age)))
+    if reboot is not None:
+        lines.append(_('♻️ Серверу нужна перезагрузка')
+                     + (f" ({html.escape(pkgupdates.names_short(reboot))})" if reboot else ""))
+    if busy:
+        lines.append(_('⏳ Сейчас идёт установка обновлений, результат придёт отдельным сообщением.'))
+    rows = [[Btn(_('🔍 Проверить заново'), callback_data="pkg:refresh")]]
+    if actions_on() and pkgs and not busy:
+        sec = sum(p.security for p in pkgs)
+        if sec:
+            rows.append([Btn(_('🛡 Установить обновления безопасности ({n})', n=sec), callback_data="pkg:go:security")])
+        rows.append([Btn(_('⬆️ Установить все ({n})', n=len(pkgs)), callback_data="pkg:go:all")])
+    if actions_on() and reboot is not None:
+        rows.append([Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
+    lines.append(_('\n🛡 — обновление безопасности. Установка идёт через помощник с подтверждением; настройки '
+                   'пакетов не меняются, пакеты не удаляются. Сервер сам не перезагружается.'))
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def report_apt(bot) -> None:
+    """Сообщить результат установки обновлений один раз (файл пишет помощник)."""
+    res = await asyncio.to_thread(pkgupdates.last_result)
+    if not res or res.get("finished") == STATE.apt_reported:
+        return
+    first = STATE.apt_reported is None and time.time() - (res.get("finished") or 0) > 3600
+    STATE.apt_reported = res.get("finished")
+    STATE.save()
+    if first:
+        return  # старый результат (например, после обновления бота) не присылаем
+    rows = [[Btn(_('📦 Обновления пакетов'), callback_data="pkg:view:new")]]
+    if res.get("reboot_required") and actions_on():
+        rows.append([Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
+    await broadcast(bot, f"<b>{html.escape(host())}</b>\n{html.escape(pkgupdates.result_text(res))}",
+                    InlineKeyboardMarkup(rows))
 
 
 BACKUP_TIMES = (None, "03:45", "05:00")
@@ -825,6 +878,11 @@ async def cmd_actions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, _('Действия выключены (actions_enabled: false в config.yaml)'))
         return
     await send(update, *actions_menu())
+
+
+async def cmd_updates(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await send(update, *(await asyncio.to_thread(pkg_view)))
 
 
 async def cmd_probe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1101,7 +1159,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await send(update, text, logs_kb(name, tail))
         elif cmd == "sec":
             key = parts[1]
-            default = key != "ssh_alert_all_logins"
+            default = key not in ("ssh_alert_all_logins", "update_alerts_all")
             S.set(key, not CFG.get(key, default))
             await edit(update, *security_view())
         elif cmd == "abthr":
@@ -1195,6 +1253,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await edit(update, text, net_kb())
             else:
                 await send(update, text, net_kb())
+        elif cmd == "pkg":
+            if parts[1] == "refresh":  # apt-get update бывает долгим, кнопку отпускаем сразу
+                await q.answer(_('Обновляю списки пакетов, это может занять минуту…'))
+                answered = True
+            note = await handle_pkg(update, parts)
         elif cmd == "up":
             sub = parts[1]
             if sub == "check":
@@ -1374,6 +1437,42 @@ async def handle_act(update: Update, parts: list[str]) -> None:
                    confirm_kb(token, _('Да, перезагрузить')))
 
 
+async def handle_pkg(update: Update, parts: list[str]) -> str | None:
+    sub = parts[1]
+    if sub == "view":
+        view = await asyncio.to_thread(pkg_view)
+        await (send if len(parts) > 2 else edit)(update, *view)
+    elif sub == "refresh":
+        ok, out = await asyncio.to_thread(ACT._helper, "apt-refresh", timeout=600)
+        await edit(update, *(await asyncio.to_thread(pkg_view)))
+        if not ok:
+            await send(update, _('Не удалось обновить списки пакетов: {escape}', escape=html.escape(out[-500:])))
+    elif sub == "go":
+        mode = parts[2] if len(parts) > 2 else ""
+        if not actions_on():
+            return _('Действия выключены в config.yaml')
+        if mode not in pkgupdates.MODES:
+            return _('неизвестное действие')
+        if pkgupdates.running():
+            return _('установка обновлений уже идёт')
+        pkgs = await asyncio.to_thread(pkgupdates.upgradable) or []
+        chosen = [p for p in pkgs if p.security] if mode == "security" else pkgs
+        if not chosen:
+            return _('Нечего устанавливать')
+        token = ACT.ask("apt", mode, update.effective_chat.id)
+        await send(update, _('📦 Установить {what}: {len} пак.?\n'
+                             '<code>{names}</code>\n'
+                             '\n'
+                             'Установка идёт в фоне, обычно 1–5 минут. Службы, которые используют обновлённые '
+                             'библиотеки, перезапустятся автоматически (это может быть Docker с контейнерами и сам '
+                             'бот), поэтому бот может ненадолго замолчать. Настройки пакетов не меняются, пакеты не '
+                             'удаляются. Сервер сам не перезагружается: если перезагрузка нужна, бот напишет.',
+                             what=pkgupdates.mode_text(mode), len=len(chosen),
+                             names=html.escape(pkgupdates.names_short([p.name for p in chosen], 20))),
+                   confirm_kb(token, N_('✅ Да, установить')))
+    return None
+
+
 async def ask_ban(update: Update, ip: str) -> None:
     import ipaddress
     try:
@@ -1434,6 +1533,10 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
     ACT.drop(token)
     await edit(update, _('⏳ Выполняю: {describe}…', describe=actions.describe(p)))
     ok, out = await asyncio.to_thread(ACT.execute, p)
+    if p.kind == "apt" and ok:
+        await edit(update, _('⏳ Установка обновлений запущена ({what}). Результат пришлю, когда закончится, '
+                             'обычно через 1–5 минут.', what=pkgupdates.mode_text(p.arg)))
+        return None
     if p.kind == "update" and ok:
         await edit(update, _('⏳ Обновление до {arg} запущено. Сначала тесты новой версии, потом перезапуск. '
                              'Результат пришлю через 1–3 минуты.',
@@ -1488,12 +1591,18 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await report_update(ctx.bot)
     except Exception:
         log.exception("Не удалось сообщить результат обновления")
+    try:
+        await report_apt(ctx.bot)
+    except Exception:
+        log.exception("Не удалось сообщить результат установки пакетов")
     alerts = [a for a in alerts if a.send != "journal"]  # деплой и т.п.: только в журнале инцидентов
     if CFG.get("group_alerts", True) and len(alerts) > 3:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return
     for a in alerts:
         markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
+        if a.key == "apt:updates":
+            markup = kb([Btn(_('📦 Показать и установить'), callback_data="pkg:view:new")])
         text = f"<b>{html.escape(host())}</b>\n{html.escape(a.text)}"
         if a.send == "quiet":
             await broadcast(ctx.bot, text, markup, silent=True)
@@ -1686,7 +1795,7 @@ def reschedule(app: Application) -> None:
 COMMANDS = [("status", N_('📊 Состояние сервера')), ("procs", N_('🔝 Процессы по CPU')), ("mem", N_('💾 Процессы по памяти')),
             ("services", N_('⚙️ Службы и контейнеры')), ("net", N_('🌐 Сеть и диск')), ("alerts", N_('🚨 Активные алерты')), ("incidents", N_('📒 Журнал инцидентов')), ("chart", N_('📈 График за сутки')),
             ("logs", N_('📜 Логи контейнера')), ("probe", N_('🌐 Сайты и порты')), ("backup", N_('🗄 Резервные копии')),
-            ("actions", N_('🧰 Действия с сервером')), ("settings", N_('🛠 Настройки')), ("name", N_('🏷 Имя сервера')), ("mute", N_('🔕 Выключить уведомления на 1 ч')),
+            ("actions", N_('🧰 Действия с сервером')), ("updates", N_('📦 Обновления пакетов')), ("settings", N_('🛠 Настройки')), ("name", N_('🏷 Имя сервера')), ("mute", N_('🔕 Выключить уведомления на 1 ч')),
             ("unmute", N_('🔔 Включить уведомления')),
             ("maint", N_('🔧 Обслуживание 30 мин (/maint 2h, /maint off)',
                          )), ("lang", LANG_BTN), ("start", N_('👋 Клавиатура и помощь'))]
@@ -1726,7 +1835,7 @@ def build_app() -> Application:
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
                      ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
-                     ("probe", cmd_probe), ("backup", cmd_backup), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
+                     ("probe", cmd_probe), ("backup", cmd_backup), ("updates", cmd_updates), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
                      ("unmute", cmd_unmute), ("maint", cmd_maint), ("lang", cmd_lang), ("name", cmd_name)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))

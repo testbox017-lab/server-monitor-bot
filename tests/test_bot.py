@@ -34,6 +34,7 @@ backups.OFFSITE_STATUS = TMP / "no-offsite-status.json"  # тесты не чи�
 # На сервере помощник установлен, и docker пошёл бы через sudo. Тесты не должны зависеть от этого.
 checks.HELPER = str(TMP / "no-helper")
 import actions  # noqa: E402
+import pkgupdates  # noqa: E402
 backups.HELPER = actions.HELPER = checks.HELPER  # и бэкапы, и действия: на сервере sudo к настоящему помощнику работает
 
 
@@ -308,6 +309,7 @@ import importlib.util  # noqa: E402
 import subprocess  # noqa: E402
 
 import actions  # noqa: E402
+import pkgupdates  # noqa: E402
 
 
 def load_helper():
@@ -737,10 +739,22 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.ev(T0 + 120), [])
 
     def test_updates_daily(self):
-        self.updates = ["openssl", "libc6"]
-        self.assertEqual(len(self.ev(T0)), 1)
+        self.updates = [pkgupdates.Pkg("openssl", "2", "1", "noble-security"),
+                        pkgupdates.Pkg("libc6", "2", "1", "noble-updates,noble-security"),
+                        pkgupdates.Pkg("vim", "2", "1", "noble-updates")]
+        a = self.ev(T0)
+        self.assertEqual(len(a), 1)
+        self.assertIn("безопасности Ubuntu: 2 (openssl, libc6). Всего обновлений: 3", a[0].text)
+        self.assertEqual(a[0].key, "apt:updates")         # под сообщением кнопка со списком
         self.assertEqual(self.ev(T0 + 7 * 3600), [])        # проверено, но напоминание раз в сутки
         self.assertEqual(len(self.ev(T0 + 25 * 3600)), 1)
+
+    def test_updates_regular_only_when_enabled(self):
+        self.updates = [pkgupdates.Pkg("vim", "2", "1", "noble-updates")]
+        self.assertEqual(self.ev(T0), [])                    # без безопасности по умолчанию молчим
+        self.cfg["update_alerts_all"] = True
+        a = self.ev(T0 + 7 * 3600)
+        self.assertEqual([x.text for x in a], ["📦 Доступны обновления Ubuntu: 1 (vim)"])
 
     def test_muted_and_quiet(self):
         self.ssh = SSH_LOG
@@ -1159,7 +1173,8 @@ class BotButtonsTest(unittest.TestCase):
              mock.patch.object(checks, "container_states", return_value={"weather-bot": "running"}), \
              mock.patch.object(checks, "container_info", return_value={}), \
              mock.patch.object(checks, "container_stats", return_value=[("weather-bot", "0.5%", "50MiB")]), \
-             mock.patch.object(checks, "container_logs", return_value="line <b>1</b>"):
+             mock.patch.object(checks, "container_logs", return_value="line <b>1</b>"), \
+             mock.patch.object(pkgupdates, "upgradable", return_value=[]):
             while todo:
                 d = todo.pop()
                 if d in seen or d == "set:reset":
@@ -2516,6 +2531,255 @@ class Part4Test(unittest.TestCase):
                          (20, 2, 5))
         self.assertTrue(s.cfg["autoban_repeat_forever"])
         self.assertEqual(s.cfg["deploy_keys"], [])
+
+
+APT_LIST = """Listing...
+openssl/noble-updates,noble-security 3.0.13-0ubuntu3.5 amd64 [upgradable from: 3.0.13-0ubuntu3.4]
+vim/noble-updates 2:9.1.0016-1ubuntu7.9 amd64 [upgradable from: 2:9.1.0016-1ubuntu7.8]
+libc6/noble-security 2.39-0ubuntu8.6 amd64 [upgradable from: 2.39-0ubuntu8.5]
+"""
+
+
+class PackageUpdatesTest(unittest.TestCase):
+    """Список обновлений пакетов, установка через помощник, отчёт о результате."""
+
+    def test_parse(self):
+        pk = pkgupdates.parse(APT_LIST)
+        self.assertEqual([p.name for p in pk], ["libc6", "openssl", "vim"])  # сначала безопасность
+        self.assertEqual([p.security for p in pk], [True, True, False])
+        self.assertEqual(pk[1].old, "3.0.13-0ubuntu3.4")
+        self.assertEqual(pk[2].new, "2:9.1.0016-1ubuntu7.9")
+        self.assertEqual(pkgupdates.pkg_line(pk[1]), "🛡 openssl 3.0.13-0ubuntu3.4 → 3.0.13-0ubuntu3.5")
+
+    def test_view_lines(self):
+        self.assertIn("apt", pkgupdates.view_lines(None)[0])
+        self.assertEqual(pkgupdates.view_lines([]), ["✅ Все пакеты обновлены"])
+        many = [pkgupdates.Pkg(f"p{i:02}", "2", "1", "noble-updates") for i in range(pkgupdates.LIST_MAX + 5)]
+        lines = pkgupdates.view_lines(many)
+        self.assertEqual(lines[0], f"Доступно обновлений: {len(many)}, из них безопасности: 0")
+        self.assertEqual(lines[-1], "…и ещё 5")
+        self.assertEqual(len(lines), pkgupdates.LIST_MAX + 2)
+
+    def test_result_text(self):
+        t = pkgupdates.result_text({"mode": "security", "ok": True, "upgraded": ["openssl", "libc6"],
+                                    "restarted": ["cron.service"], "reboot_required": True,
+                                    "reboot_pkgs": ["linux-image-generic"]})
+        self.assertIn("✅ Установлены обновления безопасности: 2 пак. (openssl, libc6)", t)
+        self.assertIn("Перезапущены службы: cron.service", t)
+        self.assertIn("♻️ Нужна перезагрузка сервера (linux-image-generic)", t)
+        t = pkgupdates.result_text({"mode": "all", "ok": False, "error": "apt-get exit 100",
+                                    "upgraded": [], "left": ["vim"], "log_tail": "E: Broken"})
+        self.assertIn("❌ Установка (все обновления) не удалась: apt-get exit 100", t)
+        self.assertIn("Остались без обновления: 1 (vim)", t)
+        self.assertIn("E: Broken", t)
+        t = pkgupdates.result_text({"mode": "all", "ok": True, "upgraded": []})
+        self.assertIn("новых версий не было", t)
+
+    def test_last_result_and_reboot(self):
+        f = TMP / "apt-result.json"
+        self.assertIsNone(pkgupdates.last_result(f))
+        f.write_text("[1]")
+        self.assertIsNone(pkgupdates.last_result(f))
+        f.write_text('{"ok": true}')
+        self.assertEqual(pkgupdates.last_result(f), {"ok": True})
+        with mock.patch.object(pkgupdates, "REBOOT_FILE", TMP / "no-reboot"):
+            self.assertIsNone(pkgupdates.reboot_info())
+        (TMP / "reboot-required").write_text("")
+        (TMP / "reboot-required.pkgs").write_text("linux-base\nlinux-base\n")
+        with mock.patch.object(pkgupdates, "REBOOT_FILE", TMP / "reboot-required"), \
+             mock.patch.object(pkgupdates, "REBOOT_PKGS", TMP / "reboot-required.pkgs"):
+            self.assertEqual(pkgupdates.reboot_info(), ["linux-base"])
+
+
+class HelperAptTest(unittest.TestCase):
+    """Команды помощника apt-upgrade / apt-upgrade-run без настоящего apt."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.h = load_helper()
+
+    def setUp(self):
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        self.res, self.lock, self.log = d / "apt.json", d / "apt.lock", d / "apt.log"
+        self.patches = [mock.patch.object(self.h, "APT_RESULT", str(self.res)),
+                        mock.patch.object(self.h, "APT_LOCK", str(self.lock)),
+                        mock.patch.object(self.h, "APT_LOG", str(self.log))]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def fake_run(self, lists, apt_rc=0, apt_out="Setting up openssl\n"):
+        """subprocess.run: apt list отдаёт lists по очереди, apt-get — apt_rc."""
+        calls = []
+        lists = list(lists)
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:2] == ["apt", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, lists.pop(0), "")
+            return subprocess.CompletedProcess(cmd, apt_rc, apt_out, "")
+        return run, calls
+
+    def test_upgradable(self):
+        run, __ = self.fake_run([APT_LIST + "bad name/x 1 amd64\n"])
+        with mock.patch.object(self.h.subprocess, "run", side_effect=run):
+            pk = self.h.apt_upgradable()
+        self.assertEqual(pk, {"openssl": ("3.0.13-0ubuntu3.5", True), "vim": ("2:9.1.0016-1ubuntu7.9", False),
+                              "libc6": ("2.39-0ubuntu8.6", True)})
+
+    def test_security_run(self):
+        after = "Listing...\nvim/noble-updates 2:9.1.0016-1ubuntu7.9 amd64 [upgradable from: 1]\n"
+        out = "Setting up openssl\nRestarting services...\n systemctl restart cron.service ssh.service\n"
+        run, calls = self.fake_run([APT_LIST, after], apt_out=out)
+        with mock.patch.object(self.h.subprocess, "run", side_effect=run):
+            self.h.apt_upgrade_run("security")
+        apt = [c for c in calls if c[0] == "apt-get"][0]
+        self.assertEqual(apt[-4:], ["--only-upgrade", "--", "libc6", "openssl"])  # только безопасность
+        self.assertIn("Dpkg::Options::=--force-confold", apt)
+        res = json.loads(self.res.read_text())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["upgraded"], ["libc6", "openssl"])
+        self.assertEqual(res["left"], [])
+        self.assertEqual(res["restarted"], ["cron.service", "ssh.service"])
+        self.assertFalse(self.lock.exists())                  # замок снят
+        self.assertIn("Setting up openssl", self.log.read_text())
+
+    def test_all_run_failure(self):
+        run, calls = self.fake_run([APT_LIST, APT_LIST], apt_rc=100, apt_out="E: dpkg was interrupted\n")
+        with mock.patch.object(self.h.subprocess, "run", side_effect=run):
+            self.h.apt_upgrade_run("all")
+        self.assertEqual([c for c in calls if c[0] == "apt-get"][0][-1], "upgrade")
+        res = json.loads(self.res.read_text())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "apt-get exit 100")
+        self.assertEqual(res["upgraded"], [])
+        self.assertEqual(sorted(res["left"]), ["libc6", "openssl", "vim"])
+        self.assertIn("dpkg was interrupted", res["log_tail"])
+
+    def test_nothing_to_do(self):
+        run, calls = self.fake_run(["Listing...\nvim/noble-updates 2 amd64 [upgradable from: 1]\n"])
+        with mock.patch.object(self.h.subprocess, "run", side_effect=run):
+            self.h.apt_upgrade_run("security")
+        self.assertFalse([c for c in calls if c[0] == "apt-get"])
+        self.assertTrue(json.loads(self.res.read_text())["ok"])
+
+    def test_refuses(self):
+        for fn in (self.h.apt_upgrade, self.h.apt_upgrade_run):
+            with self.assertRaises(SystemExit), mock.patch("sys.stdout", io.StringIO()):
+                fn("everything; rm -rf /")
+        self.lock.write_text("")
+        with self.assertRaises(SystemExit), mock.patch("sys.stdout", io.StringIO()) as out, \
+                mock.patch.object(self.h, "run") as r:
+            self.h.apt_upgrade("all")
+        r.assert_not_called()
+        self.assertIn("already running", out.getvalue())
+        with self.assertRaises(SystemExit), mock.patch("sys.stdout", io.StringIO()):
+            self.h.main(["apt-upgrade"])                       # без режима — неизвестная команда
+
+    def test_starts_in_own_unit(self):
+        with mock.patch.object(self.h, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as r, \
+                mock.patch("sys.stdout", io.StringIO()):
+            self.h.apt_upgrade("security")
+        cmd = r.call_args.args[0]
+        self.assertEqual(cmd[0], "systemd-run")
+        self.assertTrue(cmd[1].startswith("--unit=monitor-bot-apt-"))
+        self.assertEqual(cmd[-2:], ["apt-upgrade-run", "security"])
+
+
+class BotPackagesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    press = BotButtonsTest.press
+    all_callbacks = BotButtonsTest.all_callbacks
+
+    def setUp(self):
+        self.pk = pkgupdates.parse(APT_LIST)
+        self.patches = [mock.patch.object(pkgupdates, "upgradable", side_effect=lambda: list(self.pk)),
+                        mock.patch.object(pkgupdates, "LOCK_FILE", TMP / "no-apt-lock"),
+                        mock.patch.object(pkgupdates, "REBOOT_FILE", TMP / "no-reboot")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_view_and_install(self):
+        b = self.bot
+        q, __ = self.press("pkg:view")
+        text = q.edit_message_text.await_args.args[0]
+        self.assertIn("Доступно обновлений: 3, из них безопасности: 2", text)
+        self.assertIn("🛡 openssl", text)
+        cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+        self.assertIn("pkg:go:security", cbs)
+        self.assertIn("pkg:go:all", cbs)
+        self.assertNotIn("act:reboot", cbs)
+        q, upd = self.press("pkg:go:security")
+        ask = upd.effective_message.reply_text.await_args
+        self.assertIn("2 пак.", ask.args[0])
+        self.assertIn("libc6, openssl", ask.args[0])
+        yes = self.all_callbacks(ask.kwargs["reply_markup"])[0]
+        with mock.patch.object(b.ACT, "_helper", return_value=(True, "started")) as hp:
+            q, __ = self.press(yes)
+        hp.assert_called_once_with("apt-upgrade", "security", timeout=30)
+        self.assertIn("Установка обновлений запущена", q.edit_message_text.await_args.args[0])
+        q, __ = self.press("pkg:go:rm")
+        self.assertEqual(q.answer.await_args.args[0], "неизвестное действие")
+
+    def test_nothing_or_busy(self):
+        self.pk = [p for p in self.pk if not p.security]
+        q, __ = self.press("pkg:go:security")
+        self.assertEqual(q.answer.await_args.args[0], "Нечего устанавливать")
+        lock = TMP / "apt-lock-busy"
+        lock.write_text("")
+        with mock.patch.object(pkgupdates, "LOCK_FILE", lock):
+            q, __ = self.press("pkg:view")
+            self.assertIn("идёт установка", q.edit_message_text.await_args.args[0])
+            cbs = self.all_callbacks(q.edit_message_text.await_args.kwargs["reply_markup"])
+            self.assertFalse([c for c in cbs if c.startswith("pkg:go")])
+        self.pk = []
+        q, __ = self.press("pkg:view")
+        self.assertIn("Все пакеты обновлены", q.edit_message_text.await_args.args[0])
+
+    def test_refresh(self):
+        with mock.patch.object(self.bot.ACT, "_helper", return_value=(False, "помощник на сервере не обновлён")) as hp:
+            q, upd = self.press("pkg:refresh")
+        hp.assert_called_once_with("apt-refresh", timeout=600)
+        q.answer.assert_awaited()
+        self.assertIn("Не удалось обновить списки", upd.effective_message.reply_text.await_args.args[0])
+
+    def test_report_once(self):
+        b = self.bot
+        f = TMP / "apt-report.json"
+        res = {"mode": "security", "ok": True, "upgraded": ["openssl"], "reboot_required": True,
+               "finished": time.time()}
+        f.write_text(json.dumps(res))
+        bot_api = mock.MagicMock()
+        bot_api.send_message = mock.AsyncMock()
+        b.STATE.apt_reported = 1.0
+        with mock.patch.object(pkgupdates, "RESULT_FILE", f), mock.patch.object(b.STATE, "save"):
+            asyncio.run(b.report_apt(bot_api))
+            asyncio.run(b.report_apt(bot_api))       # второй раз не шлём
+        bot_api.send_message.assert_awaited_once()
+        kw = bot_api.send_message.await_args
+        self.assertIn("Установлены обновления безопасности: 1 пак. (openssl)", kw.args[1])
+        self.assertIn("act:reboot", self.all_callbacks(kw.kwargs["reply_markup"]))
+        # первый запуск новой версии бота: старый результат не присылаем
+        res["finished"] = time.time() - 7200
+        f.write_text(json.dumps(res))
+        b.STATE.apt_reported = None
+        bot_api.send_message.reset_mock()
+        with mock.patch.object(pkgupdates, "RESULT_FILE", f), mock.patch.object(b.STATE, "save"):
+            asyncio.run(b.report_apt(bot_api))
+        bot_api.send_message.assert_not_awaited()
+        self.assertEqual(b.STATE.apt_reported, res["finished"])
 
 
 if __name__ == "__main__":

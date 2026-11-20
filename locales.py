@@ -714,6 +714,12 @@ UK = {
         "<pre>  CPU%  RAM%    PID  Ім'я",
     "📜 Не удалось получить логи {escape} (нет контейнера или доступа к docker)":
         "📜 Не вдалося отримати логи {escape} (немає контейнера або доступу до docker)",
+    "📜 Не удалось получить логи службы {escape} (нет службы или доступа к журналу)":
+        "📜 Не вдалося отримати логи служби {escape} (немає служби або доступу до журналу)",
+    "🔁 Служба {name} упала, systemd перезапустил её (всего {n})":
+        "🔁 Служба {name} впала, systemd перезапустив її (усього {n})",
+    "🚀 Служба {name} перезапущена вручную или обновлена":
+        "🚀 Службу {name} перезапущено вручну або оновлено",
     "(пусто)":
         "(порожньо)",
     "📜 <b>{escape}</b>, последние {tail} строк\n<pre>{escape2}</pre>":
@@ -1821,6 +1827,12 @@ EN = {
         "<pre>  CPU%  RAM%    PID  Name",
     "📜 Не удалось получить логи {escape} (нет контейнера или доступа к docker)":
         "📜 Could not get logs for {escape} (no such container or no access to docker)",
+    "📜 Не удалось получить логи службы {escape} (нет службы или доступа к журналу)":
+        "📜 Could not get logs for service {escape} (no such service or no access to the journal)",
+    "🔁 Служба {name} упала, systemd перезапустил её (всего {n})":
+        "🔁 Service {name} crashed, systemd restarted it (total {n})",
+    "🚀 Служба {name} перезапущена вручную или обновлена":
+        "🚀 Service {name} was restarted manually or updated",
     "(пусто)":
         "(empty)",
     "📜 <b>{escape}</b>, последние {tail} строк\n<pre>{escape2}</pre>":

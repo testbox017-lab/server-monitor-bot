@@ -174,6 +174,78 @@ class StepTest(unittest.TestCase):
         self.assertLess(t - 1_800_000_000, 86400)
 
 
+class ServiceEventsTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"log_services": ["hetzner-bot"], "log_alert_min": 15, "log_check_min": 1}
+        self.st = checks.AlertState()
+
+    def ev(self, now, inv="a", restarts=0, up=5000.0, logs="", recovered=(), muted=False, quiet=False):
+        info = {"hetzner-bot": {"inv": inv, "restarts": restarts, "up": up}}
+        return checks.service_events(self.cfg, self.st, now, set(recovered), muted, quiet, info,
+                                     lambda n, since: logs)
+
+    def test_crash_is_loud_manual_restart_is_journal(self):
+        self.assertEqual(self.ev(T0), [])                          # первый раз только запоминаем
+        a = self.ev(T0 + 60, inv="b", restarts=1)                  # systemd поднял после падения
+        self.assertEqual(len(a), 1)
+        self.assertTrue(a[0].text.startswith("🔁 Служба hetzner-bot упала"))
+        self.assertEqual((a[0].key, a[0].send), ("slog:hetzner-bot", "loud"))
+        self.assertEqual(self.ev(T0 + 120, inv="b", restarts=1), [])
+        a = self.ev(T0 + 180, inv="c", restarts=0)                 # systemctl restart сбрасывает NRestarts
+        self.assertEqual(len(a), 1)
+        self.assertTrue(a[0].text.startswith("🚀 Служба hetzner-bot перезапущена"))
+        self.assertEqual((a[0].key, a[0].send), ("deploy:hetzner-bot", "journal"))
+        import incidents
+        self.assertEqual(incidents.event_kind(a[0].text), "деплои")
+
+    def test_boot_and_recovered_are_not_reported(self):
+        self.ev(T0)
+        self.assertEqual(self.ev(T0 + 60, inv="b", restarts=0, up=20.0), [])   # поднялась вместе с сервером
+        self.assertEqual(self.ev(T0 + 120, inv="c", restarts=1, recovered={"svc:hetzner-bot"}), [])
+        self.assertEqual(self.ev(T0 + 180, inv="", restarts=1), [])            # остановлена: не трогаем
+        self.assertEqual(self.st.svc_inv["hetzner-bot"], "c")
+
+    def test_errors_in_journal(self):
+        self.ev(T0)
+        tb = "Traceback (most recent call last):\nAttributeError: 'Server' object has no attribute 'datacenter'"
+        a = self.ev(T0 + 60, logs=tb)
+        self.assertEqual(len(a), 1)
+        self.assertTrue(a[0].text.startswith("⚠️ Ошибки в логах hetzner-bot"))
+        self.assertEqual(a[0].key, "slog:hetzner-bot")
+        self.assertIn("svc:hetzner-bot", self.st.log_checked)          # не путается с контейнером того же имени
+        self.assertNotIn("hetzner-bot", self.st.log_checked)
+        self.assertEqual(self.ev(T0 + 120, logs=tb), [])               # не чаще log_alert_min
+        net = "ERROR:aiogram:Failed to fetch updates - TelegramNetworkError: ClientConnectorError"
+        self.st.log_alert_at.clear()
+        a = self.ev(T0 + 200, logs=net)
+        self.assertTrue(a[0].text.startswith("🌐 Сетевые ошибки в логах hetzner-bot"))
+        self.assertEqual(a[0].send, "quiet")
+        self.cfg["log_alerts"] = False
+        self.st.log_alert_at.clear()
+        self.assertEqual(self.ev(T0 + 400, logs=tb), [])
+
+    def test_nothing_configured(self):
+        self.assertEqual(checks.service_events({}, self.st, T0, set(), False, False), [])
+        self.assertEqual(checks.log_services({"log_services": ["ok-name", "-bad", 5, "getty@tty1"]}),
+                         ["ok-name", "getty@tty1"])
+
+    def test_service_info_and_logs_commands(self):
+        out = "InvocationID=abc\nNRestarts=2\nActiveEnterTimestampMonotonic=7000000\n"
+        run = mock.Mock(return_value=NS(returncode=0, stdout=out, stderr=""))
+        with mock.patch.object(checks, "IS_WINDOWS", False), \
+             mock.patch.object(checks.shutil, "which", return_value="/usr/bin/x"), \
+             mock.patch.object(checks.subprocess, "run", run):
+            self.assertEqual(checks.service_info(["hetzner-bot"]),
+                             {"hetzner-bot": {"inv": "abc", "restarts": 2, "up": 7.0}})
+            run.return_value = NS(returncode=0, stdout="line\n", stderr="")
+            self.assertEqual(checks.service_logs("hetzner-bot", since=T0), "line\n")
+            args = run.call_args[0][0]
+            self.assertEqual(args[:3], ["journalctl", "-u", "hetzner-bot"])
+            self.assertIn(f"@{T0}", args)
+            self.assertIsNone(checks.service_logs("--all"))
+            self.assertIn("line", checks.logs_text("hetzner-bot", service=True))
+
+
 class DockerEventsTest(unittest.TestCase):
     def setUp(self):
         self.cfg = {"containers": ["weather-bot"], "log_alert_min": 15, "log_check_min": 1}
@@ -1221,6 +1293,18 @@ class BotButtonsTest(unittest.TestCase):
         self.assertIn("logs:weather-bot", self.all_callbacks(b.alert_kb("ctr:weather-bot")))
         self.assertIn("logs:weather-bot", self.all_callbacks(b.alert_kb("log:weather-bot")))
         self.assertNotIn("logs:cpu", self.all_callbacks(b.alert_kb("cpu")))
+
+    def test_alert_kb_service(self):
+        b = self.bot
+        with mock.patch.dict(b.CFG, {"log_services": ["hetzner-bot"], "action_services": ["hetzner-bot"]}):
+            cbs = self.all_callbacks(b.alert_kb("slog:hetzner-bot"))
+            self.assertIn("logs:hetzner-bot", cbs)
+            if b.actions_on():
+                self.assertIn("act:svc:hetzner-bot", cbs)
+            self.assertNotIn("act:ctr:hetzner-bot", cbs)
+            self.assertTrue(b.is_service_log("hetzner-bot"))
+            self.assertFalse(b.is_service_log("weather-bot"))
+            self.assertIn("logs:hetzner-bot", self.all_callbacks(b.services_kb()))
 
     def test_logs_text_escaped(self):
         with mock.patch.object(checks, "container_logs", return_value="<script>" + "x" * 5000):

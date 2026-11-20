@@ -174,6 +174,26 @@ class StepTest(unittest.TestCase):
         self.assertLess(t - 1_800_000_000, 86400)
 
 
+class ServiceSettleTest(unittest.TestCase):
+    def state(self, seq, settle=True):
+        calls = iter(seq)
+        with mock.patch.object(checks, "_service_state_once", side_effect=lambda n: next(calls)), \
+             mock.patch.object(checks.time, "sleep") as sleep:
+            return checks.service_state("hetzner-bot", settle=settle), sleep.call_count
+
+    def test_restart_in_progress_is_not_a_failure(self):
+        self.assertEqual(self.state(["deactivating", "activating", "running"]), ("running", 2))
+        self.assertEqual(self.state(["running"]), ("running", 0))
+        self.assertEqual(self.state(["failed"]), ("failed", 0))           # настоящее падение — сразу
+
+    def test_stuck_in_activating_still_reported(self):
+        st, sleeps = self.state(["activating"] * 10)
+        self.assertEqual((st, sleeps), ("activating", checks.SETTLE_TRIES))
+
+    def test_no_settle_for_display(self):
+        self.assertEqual(self.state(["deactivating"], settle=False), ("deactivating", 0))
+
+
 class ServiceEventsTest(unittest.TestCase):
     def setUp(self):
         self.cfg = {"log_services": ["hetzner-bot"], "log_alert_min": 15, "log_check_min": 1}

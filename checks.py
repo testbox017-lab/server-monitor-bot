@@ -186,8 +186,26 @@ def process_running(pattern: str) -> int:
     return count
 
 
-def service_state(name: str) -> str:
-    """'running' / 'stopped' / 'unknown' и т.п."""
+TRANSITIONAL_STATES = ("activating", "deactivating", "reloading", "refreshing",
+                       "start_pending", "stop_pending", "continue_pending", "pause_pending")
+SETTLE_TRIES, SETTLE_PAUSE = 3, 2.0  # служба в переходном состоянии: до 3 перепроверок через 2 с
+
+
+def service_state(name: str, settle: bool = False) -> str:
+    """'running' / 'stopped' / 'unknown' и т.п.
+    settle=True: если служба как раз перезапускается (deactivating → activating, обычно 1–2 с),
+    подождать и спросить ещё раз, чтобы обновление не выглядело падением. Застрявшая в activating
+    служба (цикл падений с автоперезапуском) после перепроверок всё равно считается неработающей."""
+    st = _service_state_once(name)
+    for _i in range(SETTLE_TRIES if settle else 0):
+        if st not in TRANSITIONAL_STATES:
+            break
+        time.sleep(SETTLE_PAUSE)
+        st = _service_state_once(name)
+    return st
+
+
+def _service_state_once(name: str) -> str:
     if IS_WINDOWS:
         try:
             return psutil.win_service_get(name).status()
@@ -707,7 +725,7 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             res[f"temp:{name}"] = (_('🌡 Перегрев {name}: {t:.0f}°C (порог {temp}°C)', name=name, t=t, temp=th['temp'])
                                    if t >= th["temp"] else None)
     for svc in cfg.get("services", []) or []:
-        st = service_state(svc)
+        st = service_state(svc, settle=True)
         res[f"svc:{svc}"] = None if st == "running" else _('❌ Служба {svc} не работает ({st})', svc=svc, st=st)
     for proc in cfg.get("processes", []) or []:
         res[f"proc:{proc}"] = None if process_running(proc) else _('❌ Процесс {proc} не найден', proc=proc)

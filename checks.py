@@ -367,8 +367,71 @@ def container_logs(name: str, tail: int = 30, since: int | None = None) -> str |
     return (r.stdout or "") + (r.stderr or "")  # docker отдаёт stderr контейнера в stderr
 
 
-def logs_text(name: str, tail: int = 30) -> str:
-    logs = container_logs(name, tail)
+def valid_service(name: str) -> bool:
+    """Имя службы systemd: как у контейнера, плюс «@» (getty@tty1)."""
+    return valid_container(name.replace("@", "_", 1)) if name else False
+
+
+def _systemctl_show(name: str, *props: str) -> dict[str, str] | None:
+    if IS_WINDOWS or not valid_service(name) or not shutil.which("systemctl"):
+        return None
+    args = ["systemctl", "show", name]
+    for p in props:
+        args += ["-p", p]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+
+
+def service_info(names: list[str]) -> dict[str, dict]:
+    """{служба: {inv: InvocationID запуска, restarts: автоперезапусков systemd, up: с какой секунды после загрузки}}.
+    Без sudo: systemctl show доступен любому пользователю."""
+    out = {}
+    for name in names:
+        d = _systemctl_show(name, "InvocationID", "NRestarts", "ActiveEnterTimestampMonotonic")
+        if d is None:
+            continue
+        try:
+            restarts = int(d.get("NRestarts") or 0)
+            up = int(d.get("ActiveEnterTimestampMonotonic") or 0) / 1e6
+        except ValueError:
+            restarts, up = 0, 0.0
+        out[name] = {"inv": d.get("InvocationID", ""), "restarts": restarts, "up": up}
+    return out
+
+
+def service_logs(name: str, tail: int = 30, since: int | None = None) -> str | None:
+    """Журнал службы systemd. Боту нужна группа systemd-journal (как для проверки SSH)."""
+    if IS_WINDOWS or not valid_service(name) or not shutil.which("journalctl"):
+        return None
+    args = ["journalctl", "-u", name, "-o", "cat", "--no-pager", "-q"]
+    args += ["-n", str(tail)] if since is None else ["--since", f"@{int(since)}", "-n", "2000"]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout or ""
+
+
+def log_services(cfg: dict) -> list[str]:
+    """Службы systemd, за журналом и перезапусками которых следим (как за контейнерами)."""
+    return [s for s in (cfg.get("log_services") or []) if isinstance(s, str) and valid_service(s)]
+
+
+def logs_text(name: str, tail: int = 30, service: bool = False) -> str:
+    if service:
+        logs = service_logs(name, tail)
+        if logs is None:
+            return _('📜 Не удалось получить логи службы {escape} (нет службы или доступа к журналу)',
+                     escape=html.escape(name))
+    else:
+        logs = container_logs(name, tail)
     if logs is None:
         return _('📜 Не удалось получить логи {escape} (нет контейнера или доступа к docker)', escape=html.escape(name))
     logs = logs.strip() or _('(пусто)')
@@ -515,6 +578,8 @@ class AlertState:
     seen_containers: list[str] = field(default_factory=list)   # для авто-режима
     ctr_started: dict[str, str] = field(default_factory=dict)  # StartedAt по контейнеру
     ctr_restarts: dict[str, int] = field(default_factory=dict)
+    svc_inv: dict[str, str] = field(default_factory=dict)      # InvocationID запуска службы из log_services
+    svc_restarts: dict[str, int] = field(default_factory=dict)  # NRestarts службы: растёт только при падениях
     log_checked: dict[str, int] = field(default_factory=dict)  # до какого времени логи просмотрены
     log_alert_at: dict[str, float] = field(default_factory=dict)
     ssh_checked: int = 0
@@ -787,6 +852,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             import logging
             logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности')
         out += docker_events(cfg, state, now, recovered, muted, quiet)
+        out += service_events(cfg, state, now, recovered, muted, quiet)
         import probes
         try:
             out += probes.ssl_events(cfg, state, now, muted, quiet)
@@ -899,43 +965,92 @@ def docker_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
 
     if not cfg.get("log_alerts", True):
         return out
+    for name in names:
+        if name in info:
+            out += _scan_logs(cfg, state, now, name, name, f"log:{name}", logs_fn, muted, quiet)
+    return out
+
+
+def _scan_logs(cfg: dict, state: AlertState, now: float, name: str, skey: str, akey: str,
+               logs_fn, muted: bool, quiet: bool) -> list[Alert]:
+    """Ошибки в логах контейнера или службы с прошлого просмотра. skey — ключ в state, akey — ключ алерта."""
     patterns = list(cfg.get("log_patterns") or DEFAULT_LOG_PATTERNS)  # с учётом регистра: ERROR, не «error»
     every = (cfg.get("log_alert_min") or 15) * 60
-    check_every = int(cfg.get("log_check_min") or 5) * 60  # каждый просмотр логов — вызов помощника через sudo
+    check_every = int(cfg.get("log_check_min") or 5) * 60  # каждый просмотр логов контейнера — вызов помощника через sudo
+    since = state.log_checked.get(skey)
+    if since is not None and now - since < check_every - 5:
+        return []  # ещё рано: в следующий раз прочитаем всё с момента since, ничего не потеряется
+    state.log_checked[skey] = int(now)
+    if since is None:
+        return []  # первый запуск: старые ошибки не присылаем
+    if muted or quiet or now - state.log_alert_at.get(skey, 0) < every:
+        return []
+    logs = logs_fn(name, since)
+    if not logs:
+        return []
+    hits = [ln.strip() for ln in logs.splitlines() if any(p in ln for p in patterns)]
+    if not hits:
+        return []
+    state.log_alert_at[skey] = now
+    sample = "\n".join(h[:200] for h in hits[:3])
+    net = network_errors(logs)
+    net_at = state.net_fail_at if now - (state.net_fail_at or 0) < NET_WINDOW else 0
+    if net or net_at:
+        # сбой связи: один инцидент «🌐», без звука — контейнер сам повторит, когда связь вернётся
+        when = _(' (у бота связь пропадала в {fmt_local})', fmt_local=fmt_local(cfg, net_at)) if net_at else ""
+        state.log.append([now, f"net:{name}"])
+        return [Alert(_('🌐 Сетевые ошибки в логах {name}: {len} строк{when}. Похоже на сбой связи, а не '
+                        'на ошибку в коде.\n'
+                        '{sample}',
+                        name=name, len=len(hits), when=when, sample=sample), akey, "event",
+                      "quiet")]
+    state.log.append([now, f"logerr:{name}"])
+    return [Alert(_('⚠️ Ошибки в логах {name}: {len} строк\n'
+                    '{sample}',
+                    name=name, len=len(hits), sample=sample), akey, "event")]
+
+
+def service_events(cfg: dict, state: AlertState, now: float, recovered: set[str],
+                   muted: bool, quiet: bool, info: dict | None = None,
+                   logs_fn=None) -> list[Alert]:
+    """Службы systemd из log_services: падения, ручные перезапуски (деплой) и ошибки в журнале.
+    Падение и ручной перезапуск различаем по NRestarts: systemd увеличивает его только при автоперезапуске
+    после сбоя, а systemctl start/restart сбрасывает в 0."""
+    out: list[Alert] = []
+    names = log_services(cfg)
+    if not names:
+        return out
+    info = service_info(names) if info is None else info
+    logs_fn = logs_fn or (lambda n, since: service_logs(n, since=since))
     for name in names:
-        if name not in info:
+        i = info.get(name)
+        if not i or not i.get("inv"):
+            continue  # служба остановлена: об этом алерт «❌ Служба … не работает», если она в services
+        prev_inv = state.svc_inv.get(name)
+        prev_restarts = state.svc_restarts.get(name)
+        state.svc_inv[name] = i["inv"]
+        state.svc_restarts[name] = i["restarts"]
+        if prev_inv is None or i["inv"] == prev_inv:
             continue
-        since = state.log_checked.get(name)
-        if since is not None and now - since < check_every - 5:
-            continue  # ещё рано: в следующий раз прочитаем всё с момента since, ничего не потеряется
-        state.log_checked[name] = int(now)
-        if since is None:
-            continue  # первый запуск: старые ошибки не присылаем
-        if muted or quiet or now - state.log_alert_at.get(name, 0) < every:
+        if 0 < i.get("up", 0) < BOOT_WINDOW:
+            state.log.append([now, f"boot:{name}"])  # поднялась вместе с сервером
             continue
-        logs = logs_fn(name, since)
-        if not logs:
+        if prev_restarts is not None and i["restarts"] > prev_restarts:
+            if f"svc:{name}" not in recovered and not muted:
+                out.append(Alert(_('🔁 Служба {name} упала, systemd перезапустил её (всего {n})',
+                                   name=name, n=i["restarts"]), f"slog:{name}", "event"))
+                state.log.append([now, f"restart:{name}"])
             continue
-        hits = [ln.strip() for ln in logs.splitlines() if any(p in ln for p in patterns)]
-        if hits:
-            state.log_alert_at[name] = now
-            sample = "\n".join(h[:200] for h in hits[:3])
-            net = network_errors(logs)
-            net_at = state.net_fail_at if now - (state.net_fail_at or 0) < NET_WINDOW else 0
-            if net or net_at:
-                # сбой связи: один инцидент «🌐», без звука — контейнер сам повторит, когда связь вернётся
-                when = _(' (у бота связь пропадала в {fmt_local})', fmt_local=fmt_local(cfg, net_at)) if net_at else ""
-                state.log.append([now, f"net:{name}"])
-                out.append(Alert(_('🌐 Сетевые ошибки в логах {name}: {len} строк{when}. Похоже на сбой связи, а не '
-                                   'на ошибку в коде.\n'
-                                   '{sample}',
-                                   name=name, len=len(hits), when=when, sample=sample), f"log:{name}", "event",
-                                 "quiet"))
-                continue
-            state.log.append([now, f"logerr:{name}"])
-            out.append(Alert(_('⚠️ Ошибки в логах {name}: {len} строк\n'
-                               '{sample}',
-                               name=name, len=len(hits), sample=sample), f"log:{name}", "event"))
+        # перезапуск через systemctl (выкладка новой версии, кнопка «Перезапустить») — не сбой
+        out.append(Alert(_('🚀 Служба {name} перезапущена вручную или обновлена', name=name),
+                         f"deploy:{name}", "event", "journal"))
+        state.log.append([now, f"deploy:{name}"])
+
+    if not cfg.get("log_alerts", True):
+        return out
+    for name in names:
+        if name in info:
+            out += _scan_logs(cfg, state, now, name, f"svc:{name}", f"slog:{name}", logs_fn, muted, quiet)
     return out
 
 

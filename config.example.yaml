@@ -73,6 +73,9 @@ log_alerts: true
 log_alert_min: 15
 # Что считать ошибкой (с учётом регистра). null = Traceback, ERROR, CRITICAL, Exception, FATAL
 log_patterns: null
+# Службы systemd, за которыми следить как за контейнерами: ошибки в журнале (journalctl, нужна группа
+# systemd-journal), падения (systemd перезапустил сам) — громко, перезапуск через systemctl — деплой, только в журнал
+log_services: []   # [hetzner-bot]
 
 # Безопасность (переключается и кнопками в «Настройки → 🛡 Безопасность»)
 ssh_alerts: true            # вход по SSH с нового IP и подбор пароля (боту нужна группа systemd-journal)

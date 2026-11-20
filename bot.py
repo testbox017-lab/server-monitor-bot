@@ -98,13 +98,23 @@ def act_btn(label: str, data: str) -> Btn | None:
     return Btn(label, callback_data=data) if actions_on() and len(data.encode()) <= 64 else None
 
 
+def log_names() -> list[str]:
+    """Чьи логи можно смотреть: контейнеры и службы из log_services."""
+    names = checks.watched_containers(CFG, STATE)
+    return names + [s for s in checks.log_services(CFG) if s not in names]
+
+
+def is_service_log(name: str) -> bool:
+    return name in checks.log_services(CFG) and name not in checks.watched_containers(CFG, STATE)
+
+
 def logs_btn(name: str, label: str | None = None) -> Btn | None:
     data = f"logs:{name}"
     return Btn(label or f"📜 {name}", callback_data=data) if len(data.encode()) <= 60 else None
 
 
 def services_kb() -> InlineKeyboardMarkup:
-    logs = [b for b in (logs_btn(c) for c in checks.watched_containers(CFG, STATE)) if b]
+    logs = [b for b in (logs_btn(c) for c in log_names()) if b]
     return kb([Btn(_('🔄 Обновить'), callback_data="services"),
                Btn(_('✏️ Что отслеживать'), callback_data="set:watch")],
               *[logs[i:i + 2] for i in range(0, len(logs), 2)],
@@ -122,7 +132,13 @@ def active_key(kid: str) -> str | None:
 def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMarkup:
     extra = []
     fix = None
-    if key and key.startswith(("ctr:", "log:")):
+    if key and key.startswith("slog:"):  # служба из log_services: журнал и перезапуск через systemctl
+        b = logs_btn(checks.key_label(key), _('📜 Логи'))
+        if b:
+            extra.append(b)
+        if checks.key_label(key) in action_services():
+            fix = act_btn(_('♻️ Перезапустить'), f"act:svc:{checks.key_label(key)}")
+    elif key and key.startswith(("ctr:", "log:")):
         b = logs_btn(checks.key_label(key), _('📜 Логи'))
         if b:
             extra.append(b)
@@ -857,7 +873,7 @@ async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    names = checks.watched_containers(CFG, STATE)
+    names = log_names()
     if not ctx.args:
         btns = [b for b in (logs_btn(c) for c in names) if b]
         await send(update, _('Чьи логи показать? Или /logs имя_контейнера'),
@@ -869,7 +885,8 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     tail = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 30
     tail = max(1, min(tail, 300))
-    await send(update, await asyncio.to_thread(checks.logs_text, name, tail), logs_kb(name, 30 if tail == 30 else 100))
+    await send(update, await asyncio.to_thread(checks.logs_text, name, tail, is_service_log(name)),
+               logs_kb(name, 30 if tail == 30 else 100))
 
 
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,7 +1176,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         elif cmd == "logs":
             name = parts[1]
             tail = int(parts[2]) if len(parts) > 2 else 30
-            text = await asyncio.to_thread(checks.logs_text, name, tail)
+            text = await asyncio.to_thread(checks.logs_text, name, tail, is_service_log(name))
             if len(parts) > 2:
                 await edit(update, text, logs_kb(name, tail))
             else:
@@ -1607,7 +1624,7 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return
     for a in alerts:
-        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "brute:")) else None
+        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "slog:", "brute:")) else None
         if a.key == "apt:updates":
             markup = kb([Btn(_('📦 Показать и установить'), callback_data="pkg:view:new")])
         text = f"<b>{html.escape(host())}</b>\n{html.escape(a.text)}"

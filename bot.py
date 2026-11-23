@@ -30,6 +30,7 @@ import incidents
 import network
 import pkgupdates
 import probes
+import remote
 import security
 import updater
 from settings import Settings
@@ -75,7 +76,12 @@ def kb(*rows) -> InlineKeyboardMarkup:
 def status_kb() -> InlineKeyboardMarkup:
     return kb([Btn(_('🔄 Обновить'), callback_data="status"), Btn(_('📈 График'), callback_data="chart:24h")],
               [Btn(_('🔝 Процессы'), callback_data="procs:cpu:10"), Btn(_('⚙️ Службы'), callback_data="services")],
-              [Btn(_('🌐 Сеть и диск'), callback_data="net"), Btn(_('📦 Обновления'), callback_data="pkg:view:new")])
+              [Btn(_('🌐 Сеть и диск'), callback_data="net"), Btn(_('📦 Обновления'), callback_data="pkg:view:new")],
+              [Btn(_('🖥 Другие серверы'), callback_data="servers:new")] if remote.servers(CFG) else None)
+
+
+def servers_kb() -> InlineKeyboardMarkup:
+    return kb([Btn(_('🔄 Обновить'), callback_data="servers"), Btn(_('📊 Статус'), callback_data="status:new")])
 
 
 def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
@@ -132,7 +138,10 @@ def active_key(kid: str) -> str | None:
 def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMarkup:
     extra = []
     fix = None
-    if key and key.startswith("slog:"):  # служба из log_services: журнал и перезапуск через systemctl
+    status_btn = Btn(_('📊 Статус сейчас'), callback_data="status:new")
+    if remote.is_remote(key):  # другой сервер: действий с ним пока нет, только его состояние
+        status_btn = Btn(_('🖥 Другие серверы'), callback_data="servers:new")
+    elif key and key.startswith("slog:"):  # служба из log_services: журнал и перезапуск через systemctl
         b = logs_btn(checks.key_label(key), _('📜 Логи'))
         if b:
             extra.append(b)
@@ -155,7 +164,7 @@ def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMar
                Btn(_('💤 Этот на 1 ч'), callback_data=f"snz:{short_id(key)}")]
     return kb(ack,
               [Btn(_('🔕 Все на 1 ч'), callback_data="mute:3600:a"), Btn(_('🌙 До утра'), callback_data="mute:morning:a")],
-              [Btn(_('📊 Статус сейчас'), callback_data="status:new")] + extra,
+              [status_btn] + extra,
               [fix] if fix else None)
 
 
@@ -850,6 +859,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, await asyncio.to_thread(checks.status_text, CFG), status_kb())
 
 
+async def cmd_servers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await send(update, remote.servers_text(CFG), servers_kb())
+
+
 async def cmd_procs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
         await send(update, await asyncio.to_thread(checks.top_processes, 10, "cpu"), procs_kb("cpu", 10))
@@ -1057,6 +1071,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await send(update, text, status_kb())
             else:
                 await edit(update, text, status_kb())
+        elif cmd == "servers":
+            text = remote.servers_text(CFG)
+            if len(parts) > 1:
+                await send(update, text, servers_kb())
+            else:
+                await edit(update, text, servers_kb())
         elif cmd == "procs":
             by, n = parts[1], int(parts[2])
             await edit(update, await asyncio.to_thread(checks.top_processes, n, by), procs_kb(by, n))
@@ -1627,7 +1647,8 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "slog:", "brute:")) else None
         if a.key == "apt:updates":
             markup = kb([Btn(_('📦 Показать и установить'), callback_data="pkg:view:new")])
-        text = f"<b>{html.escape(host())}</b>\n{html.escape(a.text)}"
+        body = a.text.replace(f"[{a.server}] ", "", 1) if a.server else a.text  # имя сервера и так в заголовке
+        text = f"<b>{html.escape(a.server or host())}</b>\n{html.escape(body)}"
         if a.send == "quiet":
             await broadcast(ctx.bot, text, markup, silent=True)
         else:
@@ -1817,7 +1838,7 @@ def reschedule(app: Application) -> None:
 
 
 COMMANDS = [("status", N_('📊 Состояние сервера')), ("procs", N_('🔝 Процессы по CPU')), ("mem", N_('💾 Процессы по памяти')),
-            ("services", N_('⚙️ Службы и контейнеры')), ("net", N_('🌐 Сеть и диск')), ("alerts", N_('🚨 Активные алерты')), ("incidents", N_('📒 Журнал инцидентов')), ("chart", N_('📈 График за сутки')),
+            ("services", N_('⚙️ Службы и контейнеры')), ("servers", N_('🖥 Другие серверы')),("net", N_('🌐 Сеть и диск')), ("alerts", N_('🚨 Активные алерты')), ("incidents", N_('📒 Журнал инцидентов')), ("chart", N_('📈 График за сутки')),
             ("logs", N_('📜 Логи контейнера')), ("probe", N_('🌐 Сайты и порты')), ("backup", N_('🗄 Резервные копии')),
             ("actions", N_('🧰 Действия с сервером')), ("updates", N_('📦 Обновления пакетов')), ("settings", N_('🛠 Настройки')), ("name", N_('🏷 Имя сервера')), ("mute", N_('🔕 Выключить уведомления на 1 ч')),
             ("unmute", N_('🔔 Включить уведомления')),
@@ -1857,7 +1878,7 @@ def build_app() -> Application:
     # concurrent_updates: долгое действие (очистка места, проверка копий) не задерживает ответы на другие кнопки
     app = Application.builder().token(CFG["token"]).post_init(on_startup).concurrent_updates(8).build()
     for name, fn in [("start", cmd_start), ("help", cmd_start), ("menu", cmd_start), ("status", cmd_status),
-                     ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services),
+                     ("procs", cmd_procs), ("mem", cmd_mem), ("services", cmd_services), ("servers", cmd_servers),
                      ("alerts", cmd_alerts), ("settings", cmd_settings), ("mute", cmd_mute), ("logs", cmd_logs), ("chart", cmd_chart), ("actions", cmd_actions),
                      ("probe", cmd_probe), ("backup", cmd_backup), ("updates", cmd_updates), ("incidents", cmd_incidents), ("net", cmd_net), ("ban", cmd_ban),
                      ("unmute", cmd_unmute), ("maint", cmd_maint), ("lang", cmd_lang), ("name", cmd_name)]:

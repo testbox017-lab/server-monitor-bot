@@ -47,6 +47,16 @@ processes: []
 containers: []
 #  - weather-bot
 
+# Другие серверы: бот заходит на них по SSH и спрашивает состояние у агента deploy/monitor-agent
+# (установка — в README, раздел «Другие серверы»). Пороги общие (thresholds).
+remote_servers: []
+#  - name: ovh                          # имя в сообщениях: буквы, цифры, . _ -
+#    host: 203.0.113.5
+#    user: root                         # по умолчанию root; ключ там ограничен command=...monitor-agent
+#    key: /var/lib/monitor_bot/remote_ed25519   # по умолчанию remote_ed25519 в папке данных бота
+#    services: [ssh]
+#    containers: []                     # или containers_auto: true — следить за всеми контейнерами
+
 # ---- Дальше всё можно менять кнопками в боте (меню «Настройки»). ----
 # Изменения из Telegram сохраняются в settings.json и перекрывают значения ниже.
 

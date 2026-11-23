@@ -1114,6 +1114,24 @@ UK = {
         '📦 Оновлення: {len}',
     '📦 Обновления':
         '📦 Оновлення',
+    "связь":
+        "зв'язок",
+    "🖥 Другие серверы":
+        "🖥 Інші сервери",
+    "нет ответа за {n} с":
+        "немає відповіді за {n} с",
+    "агент ответил не JSON":
+        "агент відповів не JSON",
+    "📡 Сервер не отвечает: {err}":
+        "📡 Сервер не відповідає: {err}",
+    "📡 Нет связи: {err}":
+        "📡 Немає зв'язку: {err}",
+    "Данных ещё нет: первая проверка через минуту":
+        "Даних ще немає: перша перевірка за хвилину",
+    "🕑 Данные {n} с назад":
+        "🕑 Дані {n} с тому",
+    "Других серверов нет. Добавьте remote_servers в config.yaml (см. README).":
+        "Інших серверів немає. Додайте remote_servers у config.yaml (див. README).",
 }
 
 EN = {
@@ -2227,4 +2245,22 @@ EN = {
         '📦 Updates: {len}',
     '📦 Обновления':
         '📦 Updates',
+    "связь":
+        "connection",
+    "🖥 Другие серверы":
+        "🖥 Other servers",
+    "нет ответа за {n} с":
+        "no answer in {n} s",
+    "агент ответил не JSON":
+        "the agent did not answer with JSON",
+    "📡 Сервер не отвечает: {err}":
+        "📡 Server is not responding: {err}",
+    "📡 Нет связи: {err}":
+        "📡 No connection: {err}",
+    "Данных ещё нет: первая проверка через минуту":
+        "No data yet: the first check runs within a minute",
+    "🕑 Данные {n} с назад":
+        "🕑 Data from {n} s ago",
+    "Других серверов нет. Добавьте remote_servers в config.yaml (см. README).":
+        "No other servers. Add remote_servers to config.yaml (see README).",
 }

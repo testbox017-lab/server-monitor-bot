@@ -578,9 +578,15 @@ CRITICAL_PREFIXES = ("svc:", "proc:", "ctr:", "web:")
 MAINT_MARK = "🔧 "  # инцидент начался во время обслуживания (плановые работы)
 
 
+def local_key(key: str) -> str:
+    """Ключ без имени другого сервера: «ovh|svc:ssh» → «svc:ssh»."""
+    return key.split("|", 1)[1] if "|" in key else key
+
+
 def is_critical(key: str) -> bool:
-    """Критичные алерты приходят и в тихие часы."""
-    return key.startswith(CRITICAL_PREFIXES)
+    """Критичные алерты приходят и в тихие часы. Недоступность другого сервера («имя|down») тоже."""
+    k = local_key(key)
+    return k.startswith(CRITICAL_PREFIXES) or (k == "down" and k != key)
 
 
 @dataclass
@@ -632,6 +638,8 @@ class AlertState:
     ssh_daily: dict[str, dict] = field(default_factory=dict)   # «2026-11-16» → {IP: попыток} за 8 дней
     ban_history: dict[str, list] = field(default_factory=dict)  # IP или подсеть → [сколько раз банили, когда]
     bak_first_seen: dict[str, float] = field(default_factory=dict)  # папка бэкапов → когда бот впервые её увидел
+    remote_fails: dict[str, int] = field(default_factory=dict)  # другой сервер → неудачных опросов подряд
+    remote_last: dict[str, dict] = field(default_factory=dict)  # другой сервер → результаты последнего опроса
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
@@ -689,6 +697,9 @@ class AlertState:
 
 
 def key_label(key: str) -> str:
+    if "|" in key:  # другой сервер: «ovh · ssh»
+        srv, k = key.split("|", 1)
+        return f"{srv} · " + (_('связь') if k == "down" else key_label(k))
     if key.startswith("anom:"):
         return _('необычная нагрузка ') + smart.NAMES.get(key[5:], key[5:])
     if key == "bak:pc":
@@ -764,7 +775,8 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
 
 def instant_keys(key: str) -> bool:
     """Падение службы/процесса/контейнера сообщаем сразу, ресурсы только после duration."""
-    return key.startswith(CRITICAL_PREFIXES) or key == "reboot_required"
+    k = local_key(key)
+    return k.startswith(CRITICAL_PREFIXES) or k == "reboot_required" or (k == "down" and k != key)
 
 
 @dataclass
@@ -773,6 +785,7 @@ class Alert:
     key: str | None = None   # ключ проблемы, для кнопок под сообщением
     kind: str = "alert"      # alert / remind / recovered / event
     send: str = "loud"       # loud — как обычно, quiet — без звука, journal — только в журнал инцидентов
+    server: str | None = None  # другой сервер (remote_servers), от имени которого сообщение
 
 
 def step(cfg: dict, state: AlertState, now: float | None = None,
@@ -793,6 +806,13 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             docker_poll()
         forgotten = update_seen_containers(state, cfg, now)
     results = evaluate(cfg, state) if real else dict(results)
+    if real and cfg.get("remote_servers"):
+        import remote
+        try:
+            results.update(remote.evaluate(cfg, state, now, state.path.parent if state.path else None))
+        except Exception:  # другой сервер не должен ломать проверку своего
+            import logging
+            logging.getLogger("monitor_bot").exception('Ошибка опроса других серверов')
     if real and hist is not None:
         try:
             results.update(smart.anomaly_results(cfg, LAST_SAMPLE, hist, now, tz(cfg)))
@@ -891,6 +911,8 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 logging.getLogger("monitor_bot").exception('Ошибка прогноза памяти')
 
     for a in out:
+        if a.key and "|" in a.key:
+            a.server = a.key.split("|", 1)[0]
         if a.kind == "event":
             _journal(inc, "event", a.key, a.text, now)
     state.log = [x for x in state.log if now - x[0] < 48 * 3600]

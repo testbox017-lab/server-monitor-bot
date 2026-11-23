@@ -232,42 +232,52 @@ def age_h(st: dict, now: float) -> float | None:
     return (now - st["newest"][2]) / 3600 if st.get("newest") else None
 
 
+def folder_problem(st: dict, state, now: float, seen_key: str) -> str | None:
+    """Текст проблемы с папкой копий (или None): папки нет, копий нет, последняя слишком старая.
+    seen_key — под каким ключом помнить, когда папку впервые увидели (только что добавленную не ругаем)."""
+    limit = st.get("max_age_h")
+    age = age_h(st, now)
+    seen = getattr(state, "bak_first_seen", None)
+    first = seen.setdefault(seen_key, now) if isinstance(seen, dict) else None
+    if not st.get("exists"):
+        return _('💾 Папки с бэкапами {path} нет', path=st['path'])
+    if age is None:
+        # папку только что добавили под наблюдение: первая копия появится по своему расписанию
+        fresh = first is not None and now - first < max(24.0, float(limit)) * 3600
+        return None if fresh else _('💾 В {path} нет ни одной резервной копии', path=st['path'])
+    if age > limit:
+        return _('💾 Последней резервной копии в {path} уже {age:.0f} ч (норма до {limit:.0f} ч)',
+                 path=st['path'], age=age, limit=limit)
+    return None
+
+
+def offsite_problem(cfg: dict, off: dict | None, now: float) -> str | None:
+    limit = cfg.get("offsite_max_age_h")
+    if not limit or off is None:  # пока ПК ни разу не забирал копии, не шумим
+        return None
+    age = (now - off["ts"]) / 3600
+    return (_('💻 ПК не забирал резервные копии уже {age:.0f} ч (норма до {limit:.0f} ч). Включён ли '
+              'компьютер и работает ли задача «monitor-bot-pull»?',
+              age=age, limit=limit)) if age > limit else None
+
+
 def evaluate(cfg: dict, state, now: float, data_dir: Path | None, watched_fn=watched_status,
              offsite_fn=offsite_status) -> dict[str, str | None]:
     """Ключи bak:<папка>: копий нет или последняя слишком старая; bak:pc — ПК давно не забирал копии."""
     res: dict[str, str | None] = {}
     if not cfg.get("backup_alerts", True):
         return res
-    limit = cfg.get("offsite_max_age_h")
-    off = offsite_fn() if limit else None
-    if off is not None:  # пока ПК ни разу не забирал копии, не шумим
-        age = (now - off["ts"]) / 3600
-        res["bak:pc"] = (_('💻 ПК не забирал резервные копии уже {age:.0f} ч (норма до {limit:.0f} ч). Включён ли '
-                           'компьютер и работает ли задача «monitor-bot-pull»?',
-                           age=age, limit=limit)) if age > limit else None
+    off = offsite_fn() if cfg.get("offsite_max_age_h") else None
+    if off is not None:
+        res["bak:pc"] = offsite_problem(cfg, off, now)
     statuses = []
     if data_dir is not None and cfg.get("backup_time"):
         statuses.append(own_status(cfg, data_dir))
     statuses += watched_fn(now) or []
     for st in statuses:
-        key = f"bak:{st['path']}"
-        limit = st.get("max_age_h")
-        if not limit:
+        if not st.get("max_age_h"):
             continue
-        age = age_h(st, now)
-        seen = getattr(state, "bak_first_seen", None)
-        first = seen.setdefault(st["path"], now) if isinstance(seen, dict) else None
-        if not st.get("exists"):
-            res[key] = _('💾 Папки с бэкапами {path} нет', path=st['path'])
-        elif age is None:
-            # папку только что добавили под наблюдение: первая копия появится по своему расписанию
-            fresh = first is not None and now - first < max(24.0, float(limit)) * 3600
-            res[key] = None if fresh else _('💾 В {path} нет ни одной резервной копии', path=st['path'])
-        elif age > limit:
-            res[key] = _('💾 Последней резервной копии в {path} уже {age:.0f} ч (норма до {limit:.0f} ч)',
-                         path=st['path'], age=age, limit=limit)
-        else:
-            res[key] = None
+        res[f"bak:{st['path']}"] = folder_problem(st, state, now, st["path"])
         new, prev = st.get("newest"), st.get("previous")
         if new and prev and prev[1] > 1024 and new[1] < prev[1] * SIZE_DROP:
             if state.bak_small.get(st["path"]) != new[0]:
@@ -312,6 +322,15 @@ def status_text(cfg: dict, data_dir: Path, now: float | None = None, watched_fn=
         lines.append(_('Чужие бэкапы: помощник не настроен (см. README, раздел «Резервные копии»)'))
     for st in watched or []:
         lines.append(describe(html.escape(st["path"]), st))
+    import remote
+    for srv in remote.servers(cfg):  # другие серверы: что знает их агент (обновляется раз в минуту)
+        data = remote.last_data(srv["name"])
+        if not data.get("backups") and data.get("offsite") is None:
+            continue
+        lines.append(f"\n🖥 <b>{html.escape(srv['name'])}</b>")
+        lines.append(offsite_text(cfg, now, lambda d=data: d.get("offsite")))
+        for st in data.get("backups") or []:
+            lines.append(describe(html.escape(str(st.get("path"))), st))
     if cfg.get("backup_send_daily"):
         lines.append(_('📤 Каждый день присылаю копии сюда, в Telegram'))
     return "\n".join(lines)

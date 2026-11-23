@@ -11,10 +11,14 @@
                             перечисленных служб systemd и всех контейнеров docker, открытые порты,
                             блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
                             с момента TS (без входов самого бота по ключу агента)
-                            и строки с ошибками из логов работающих контейнеров (ctr_logs)
-    logs / restart / ban / unban / reboot / backups / backup-get — действия из бота, ровно в видах
-                            из parse_action(). Перезапуск служб — только из /etc/monitor-agent/allowed-services,
-                            копии — только из папок /etc/monitor-agent/backup-watch.
+                            и строки с ошибками из логов работающих контейнеров (ctr_logs); всегда —
+                            свежесть копий в папках /etc/monitor-agent/backup-watch и когда их забирал ПК
+    logs / restart / ban / unban / reboot — действия из бота, ровно в видах из parse_action().
+                            Перезапуск служб — только из /etc/monitor-agent/allowed-services.
+
+Копии на ПК: отдельный ключ ПК с command="/usr/local/sbin/monitor-agent pull-stream",restrict — агент
+отдаёт tar с последней копией из каждой папки backup-watch (аргумент командной строки важнее
+SSH_ORIGINAL_COMMAND, поэтому этим ключом ничего другого не сделать).
 """
 import base64
 import hashlib
@@ -389,6 +393,8 @@ def status(services: list[str], since: int | None = None) -> dict:
         "fail2ban": fail2ban(),
         "allowed_services": allowed_services(),
         "apt_running": apt_running(),
+        "backups": backups_status(),
+        "offsite": offsite(),
     }
 
 
@@ -499,24 +505,34 @@ def apt_upgrade(mode: str) -> dict:
                  f"{script} > /var/log/monitor-agent-apt.log 2>&1"], 30)
 
 
-# ---------- Резервные копии (главный бот забирает себе последнюю копию из каждой папки) ----------
+# ---------- Резервные копии: свежесть для главного бота и забор на ПК (pull-stream) ----------
 
 BACKUP_WATCH = "/etc/monitor-agent/backup-watch"
-BACKUP_MAX = 50 << 20  # больше 50 МБ через SSH в JSON не передаём
+OFFSITE_STATUS = "/var/lib/monitor-agent/offsite.json"  # когда ПК последний раз забрал копии
+LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def backup_dirs() -> list[str]:
-    """Папки с копиями из BACKUP_WATCH: путь в начале строки (дальше можно писать что угодно), # — комментарий."""
+def backup_dirs() -> list[tuple[str, float]]:
+    """[(папка, максимальный возраст копии в часах)] из BACKUP_WATCH: «/var/backups/x 26», # — комментарий."""
+    out = []
     try:
         with open(BACKUP_WATCH, encoding="utf-8") as fh:
-            lines = [ln.split("#", 1)[0].split() for ln in fh]
+            for ln in fh:
+                p = ln.split("#", 1)[0].split()
+                if not p or not os.path.isabs(p[0]):
+                    continue
+                try:
+                    hours = float(p[1]) if len(p) > 1 else 26.0
+                except ValueError:
+                    hours = 26.0
+                out.append((os.path.normpath(p[0]), hours))
     except OSError:
-        return []
-    return [os.path.normpath(p[0]) for p in lines if p and os.path.isabs(p[0])]
+        pass
+    return out
 
 
-def newest_backup(path: str) -> tuple[str, int, float] | None:
-    """(имя, размер, mtime) самой свежей копии; latest.* — копия последней, её не берём, если есть другие."""
+def backup_files(path: str) -> list[tuple[str, int, float]]:
+    """[(имя, размер, mtime)] обычных файлов папки, новые первыми."""
     files = []
     try:
         with os.scandir(path) as it:
@@ -525,35 +541,95 @@ def newest_backup(path: str) -> tuple[str, int, float] | None:
                     st = e.stat(follow_symlinks=False)
                     files.append((e.name, st.st_size, st.st_mtime))
     except OSError:
-        return None
+        return []
     files.sort(key=lambda x: x[2], reverse=True)
-    dated = [f for f in files if not f[0].startswith("latest")] or files
-    return dated[0] if dated else None
+    return files
 
 
-def backups_list() -> dict:
-    return {"ok": True, "out": json.dumps([{"path": p, "newest": newest_backup(p)} for p in backup_dirs()])}
+def backups_status() -> list[dict]:
+    """Как backup-status помощника главного сервера: по папке — сколько копий, последняя и предпоследняя."""
+    res = []
+    for path, hours in backup_dirs():
+        files = backup_files(path)
+        dated = [f for f in files if not f[0].startswith("latest")]  # latest.* — копия последней
+        res.append({"path": path, "max_age_h": hours, "exists": os.path.isdir(path),
+                    "count": len(dated), "total": sum(f[1] for f in files),
+                    "newest": list(dated[0]) if dated else (list(files[0]) if files else None),
+                    "previous": list(dated[1]) if len(dated) > 1 else None})
+    return res
 
 
-def backup_get(n: int) -> dict:
-    """Последняя копия из n-й папки: JSON {name, size, mtime, b64} в out."""
-    dirs = backup_dirs()
-    if n >= len(dirs):
-        return {"ok": False, "out": "bad index"}
-    nb = newest_backup(dirs[n])
-    if nb is None:
-        return {"ok": False, "out": "no backups"}
-    name, size, mtime = nb
-    if size > BACKUP_MAX:
-        return {"ok": False, "out": f"too big: {size}"}
+def offsite() -> dict | None:
     try:
-        fd = os.open(os.path.join(dirs[n], name), os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as fh:
-            data = fh.read(BACKUP_MAX + 1)
-    except OSError as e:
-        return {"ok": False, "out": str(e)}
-    return {"ok": True, "out": json.dumps({"name": name, "size": len(data), "mtime": mtime,
-                                           "b64": base64.b64encode(data).decode()})}
+        with open(OFFSITE_STATUS, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) and isinstance(data.get("ts"), (int, float)) else None
+    except (OSError, ValueError):
+        return None
+
+
+def newest_copies() -> list[tuple[str, str, str]]:
+    """[(метка, папка, имя)]: по одной последней копии из каждой папки BACKUP_WATCH."""
+    out, used = [], set()
+    for path, __ in backup_dirs():
+        files = [f for f in backup_files(path) if not f[0].startswith("latest")] or backup_files(path)
+        if not files:
+            continue
+        label = LABEL_RE.sub("_", os.path.basename(path) or "root")[:40] or "dir"
+        while label in used:
+            label += "_"
+        used.add(label)
+        out.append((label, path, files[0][0]))
+    return out
+
+
+class HashReader:
+    def __init__(self, f):
+        self.f, self.h = f, hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        b = self.f.read(n)
+        self.h.update(b)
+        return b
+
+
+def pull_stream(out=None) -> int:
+    """Для ПК (ключ с command="... pull-stream"): tar в stdout — <метка>/<файл> и SHA256SUMS в конце,
+    тот же формат, что у monitor-bot-action pull-stream на главном сервере."""
+    import io
+    import tarfile
+    items = newest_copies()
+    if not items:  # stdout — поток для ПК, поэтому ошибку пишем в stderr
+        sys.stderr.write("no backups\n")
+        return 1
+    out = out or sys.stdout.buffer
+    sums, sent = [], []
+    with tarfile.open(fileobj=out, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+        for label, path, name in items:
+            try:
+                fd = os.open(os.path.join(path, name), os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as f:
+                st = os.fstat(f.fileno())
+                info = tarfile.TarInfo(f"{label}/{name}")
+                info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), 0o600
+                r = HashReader(f)
+                tar.addfile(info, r)
+            sums.append(f"{r.h.hexdigest()}  {label}/{name}")
+            sent.append({"path": path, "name": name, "size": st.st_size, "mtime": st.st_mtime})
+        data = ("\n".join(sums) + "\n").encode()
+        info = tarfile.TarInfo("SHA256SUMS")
+        info.size, info.mtime, info.mode = len(data), int(time.time()), 0o644
+        tar.addfile(info, io.BytesIO(data))
+    out.flush()
+    os.makedirs(os.path.dirname(OFFSITE_STATUS), mode=0o755, exist_ok=True)
+    tmp = OFFSITE_STATUS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"ts": time.time(), "files": sent, "bytes": sum(x["size"] for x in sent),
+                   "client": (os.environ.get("SSH_CONNECTION") or "").split(" ")[0]}, fh)
+    os.replace(tmp, OFFSITE_STATUS)
+    return 0
 
 
 def parse_action(cmd: str) -> list[str] | None:
@@ -566,16 +642,10 @@ def parse_action(cmd: str) -> list[str] | None:
         updates                  — пакеты, которые можно обновить (JSON в out)
         apt-upgrade security|all — установить обновления в фоне (служба monitor-agent-apt)
         reboot                   — перезагрузка через 5 секунд
-        backups                  — папки из /etc/monitor-agent/backup-watch и свежая копия в каждой (JSON)
-        backup-get N             — последняя копия из N-й папки (JSON с base64)
     """
     p = cmd.split()
     if not p:
         return None
-    if p == ["backups"]:
-        return p
-    if p[0] == "backup-get" and len(p) == 2 and p[1].isdigit() and int(p[1]) < 100:
-        return p
     if p[0] == "logs" and len(p) == 4 and p[1] in ("svc", "ctr") and p[3].isdigit() and 1 <= int(p[3]) <= 200:
         ok = SVC_RE.match(p[2]) if p[1] == "svc" else CTR_RE.match(p[2])
         return p if ok else None
@@ -597,10 +667,6 @@ def parse_action(cmd: str) -> list[str] | None:
 
 
 def action(p: list[str]) -> dict:
-    if p == ["backups"]:
-        return backups_list()
-    if p[0] == "backup-get":
-        return backup_get(int(p[1]))
     if p[0] == "logs":
         if p[1] == "svc":
             return _run(["journalctl", "-u", p[2], "-n", p[3], "--no-pager", "-o", "short-iso"], 30)
@@ -636,6 +702,8 @@ def action(p: list[str]) -> dict:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["pull-stream"]:  # ключ ПК: command="... pull-stream", что бы ни прислал клиент
+        return pull_stream()
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:]))
     parsed = parse_cmd(cmd)
     if parsed is not None:

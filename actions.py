@@ -133,6 +133,9 @@ class Actions:
             res = self._helper("apt-upgrade", p.arg, timeout=30)
         elif p.kind == "prunebak":
             res = self._helper("prune-bak", p.arg, timeout=300)
+        elif p.kind in ("rsvc", "rctr", "rban", "runban", "rreboot", "rapt"):  # другой сервер, через его агента
+            import remote
+            res = remote.execute(p.kind, p.arg)
         else:
             res = (False, _('неизвестное действие'))
         self.log(p, *res)
@@ -158,6 +161,9 @@ class Actions:
 
 
 def describe(p: Pending) -> str:
+    if p.kind in ("rsvc", "rctr", "rban", "runban", "rreboot", "rapt"):  # «сервер|цель» → как у своего, плюс имя сервера
+        srv, __, target = p.arg.partition("|")
+        return describe(Pending(p.kind[1:], target, p.chat_id, p.expires, p.stage, p.extra)) + f" · {srv}"
     return {
         "ctr": _('перезапуск контейнера {arg}', arg=p.arg),
         "svc": _('перезапуск службы {arg}', arg=p.arg),

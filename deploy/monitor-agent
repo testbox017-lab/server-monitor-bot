@@ -11,10 +11,12 @@
                             перечисленных служб systemd и всех контейнеров docker, открытые порты,
                             блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
                             с момента TS (без входов самого бота по ключу агента)
-Ничего не меняет на сервере.
+    logs / restart / ban / unban / reboot — действия из бота, ровно в видах из parse_action().
+                            Перезапуск служб — только из /etc/monitor-agent/allowed-services.
 """
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -270,13 +272,41 @@ def fail2ban() -> dict | None:
         return None
 
 
+def net_counters(text: str) -> dict:
+    """Принято и отправлено байт по всем интерфейсам, кроме lo, из /proc/net/dev."""
+    rx = tx = 0
+    for line in text.splitlines()[2:]:
+        name, _, rest = line.partition(":")
+        f = rest.split()
+        if name.strip() == "lo" or len(f) < 9:
+            continue
+        rx += int(f[0])
+        tx += int(f[8])
+    return {"rx": rx, "tx": tx}
+
+
+def allowed_services() -> list[str]:
+    """Службы, которые можно перезапускать из бота: по одной в строке, # — комментарий."""
+    try:
+        with open(ALLOWED_SERVICES) as fh:
+            names = [ln.split("#", 1)[0].strip() for ln in fh]
+    except OSError:
+        return []
+    return [n for n in names if n and SVC_RE.match(n)]
+
+
 def status(services: list[str], since: int | None = None) -> dict:
     with open("/proc/meminfo") as fh:
         mem = meminfo(fh.read())
     with open("/proc/uptime") as fh:
         uptime = float(fh.read().split()[0])
+    try:
+        with open("/proc/net/dev") as fh:
+            net = net_counters(fh.read())
+    except OSError:
+        net = None
     return {
-        "v": 1,
+        "v": 2,
         "host": platform.node(),
         "os": f"{platform.system()} {platform.release()}",
         "time": time.time(),
@@ -285,6 +315,7 @@ def status(services: list[str], since: int | None = None) -> dict:
         "load": list(os.getloadavg()),
         **mem,
         "disks": disks(),
+        "net": net,
         "uptime": uptime,
         "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
         "services": {s: service_state(s) for s in services},
@@ -292,17 +323,200 @@ def status(services: list[str], since: int | None = None) -> dict:
         "ssh": ssh_log(since) if since else None,
         "ports": ports(),
         "fail2ban": fail2ban(),
+        "allowed_services": allowed_services(),
+        "apt_running": apt_running(),
     }
+
+
+# ---------- Действия ----------
+
+ALLOWED_SERVICES = "/etc/monitor-agent/allowed-services"
+CTR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+F2B_JAIL = "sshd"
+
+
+def _run(cmd: list[str], timeout: int) -> dict:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "out": "timeout"}
+    except OSError as e:
+        return {"ok": False, "out": str(e)}
+    return {"ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()[-6000:]}
+
+
+def caller_ip() -> str:
+    """IP, с которого пришла эта SSH-сессия (главный сервер): его нельзя заблокировать."""
+    return os.environ.get("SSH_CLIENT", "").split(" ")[0]
+
+
+def bannable(ip: str) -> str | None:
+    """Нормализованный публичный IP или None."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if a.is_private or a.is_loopback or a.is_link_local or a.is_multicast or a.is_unspecified or a.is_reserved:
+        return None
+    return str(a)
+
+
+# ---------- Процессы и обновления (только чтение) ----------
+
+def _proc_ticks() -> dict:
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as fh:
+                s = fh.read()
+            name = s[s.index("(") + 1:s.rindex(")")]
+            f = s[s.rindex(")") + 2:].split()
+            with open(f"/proc/{d}/statm") as fh:
+                rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            out[int(d)] = (name, int(f[11]) + int(f[12]), rss)
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def top_procs(by: str, n: int, interval: float = 1.0) -> list[dict]:
+    """[{pid, name, cpu, rss}] — самые нагружающие процессы (CPU за interval секунд или память)."""
+    a = _proc_ticks()
+    time.sleep(interval)
+    b = _proc_ticks()
+    hz = os.sysconf("SC_CLK_TCK")
+    rows = []
+    for pid, (name, ticks, rss) in b.items():
+        prev = a.get(pid)
+        cpu = 100.0 * (ticks - prev[1]) / hz / interval if prev and prev[0] == name else 0.0
+        rows.append({"pid": pid, "name": name, "cpu": round(cpu, 1), "rss": rss})
+    rows.sort(key=lambda r: r["cpu" if by == "cpu" else "rss"], reverse=True)
+    return rows[:n]
+
+
+def parse_upgradable(text: str) -> list[dict]:
+    """«pkg/noble-security 1.2 amd64 [upgradable from: 1.1]» → [{name, security}]."""
+    out = []
+    for line in text.splitlines():
+        if "/" not in line or "upgradable" not in line:
+            continue
+        name, _, rest = line.partition("/")
+        out.append({"name": name.strip(), "security": "-security" in rest.split(" ", 1)[0]})
+    return out
+
+
+def upgradable() -> dict:
+    r = _run(["apt", "list", "--upgradable"], 60)
+    return {"ok": r["ok"], "out": json.dumps(parse_upgradable(r["out"])) if r["ok"] else r["out"]}
+
+
+APT_UNIT = "monitor-agent-apt"
+
+
+def apt_running() -> bool:
+    r = _run(["systemctl", "is-active", APT_UNIT], 10)
+    return r["out"].strip() in ("active", "activating")
+
+
+def apt_upgrade(mode: str) -> dict:
+    """Установка обновлений в отдельной службе systemd (переживёт обрыв SSH). security — unattended-upgrade
+    (только обновления безопасности), all — apt-get upgrade без удаления пакетов."""
+    if apt_running():
+        return {"ok": False, "out": "package upgrade is already running"}
+    if mode == "security":
+        script = "apt-get update -q && unattended-upgrade -v"
+    else:
+        script = ("apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get -y -q "
+                  "-o Dpkg::Options::=--force-confold upgrade")
+    _run(["systemctl", "reset-failed", APT_UNIT], 10)
+    return _run(["systemd-run", f"--unit={APT_UNIT}", "--collect", "sh", "-c",
+                 f"{script} > /var/log/monitor-agent-apt.log 2>&1"], 30)
+
+
+def parse_action(cmd: str) -> list[str] | None:
+    """Разрешённые действия, ровно в этих видах:
+        logs svc|ctr NAME N      — последние N (1–200) строк журнала службы или контейнера
+        restart svc NAME         — только службы из /etc/monitor-agent/allowed-services
+        restart ctr NAME         — docker restart
+        ban IP / unban IP        — fail2ban (jail sshd); не локальные адреса и не адрес главного сервера
+        procs cpu|mem N          — N (1–30) самых нагружающих процессов (JSON в out)
+        updates                  — пакеты, которые можно обновить (JSON в out)
+        apt-upgrade security|all — установить обновления в фоне (служба monitor-agent-apt)
+        reboot                   — перезагрузка через 5 секунд
+    """
+    p = cmd.split()
+    if not p:
+        return None
+    if p[0] == "logs" and len(p) == 4 and p[1] in ("svc", "ctr") and p[3].isdigit() and 1 <= int(p[3]) <= 200:
+        ok = SVC_RE.match(p[2]) if p[1] == "svc" else CTR_RE.match(p[2])
+        return p if ok else None
+    if p[0] == "restart" and len(p) == 3 and p[1] == "svc" and SVC_RE.match(p[2]):
+        return p
+    if p[0] == "restart" and len(p) == 3 and p[1] == "ctr" and CTR_RE.match(p[2]):
+        return p
+    if p[0] in ("ban", "unban") and len(p) == 2 and bannable(p[1]):
+        return p
+    if p[0] == "procs" and len(p) == 3 and p[1] in ("cpu", "mem") and p[2].isdigit() and 1 <= int(p[2]) <= 30:
+        return p
+    if p[0] == "apt-upgrade" and len(p) == 2 and p[1] in ("security", "all"):
+        return p
+    if p == ["updates"]:
+        return p
+    if p == ["reboot"]:
+        return p
+    return None
+
+
+def action(p: list[str]) -> dict:
+    if p[0] == "logs":
+        if p[1] == "svc":
+            return _run(["journalctl", "-u", p[2], "-n", p[3], "--no-pager", "-o", "short-iso"], 30)
+        if not shutil.which("docker"):
+            return {"ok": False, "out": "docker is not installed"}
+        return _run(["docker", "logs", "--tail", p[3], p[2]], 30)
+    if p[0] == "restart" and p[1] == "svc":
+        if p[2] not in allowed_services():
+            return {"ok": False, "out": f"service not allowed (add it to {ALLOWED_SERVICES})"}
+        return _run(["systemctl", "restart", p[2]], 150)
+    if p[0] == "restart":
+        if not shutil.which("docker"):
+            return {"ok": False, "out": "docker is not installed"}
+        return _run(["docker", "restart", p[2]], 120)
+    if p[0] in ("ban", "unban"):
+        ip = bannable(p[1])
+        if p[0] == "ban" and ip == bannable(caller_ip()):
+            return {"ok": False, "out": "refused: this is the main server address"}
+        if not shutil.which("fail2ban-client"):
+            return {"ok": False, "out": "fail2ban is not installed"}
+        if p[0] == "ban":
+            return _run(["fail2ban-client", "set", F2B_JAIL, "banip", ip], 30)
+        return _run(["fail2ban-client", "unban", ip], 30)
+    if p[0] == "procs":
+        return {"ok": True, "out": json.dumps(top_procs(p[1], int(p[2])))}
+    if p[0] == "apt-upgrade":
+        return apt_upgrade(p[1])
+    if p == ["updates"]:
+        return upgradable()
+    if p == ["reboot"]:
+        return _run(["systemd-run", "--on-active=5", "--unit=monitor-agent-reboot", "systemctl", "reboot"], 15)
+    return {"ok": False, "out": "unknown command"}
 
 
 def main() -> int:
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:]))
     parsed = parse_cmd(cmd)
-    if parsed is None:
+    if parsed is not None:
+        print(json.dumps(status(*parsed)))
+        return 0
+    act = parse_action(cmd)
+    if act is None:
         print(json.dumps({"error": "command not allowed"}))
         return 2
-    print(json.dumps(status(*parsed)))
-    return 0
+    res = action(act)
+    print(json.dumps(res))
+    return 0 if res["ok"] else 1
 
 
 if __name__ == "__main__":

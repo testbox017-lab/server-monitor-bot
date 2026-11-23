@@ -49,6 +49,7 @@ STATE = checks.AlertState.load(S.dir / "state.json")
 HIST = history.History(S.dir / "metrics.db")
 ACT = actions.Actions(S.dir / "actions.log")
 INC = incidents.Incidents(S.dir / "metrics.db")
+remote.setup(CFG, S.dir)  # действия и история других серверов
 
 
 def host() -> str:
@@ -81,7 +82,11 @@ def status_kb() -> InlineKeyboardMarkup:
 
 
 def servers_kb() -> InlineKeyboardMarkup:
-    return kb([Btn(_('🔄 Обновить'), callback_data="servers"), Btn(_('📊 Статус'), callback_data="status:new")])
+    srvs = remote.servers(CFG)
+    if len(srvs) == 1:  # один другой сервер — сразу его карточка с кнопками, как у своего
+        return rcard_kb(srvs[0]["name"])
+    return kb(*[[Btn(f"🖥 {s['name']}", callback_data=f"rs:{s['name']}:card:new")] for s in srvs],
+              [Btn(_('🔄 Обновить'), callback_data="servers"), Btn(_('📊 Статус'), callback_data="status:new")])
 
 
 def procs_kb(by: str, n: int) -> InlineKeyboardMarkup:
@@ -139,8 +144,21 @@ def alert_kb(key: str | None = None, ackable: bool = False) -> InlineKeyboardMar
     extra = []
     fix = None
     status_btn = Btn(_('📊 Статус сейчас'), callback_data="status:new")
-    if remote.is_remote(key):  # другой сервер: действий с ним пока нет, только его состояние
-        status_btn = Btn(_('🖥 Другие серверы'), callback_data="servers:new")
+    if remote.is_remote(key):  # другой сервер: кнопки ведут к его агенту, не к своему серверу
+        srv, k = remote.split_key(key)
+        status_btn = Btn(_('📊 Статус сейчас'), callback_data=f"rs:{srv}:card:new")
+        target = k.split(":", 1)[-1]
+        if k.startswith("svc:") and target in (remote.last_data(srv).get("allowed_services") or []):
+            fix = act_btn(_('♻️ Перезапустить'), f"rs:{srv}:do:svc:{target}")
+        elif k.startswith("ctr:"):
+            b = rbtn(_('📜 Логи'), f"rs:{srv}:logs:ctr:{target}")
+            if b:
+                extra.append(b)
+            fix = act_btn(_('♻️ Перезапустить'), f"rs:{srv}:do:ctr:{target}")
+        elif k.startswith("brute:"):
+            fix = act_btn(_('🚫 Заблокировать {key}', key=target), f"rs:{srv}:do:ban:{target}")
+        elif k == "apt:updates":
+            extra.append(Btn(_('📦 Показать и установить'), callback_data=f"rs:{srv}:upd:new"))
     elif key and key.startswith("slog:"):  # служба из log_services: журнал и перезапуск через systemctl
         b = logs_btn(checks.key_label(key), _('📜 Логи'))
         if b:
@@ -218,9 +236,10 @@ def chart_kb(period: str) -> InlineKeyboardMarkup:
                for p in history.PERIODS])
 
 
-async def make_chart(period: str) -> tuple[bytes | None, str]:
-    png = await asyncio.to_thread(history.chart_png, HIST, period, checks.tz(CFG), host())
-    caption = await asyncio.to_thread(history.chart_caption, HIST, period)
+async def make_chart(period: str, server: str | None = None) -> tuple[bytes | None, str]:
+    hist = remote.history(server, S.dir) if server else HIST
+    png = await asyncio.to_thread(history.chart_png, hist, period, checks.tz(CFG), server or host())
+    caption = await asyncio.to_thread(history.chart_caption, hist, period)
     return png, caption
 
 
@@ -1071,6 +1090,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await send(update, text, status_kb())
             else:
                 await edit(update, text, status_kb())
+        elif cmd == "rs":
+            note = await handle_remote(update, parts)
         elif cmd == "servers":
             text = remote.servers_text(CFG, STATE)
             if len(parts) > 1:
@@ -1568,7 +1589,7 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
         ACT.drop(token)
         await edit(update, _('✖️ Отменено: {describe}', describe=actions.describe(p)))
         return _('Отменено')
-    if p.kind == "reboot" and p.stage == 1:
+    if p.kind in ("reboot", "rreboot") and p.stage == 1:
         p.stage = 2
         p.expires = time.time() + 60
         await edit(update, _('⚠️ <b>Точно перезагрузить сервер?</b> Это второе и последнее подтверждение.'),
@@ -1577,6 +1598,11 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
     ACT.drop(token)
     await edit(update, _('⏳ Выполняю: {describe}…', describe=actions.describe(p)))
     ok, out = await asyncio.to_thread(ACT.execute, p)
+    if p.kind == "rapt" and ok:
+        srv = p.arg.split(remote.SEP, 1)[0]
+        await edit(update, _("⏳ Установка обновлений на {name} запущена ({what}). Проверить: «📦 Обновления» в карточке сервера.",
+                             name=html.escape(srv), what=pkgupdates.mode_text(p.arg.split(remote.SEP, 1)[-1])))
+        return None
     if p.kind == "apt" and ok:
         await edit(update, _('⏳ Установка обновлений запущена ({what}). Результат пришлю, когда закончится, '
                              'обычно через 1–5 минут.', what=pkgupdates.mode_text(p.arg)))
@@ -1590,6 +1616,173 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
     icon = "✅" if ok else "❌"
     await edit(update, f"{icon} {html.escape(actions.describe(p))}\n<pre>{html.escape(out)}</pre>")
     return None
+
+
+
+
+# ---------- Другие серверы: карточка как у своего ----------
+
+def rbtn(label: str, data: str) -> Btn | None:
+    return Btn(label, callback_data=data) if len(data.encode()) <= 64 else None
+
+
+def rows_of(btns: list, n: int) -> list[list]:
+    btns = [b for b in btns if b]
+    return [btns[i:i + n] for i in range(0, len(btns), n)]
+
+
+def rcard_kb(name: str) -> InlineKeyboardMarkup:
+    p = f"rs:{name}"
+    return kb([Btn(_('🔄 Обновить'), callback_data=f"{p}:card"), Btn(_('📈 График'), callback_data=f"{p}:chart:24h")],
+              [Btn(_('🔝 Процессы'), callback_data=f"{p}:procs:cpu:10"), Btn(_('⚙️ Службы'), callback_data=f"{p}:svcs")],
+              [Btn(_('🌐 Сеть и диск'), callback_data=f"{p}:net"), Btn(_('📦 Обновления'), callback_data=f"{p}:upd")],
+              [b for b in [act_btn(_('🧰 Действия'), f"{p}:menu"), Btn(_('📊 Статус'), callback_data="status:new")] if b])
+
+
+def rback(name: str) -> Btn:
+    return Btn(_('⬅️ Назад'), callback_data=f"rs:{name}:card")
+
+
+def rprocs_kb(name: str, by: str, n: int) -> InlineKeyboardMarkup:
+    other = "mem" if by == "cpu" else "cpu"
+    p = f"rs:{name}:procs"
+    return kb([Btn(_('🔄 Обновить'), callback_data=f"{p}:{by}:{n}"),
+               Btn(_('По RAM') if other == "mem" else _('По CPU'), callback_data=f"{p}:{other}:{n}")],
+              [Btn(_('Показать 20') if n == 10 else _('Показать 10'), callback_data=f"{p}:{by}:{20 if n == 10 else 10}"),
+               rback(name)])
+
+
+def rsvcs_kb(name: str) -> InlineKeyboardMarkup:
+    s = remote.last_data(name)
+    srv = remote.server(name, CFG) or {}
+    p = f"rs:{name}"
+    logs = [rbtn(f"📜 {x}", f"{p}:logs:svc:{x}") for x in (s.get("services") or {})]
+    logs += [rbtn(f"📜 {c}", f"{p}:logs:ctr:{c}") for c in remote.watched_containers(srv, s)]
+    return InlineKeyboardMarkup(rows_of(logs, 3) + [[Btn(_('🔄 Обновить'), callback_data=f"{p}:svcs"), rback(name)]])
+
+
+def rmenu(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    s = remote.last_data(name)
+    srv = remote.server(name, CFG) or {}
+    p = f"rs:{name}:do"
+    rows = rows_of([act_btn(f"♻️ {c}", f"{p}:ctr:{c}") for c in remote.watched_containers(srv, s)], 2)
+    rows += rows_of([act_btn(f"♻️ {x}", f"{p}:svc:{x}") for x in s.get("allowed_services") or []], 3)
+    rows.append([Btn(_('🚫 Заблокированные IP'), callback_data=f"rs:{name}:banned"),
+                 Btn(_('📦 Обновления пакетов'), callback_data=f"rs:{name}:upd")])
+    rows.append([b for b in [act_btn(_('🔄 Перезагрузить сервер'), f"{p}:reboot:-")] if b] + [rback(name)])
+    text = (f"🖥 <b>{html.escape(name)}</b>\n"
+            + _('🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Службы перезапускаются только из списка '
+                '/etc/monitor-agent/allowed-services на том сервере.'))
+    return text, InlineKeyboardMarkup(rows)
+
+
+def rupd_kb(name: str) -> InlineKeyboardMarkup:
+    pkgs = (remote.UPDATES.get(name) or {}).get("pkgs") or []
+    sec = sum(bool(x.get("security")) for x in pkgs)
+    p = f"rs:{name}"
+    rows = [[Btn(_('🔍 Проверить заново'), callback_data=f"{p}:upd:refresh"), rback(name)]]
+    if sec:
+        rows.append([b for b in [act_btn(_('🛡 Установить обновления безопасности ({n})', n=sec),
+                                         f"{p}:do:apt:security")] if b])
+    if pkgs:
+        rows.append([b for b in [act_btn(_('⬆️ Установить все ({n})', n=len(pkgs)), f"{p}:do:apt:all")] if b])
+    return InlineKeyboardMarkup([r for r in rows if r])
+
+
+def rbanned_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    ips = remote.banned_ips(name)
+    p = f"rs:{name}:do:unban"
+    text = f"🖥 <b>{html.escape(name)}</b>\n" + (
+        _('🚫 <b>Заблокированные ботом IP ({len})</b>\n', len=len(ips)) + "\n".join(html.escape(i) for i in ips[:50])
+        if ips else _('🚫 Бот пока никого не блокировал.\nЗаблокировать вручную: <code>/ban IP</code>'))
+    rows = rows_of([act_btn(_('✅ Разблокировать {ip}', ip=ip), f"{p}:{ip}") for ip in ips[:20]], 1)
+    return text, InlineKeyboardMarkup(rows + [[rback(name)]])
+
+
+async def rask(update: Update, name: str, kind: str, target: str) -> None:
+    """Подтверждение действия на другом сервере: те же тексты, что у своего, плюс имя сервера."""
+    chat_id = update.effective_chat.id
+    who = f"{target} · {name}"
+    if kind == "ban" and not security.public_ip(target):
+        await send(update, _('Локальные адреса не блокирую'))
+        return
+    if kind not in ("svc", "ctr", "ban", "unban", "reboot", "apt"):
+        return
+    token = ACT.ask("r" + kind, f"{name}{remote.SEP}{target}", chat_id)
+    if kind == "svc":
+        await send(update, _('♻️ Перезапустить службу <b>{escape}</b>?', escape=html.escape(who)), confirm_kb(token))
+    elif kind == "ctr":
+        await send(update, _('♻️ Перезапустить контейнер <b>{escape}</b>?\n'
+                             'Бот внутри будет недоступен несколько секунд.', escape=html.escape(who)), confirm_kb(token))
+    elif kind == "ban":
+        await send(update, _('🚫 Заблокировать <b>{ip}</b> на сервере {name} (fail2ban)?',
+                             ip=html.escape(target), name=html.escape(name)), confirm_kb(token))
+    elif kind == "unban":
+        await send(update, _('Снять блокировку с <b>{escape}</b>?', escape=html.escape(who)), confirm_kb(token))
+    elif kind == "reboot":
+        await send(update, f"🖥 <b>{html.escape(name)}</b>\n"
+                   + _('🔄 <b>Перезагрузить сервер?</b>\nСервер и все контейнеры будут недоступны 1–2 минуты.'),
+                   confirm_kb(token, _('Да, перезагрузить')))
+    elif kind == "apt":
+        await send(update, _('📦 Установить на {name}: {what}?', name=html.escape(name),
+                             what=pkgupdates.mode_text(target)), confirm_kb(token))
+
+
+async def handle_remote(update: Update, parts: list[str]) -> str | None:
+    """rs:ИМЯ:раздел:… — карточка другого сервера и её кнопки."""
+    q = update.callback_query
+    name = parts[1] if len(parts) > 1 else ""
+    srv = remote.server(name, CFG)
+    if srv is None:
+        return _('Сервера {name} нет в remote_servers', name=name)
+    sub = parts[2] if len(parts) > 2 else "card"
+    new = parts[-1] == "new"
+    show = send if new else edit
+    if sub == "card":
+        await show(update, remote.server_text(srv, CFG, None, STATE), rcard_kb(name))
+    elif sub == "chart":
+        period = parts[3] if len(parts) > 3 and parts[3] in history.PERIODS else "24h"
+        png, caption = await make_chart(period, name)
+        if png is None:
+            return _('Данных за этот период пока нет')
+        markup = rchart_kb(name, period)
+        if len(parts) > 4 and parts[4] == "e":
+            await q.edit_message_media(InputMediaPhoto(png, caption=caption), reply_markup=markup)
+        else:
+            await update.effective_message.reply_photo(png, caption=caption, reply_markup=markup)
+    elif sub == "procs":
+        by = parts[3] if len(parts) > 3 and parts[3] in ("cpu", "mem") else "cpu"
+        n = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 10
+        await show(update, await asyncio.to_thread(remote.procs_text, name, by, n), rprocs_kb(name, by, n))
+    elif sub == "svcs":
+        await show(update, remote.services_text(name), rsvcs_kb(name))
+    elif sub == "net":
+        await show(update, remote.net_text(name, STATE), kb([Btn(_('🔄 Обновить'), callback_data=f"rs:{name}:net"),
+                                                            rback(name)]))
+    elif sub == "upd":
+        force = len(parts) > 3 and parts[3] == "refresh"
+        await show(update, await asyncio.to_thread(remote.updates_text, name, force), rupd_kb(name))
+    elif sub == "logs" and len(parts) > 4:
+        kind, target = parts[3], ":".join(parts[4:])
+        out = await asyncio.to_thread(remote.logs, name, kind, target, 30)
+        await send(update, f"📜 <b>{html.escape(target)}</b> · {html.escape(name)}\n<pre>{html.escape(out[-3500:])}</pre>",
+                   kb([rbtn(_('🔄 Обновить'), f"rs:{name}:logs:{kind}:{target}")]))
+    elif sub == "menu":
+        if not actions_on():
+            return _('Действия выключены в config.yaml')
+        await show(update, *rmenu(name))
+    elif sub == "banned":
+        await show(update, *rbanned_view(name))
+    elif sub == "do" and len(parts) > 4:
+        if not actions_on():
+            return _('Действия выключены в config.yaml')
+        await rask(update, name, parts[3], ":".join(parts[4:]))
+    return None
+
+
+def rchart_kb(name: str, period: str) -> InlineKeyboardMarkup:
+    return kb([Btn(("• " if p == period else "") + _(history.PERIOD_NAMES[p]), callback_data=f"rs:{name}:chart:{p}:e")
+               for p in history.PERIODS])
 
 
 # ---------- Фоновые задачи ----------
@@ -1644,7 +1837,7 @@ async def monitor_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await broadcast(ctx.bot, group_text(alerts), group_kb())
         return
     for a in alerts:
-        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or (a.key or "").startswith(("log:", "slog:", "brute:")) else None
+        markup = alert_kb(a.key, a.kind in ("alert", "remind")) if a.kind in ("alert", "remind") or checks.local_key(a.key or "").startswith(("log:", "slog:", "brute:", "apt:updates")) else None
         if a.key == "apt:updates":
             markup = kb([Btn(_('📦 Показать и установить'), callback_data="pkg:view:new")])
         body = a.text.replace(f"[{a.server}] ", "", 1) if a.server else a.text  # имя сервера и так в заголовке

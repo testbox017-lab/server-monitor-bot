@@ -645,6 +645,7 @@ class AlertState:
     remote_ssh_failed: dict[str, list] = field(default_factory=dict)  # другой сервер → [[ts, ip, n]] за час
     remote_fail_alert_at: dict[str, float] = field(default_factory=dict)
     remote_ports: dict[str, list] = field(default_factory=dict)  # другой сервер → известные открытые порты
+    remote_upd_alert_at: dict[str, float] = field(default_factory=dict)  # другой сервер → когда писали об обновлениях
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
@@ -898,6 +899,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
             import remote
             try:
                 out += remote.events(cfg, state, now, muted, quiet)
+                out += remote.update_events(cfg, state, now, muted, quiet)
             except Exception:
                 import logging
                 logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности других серверов')

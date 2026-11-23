@@ -3028,10 +3028,13 @@ class AgentTest(unittest.TestCase):
 
     def test_parse_cmd(self):
         a = self.a
-        self.assertEqual(a.parse_cmd("status"), [])
-        self.assertEqual(a.parse_cmd("status ssh,docker"), ["ssh", "docker"])
-        self.assertEqual(a.parse_cmd("status ssh,"), ["ssh"])
-        for bad in ("", "bash", "status ssh;id", "status a b", "status $(id)", "rm -rf /", "status ../x y"):
+        self.assertEqual(a.parse_cmd("status"), ([], None))
+        self.assertEqual(a.parse_cmd("status ssh,docker"), (["ssh", "docker"], None))
+        self.assertEqual(a.parse_cmd("status ssh,"), (["ssh"], None))
+        self.assertEqual(a.parse_cmd("status ssh since=1795400000"), (["ssh"], 1795400000))
+        self.assertEqual(a.parse_cmd("status since=5"), ([], 5))
+        for bad in ("", "bash", "status ssh;id", "status a b", "status $(id)", "rm -rf /", "status ../x y",
+                    "status since=1 since=2", "status since=-1", "status since=x", "status ssh since=1 z"):
             self.assertIsNone(a.parse_cmd(bad), bad)
 
     def test_main_refuses_other_commands(self):
@@ -3072,7 +3075,7 @@ class RemoteTest(unittest.TestCase):
         remote.ERRORS.clear()
 
     def fetcher(self, data=None, err="Connection timed out"):
-        return lambda srv, cfg, d: (data, "") if data is not None else (None, err)
+        return lambda *a: (data, "") if data is not None else (None, err)
 
     def test_servers_validated(self):
         cfg = {"remote_servers": [{"name": "ok", "host": "h.example"}, {"name": "bad name", "host": "h"},
@@ -3143,7 +3146,7 @@ class RemoteTest(unittest.TestCase):
     def test_step_real_calls_remote(self):
         with mock.patch.object(checks, "oom_kills", return_value=None), \
              mock.patch.object(checks, "evaluate", return_value=results()), \
-             mock.patch.object(remote, "fetch", side_effect=lambda s, c, d: (None, "refused")), \
+             mock.patch.object(remote, "fetch", side_effect=lambda *a: (None, "refused")), \
              mock.patch("security.events", return_value=[]), \
              mock.patch.object(checks, "docker_events", return_value=[]), \
              mock.patch.object(checks, "service_events", return_value=[]), \
@@ -3213,6 +3216,97 @@ class RemoteBotTest(unittest.TestCase):
         asyncio.run(b.cmd_servers(upd, mock.MagicMock()))
         self.assertIn("Других серверов нет", upd.effective_message.reply_text.await_args.args[0])
         self.assertIn("servers", {n for n, _ in b.COMMANDS})
+
+
+
+
+# ---------- Другие серверы: безопасность (этап Б2) ----------
+
+class AgentSecurityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.a = load_agent()
+
+    def test_own_fingerprint_and_ssh_lines(self):
+        a = self.a
+        import base64 as b64
+        import hashlib as hl
+        blob = b64.b64encode(b"\x00\x00\x00\x0bssh-ed25519" + b"k" * 36).decode()
+        fp = "SHA256:" + b64.b64encode(hl.sha256(b64.b64decode(blob)).digest()).decode().rstrip("=")
+        ak = (f'command="/usr/local/sbin/monitor-agent",restrict ssh-ed25519 {blob} monitor-bot\n'
+              f'ssh-ed25519 {b64.b64encode(b"other").decode()} me@pc\n')
+        self.assertEqual(a.own_fingerprints(ak), {fp})
+        log = (f"Accepted publickey for root from 2.29.199.153 port 1 ssh2: ED25519 {fp}\n"
+               "pam_unix(sshd:session): session opened for user root\n"
+               "Accepted publickey for ubuntu from 9.9.9.9 port 2 ssh2: ED25519 SHA256:me\n"
+               "Connection closed by authenticating user root 1.2.3.4 port 3 [preauth]\n"
+               "Invalid user admin from 5.6.7.8 port 4\n")
+        self.assertEqual(a.ssh_lines(log, {fp}), [
+            "Accepted publickey for ubuntu from 9.9.9.9 port 2 ssh2: ED25519 SHA256:me",
+            "Connection closed by authenticating user root 1.2.3.4 port 3 [preauth]",
+            "Invalid user admin from 5.6.7.8 port 4"])
+
+    def test_ports_and_fail2ban(self):
+        a = self.a
+        ss = ("tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\ntcp LISTEN 0 4096 [::]:22 [::]:*\n"
+              "udp UNCONN 0 0 127.0.0.54:53 0.0.0.0:*\ntcp LISTEN 0 5 [::1]:631 [::]:*\n"
+              "tcp LISTEN 0 5 0.0.0.0:8080 0.0.0.0:*\n")
+        self.assertEqual(a.listening_ports(ss), ["tcp/22", "tcp/8080"])
+        f2b = ("Status for the jail: sshd\n|- Filter\n|  |- Currently failed:\t3\n`- Actions\n"
+               "   |- Currently banned:\t2\n   |- Total banned:\t7\n   `- Banned IP list:\t1.2.3.4 5.6.7.8\n")
+        self.assertEqual(a.parse_f2b(f2b), {"banned": 2, "total": 7, "ips": ["1.2.3.4", "5.6.7.8"]})
+
+
+class RemoteSecurityTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"thresholds": {}, "tz": "Europe/Kyiv", "ssh_fail_threshold": 5,
+                    "remote_servers": [{"name": "ovh", "host": "203.0.113.5"}]}
+        self.st = checks.AlertState.load(TMP / f"rsec_{self._testMethodName}.json")
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+
+    def poll(self, now, **extra):
+        data = dict(AGENT_DATA, time=now, **extra)
+        seen = []
+
+        def fetcher(srv, cfg, d, since):
+            seen.append(since)
+            return data, ""
+        remote.evaluate(self.cfg, self.st, now, None, fetcher)
+        return seen, remote.events(self.cfg, self.st, now, False, False)
+
+    def test_since_passed_and_logins(self):
+        self.st.known_ips = ["145.224.101.1"]  # с него уже входили на главный сервер
+        seen, ev = self.poll(T0, ports=["tcp/22"])
+        self.assertEqual((seen, ev), ([None], []))
+        lines = ["Accepted publickey for ubuntu from 145.224.101.1 port 1 ssh2: ED25519 SHA256:a",
+                 "Accepted publickey for root from 198.51.100.7 port 2 ssh2: ED25519 SHA256:b"]
+        seen, ev = self.poll(T0 + 60, ssh=lines, ports=["tcp/22"])
+        self.assertEqual(seen, [T0])
+        self.assertEqual([(e.server, e.key) for e in ev], [("ovh", None)])
+        self.assertIn("198.51.100.7", ev[0].text)
+        seen, ev = self.poll(T0 + 120, ssh=lines[1:], ports=["tcp/22"])  # тот же IP второй раз — тихо
+        self.assertEqual(ev, [])
+        self.assertEqual(remote.events(self.cfg, self.st, T0 + 130, False, False), [])  # без нового опроса — ничего
+
+    def test_bruteforce_and_ports(self):
+        self.poll(T0, ports=["tcp/22"])
+        bad = ["Connection closed by authenticating user root 192.0.2.9 port %d [preauth]" % i for i in range(6)]
+        __, ev = self.poll(T0 + 60, ssh=bad, ports=["tcp/22", "tcp/8080"])
+        texts = [e.text for e in ev]
+        self.assertTrue(any("192.0.2.9 (6)" in t for t in texts), texts)
+        self.assertTrue(any("tcp/8080" in t for t in texts), texts)
+        self.assertTrue(all(e.server == "ovh" and e.key is None for e in ev))
+        __, ev = self.poll(T0 + 120, ssh=bad, ports=["tcp/22", "tcp/8080"])
+        self.assertEqual(ev, [])  # о подборе — не чаще раза в час, порт уже известен
+        t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0 + 130, self.st)
+        self.assertIn("за час: 12", t)
+        self.assertIn("tcp/22, tcp/8080", t)
+
+    def test_fail2ban_line(self):
+        self.poll(T0, fail2ban={"sshd": {"banned": 2, "total": 5, "ips": []}})
+        t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0, self.st)
+        self.assertIn("заблокировано сейчас 2, всего 5", t)
 
 
 if __name__ == "__main__":

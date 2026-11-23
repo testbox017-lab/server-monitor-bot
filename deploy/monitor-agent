@@ -6,10 +6,15 @@
     command="/usr/local/sbin/monitor-agent",restrict ssh-ed25519 AAAA... monitor-bot@главный-сервер
 Поэтому по этому ключу нельзя получить оболочку или запустить что-то ещё: ssh-команда приходит
 в SSH_ORIGINAL_COMMAND, и агент понимает только:
-    status [SVC,SVC...]   — CPU, память, диски, нагрузка, аптайм, нужна ли перезагрузка,
-                            состояние перечисленных служб systemd и всех контейнеров docker
+    status [SVC,SVC...] [since=TS]
+                          — CPU, память, диски, нагрузка, аптайм, нужна ли перезагрузка, состояние
+                            перечисленных служб systemd и всех контейнеров docker, открытые порты,
+                            блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
+                            с момента TS (без входов самого бота по ключу агента)
 Ничего не меняет на сервере.
 """
+import base64
+import hashlib
 import json
 import os
 import platform
@@ -126,18 +131,146 @@ def containers() -> dict | None:
     return parse_ps(r.stdout) if r.returncode == 0 else None
 
 
-def parse_cmd(cmd: str) -> list[str] | None:
-    """Службы из команды «status a,b». None — команда не разрешена."""
+def parse_cmd(cmd: str) -> tuple[list[str], int | None] | None:
+    """(службы, since) из команды «status [a,b] [since=TS]». None — команда не разрешена."""
     p = cmd.split()
-    if not p or p[0] != "status" or len(p) > 2:
+    if not p or p[0] != "status" or len(p) > 3:
         return None
-    names = [x for x in (p[1].split(",") if len(p) == 2 else []) if x]
+    names, since = [], None
+    for tok in p[1:]:
+        if tok.startswith("since="):
+            if since is not None or not tok[6:].isdigit():
+                return None
+            since = int(tok[6:])
+        elif not names:
+            names = [x for x in tok.split(",") if x]
+            if not names:
+                return None
+        else:
+            return None
     if len(names) > 50 or not all(SVC_RE.match(x) for x in names):
         return None
-    return names
+    return names, since
 
 
-def status(services: list[str]) -> dict:
+# ---------- SSH ----------
+
+SSH_WORDS = ("Accepted ", "Failed ", "Invalid user ", "[preauth]")
+SSH_MAX_LINES = 5000
+
+
+def key_fingerprint(blob_b64: str) -> str:
+    """SHA256:… как в журнале sshd, по base64 ключа из authorized_keys."""
+    raw = base64.b64decode(blob_b64)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+
+def own_fingerprints(text: str) -> set[str]:
+    """Отпечатки ключей, которые запускают этого агента: их входы — это сам главный бот, не человек."""
+    out = set()
+    for line in text.splitlines():
+        if "monitor-agent" not in line.split(" ssh-", 1)[0]:
+            continue
+        parts = line.split()
+        for i, w in enumerate(parts[:-1]):
+            if w.startswith(("ssh-", "ecdsa-")):
+                try:
+                    out.add(key_fingerprint(parts[i + 1]))
+                except ValueError:
+                    pass
+                break
+    return out
+
+
+def ssh_lines(text: str, skip_fps: set[str]) -> list[str]:
+    """Строки sshd о входах и неудачных попытках, без входов самого бота; не больше SSH_MAX_LINES последних."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not any(w in line for w in SSH_WORDS):
+            continue
+        if line.startswith("Accepted ") and any(line.endswith(fp) for fp in skip_fps):
+            continue
+        out.append(line)
+    return out[-SSH_MAX_LINES:]
+
+
+def ssh_log(since: int) -> list[str] | None:
+    try:
+        r = subprocess.run(["journalctl", "-u", "ssh.service", "-u", "sshd.service", "--since", f"@{since}",
+                            "-o", "cat", "--no-pager"], capture_output=True, text=True, timeout=30,
+                           errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        with open("/root/.ssh/authorized_keys") as fh:
+            fps = own_fingerprints(fh.read())
+    except OSError:
+        fps = set()
+    return ssh_lines(r.stdout, fps)
+
+
+def listening_ports(text: str) -> list[str]:
+    """«tcp/22», «udp/53» из ss -H -tuln: открытые не только на localhost."""
+    ports = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        addr, _, port = parts[4].rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if addr.startswith("127.") or addr == "::1":
+            continue
+        ports.add(f"{parts[0]}/{port}")
+    return sorted(ports)
+
+
+def ports() -> list[str] | None:
+    try:
+        r = subprocess.run(["ss", "-H", "-tuln"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return listening_ports(r.stdout) if r.returncode == 0 else None
+
+
+def parse_f2b(text: str) -> dict:
+    """Из «fail2ban-client status JAIL»: сколько заблокировано сейчас и всего, и список IP."""
+    res = {"banned": 0, "total": 0, "ips": []}
+    for line in text.splitlines():
+        k, _, v = line.strip(" |`-\t").partition(":")
+        v = v.strip()
+        if k == "Currently banned" and v.isdigit():
+            res["banned"] = int(v)
+        elif k == "Total banned" and v.isdigit():
+            res["total"] = int(v)
+        elif k == "Banned IP list":
+            res["ips"] = v.split()[:100]
+    return res
+
+
+def fail2ban() -> dict | None:
+    """{jail: {...}} по всем jail fail2ban; None — fail2ban не установлен."""
+    if not shutil.which("fail2ban-client"):
+        return None
+    try:
+        r = subprocess.run(["fail2ban-client", "status"], capture_output=True, text=True, timeout=10)
+        jails = []
+        for line in r.stdout.splitlines():
+            if "Jail list:" in line:
+                jails = [j.strip() for j in line.split(":", 1)[1].split(",") if j.strip()]
+        out = {}
+        for j in jails[:10]:
+            if re.match(r"^[A-Za-z0-9_.-]+$", j):
+                rj = subprocess.run(["fail2ban-client", "status", j], capture_output=True, text=True, timeout=10)
+                out[j] = parse_f2b(rj.stdout)
+        return out
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def status(services: list[str], since: int | None = None) -> dict:
     with open("/proc/meminfo") as fh:
         mem = meminfo(fh.read())
     with open("/proc/uptime") as fh:
@@ -156,16 +289,19 @@ def status(services: list[str]) -> dict:
         "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
         "services": {s: service_state(s) for s in services},
         "containers": containers(),
+        "ssh": ssh_log(since) if since else None,
+        "ports": ports(),
+        "fail2ban": fail2ban(),
     }
 
 
 def main() -> int:
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:]))
-    names = parse_cmd(cmd)
-    if names is None:
+    parsed = parse_cmd(cmd)
+    if parsed is None:
         print(json.dumps({"error": "command not allowed"}))
         return 2
-    print(json.dumps(status(names)))
+    print(json.dumps(status(*parsed)))
     return 0
 
 

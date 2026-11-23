@@ -1132,6 +1132,12 @@ UK = {
         "🕑 Дані {n} с тому",
     "Других серверов нет. Добавьте remote_servers в config.yaml (см. README).":
         "Інших серверів немає. Додайте remote_servers у config.yaml (див. README).",
+    "🛡 Неудачных входов по SSH за час: {n}":
+        "🛡 Невдалих входів по SSH за годину: {n}",
+    "🚫 fail2ban: заблокировано сейчас {banned}, всего {total}":
+        "🚫 fail2ban: заблоковано зараз {banned}, усього {total}",
+    "🚪 Порты наружу: {ports}":
+        "🚪 Порти назовні: {ports}",
 }
 
 EN = {
@@ -2263,4 +2269,10 @@ EN = {
         "🕑 Data from {n} s ago",
     "Других серверов нет. Добавьте remote_servers в config.yaml (см. README).":
         "No other servers. Add remote_servers to config.yaml (see README).",
+    "🛡 Неудачных входов по SSH за час: {n}":
+        "🛡 Failed SSH logins in the last hour: {n}",
+    "🚫 fail2ban: заблокировано сейчас {banned}, всего {total}":
+        "🚫 fail2ban: banned now {banned}, total {total}",
+    "🚪 Порты наружу: {ports}":
+        "🚪 Public ports: {ports}",
 }

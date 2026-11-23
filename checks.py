@@ -640,6 +640,11 @@ class AlertState:
     bak_first_seen: dict[str, float] = field(default_factory=dict)  # папка бэкапов → когда бот впервые её увидел
     remote_fails: dict[str, int] = field(default_factory=dict)  # другой сервер → неудачных опросов подряд
     remote_last: dict[str, dict] = field(default_factory=dict)  # другой сервер → результаты последнего опроса
+    remote_ssh_at: dict[str, int] = field(default_factory=dict)  # другой сервер → до какого времени журнал SSH прочитан
+    remote_known_ips: dict[str, dict] = field(default_factory=dict)  # другой сервер → {IP входа: когда}
+    remote_ssh_failed: dict[str, list] = field(default_factory=dict)  # другой сервер → [[ts, ip, n]] за час
+    remote_fail_alert_at: dict[str, float] = field(default_factory=dict)
+    remote_ports: dict[str, list] = field(default_factory=dict)  # другой сервер → известные открытые порты
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
@@ -889,6 +894,13 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:  # безопасность не должна ломать основную проверку
             import logging
             logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности')
+        if cfg.get("remote_servers"):
+            import remote
+            try:
+                out += remote.events(cfg, state, now, muted, quiet)
+            except Exception:
+                import logging
+                logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности других серверов')
         out += docker_events(cfg, state, now, recovered, muted, quiet)
         out += service_events(cfg, state, now, recovered, muted, quiet)
         import probes

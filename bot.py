@@ -1943,6 +1943,15 @@ async def backup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await broadcast(ctx.bot, _('❌ Не все копии удалось отправить:\n') + html.escape("\n".join(errors)))
 
 
+async def remote_backups_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в 30 минут: свежие копии с других серверов — сюда (их видят /backup, backup-watch и забор на ПК)."""
+    try:
+        for line in await asyncio.to_thread(remote.sync_backups, CFG, S.dir):
+            log.info("Копия с другого сервера: %s", line)
+    except Exception:
+        log.exception("Не удалось забрать копии с других серверов")
+
+
 async def run_verify() -> str:
     results, err = await asyncio.to_thread(backups.verify_all, S.dir)
     STATE.verify_last = {"ts": time.time(), "results": results, "err": err}
@@ -2011,11 +2020,13 @@ async def summary_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def reschedule(app: Application) -> None:
     jq = app.job_queue
-    for name in ("monitor", "summary", "backup", "verify", "weekly"):
+    for name in ("monitor", "summary", "backup", "verify", "weekly", "remote_backups"):
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
     interval = int(CFG.get("check_interval_sec", 60))
     jq.run_repeating(monitor_job, interval=interval, first=10, name="monitor")
+    if remote.servers(CFG):
+        jq.run_repeating(remote_backups_job, interval=1800, first=90, name="remote_backups")
     if CFG.get("daily_summary"):
         h, m = map(int, CFG["daily_summary"].split(":"))
         jq.run_daily(summary_job, time=dt.time(h, m, tzinfo=checks.tz(CFG)), name="summary")

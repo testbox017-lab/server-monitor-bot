@@ -11,8 +11,10 @@
                             перечисленных служб systemd и всех контейнеров docker, открытые порты,
                             блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
                             с момента TS (без входов самого бота по ключу агента)
-    logs / restart / ban / unban / reboot — действия из бота, ровно в видах из parse_action().
-                            Перезапуск служб — только из /etc/monitor-agent/allowed-services.
+                            и строки с ошибками из логов работающих контейнеров (ctr_logs)
+    logs / restart / ban / unban / reboot / backups / backup-get — действия из бота, ровно в видах
+                            из parse_action(). Перезапуск служб — только из /etc/monitor-agent/allowed-services,
+                            копии — только из папок /etc/monitor-agent/backup-watch.
 """
 import base64
 import hashlib
@@ -122,15 +124,75 @@ def parse_ps(text: str) -> dict:
     return res
 
 
+INSPECT_FMT = "{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}"
+
+
+def parse_inspect(text: str) -> dict:
+    """{имя: {restarts, started}} из docker inspect -f INSPECT_FMT."""
+    res = {}
+    for line in text.splitlines():
+        p = line.split("\t")
+        if len(p) < 3 or not p[0]:
+            continue
+        try:
+            restarts = int(p[1])
+        except ValueError:
+            restarts = 0
+        res[p[0].lstrip("/")] = {"restarts": restarts, "started": p[2]}
+    return res
+
+
 def containers() -> dict | None:
-    """None — docker не установлен или не отвечает."""
+    """None — docker не установлен или не отвечает. Для каждого: state, health, restarts, started."""
     if not shutil.which("docker"):
         return None
     try:
         r = subprocess.run(["docker", "ps", "-a", "--format", PS_FMT], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return parse_ps(r.stdout) if r.returncode == 0 else None
+    if r.returncode != 0:
+        return None
+    res = parse_ps(r.stdout)
+    names = [n for n in res if CTR_RE.match(n)]
+    if names:
+        try:
+            ri = subprocess.run(["docker", "inspect", "-f", INSPECT_FMT, *names], capture_output=True, text=True,
+                                timeout=20)
+            for n, extra in parse_inspect(ri.stdout).items():
+                if n in res:
+                    res[n].update(extra)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return res
+
+
+# Строки логов контейнеров, которые стоит показать главному боту: ошибки и признаки сбоя сети.
+LOG_WORDS = ("Traceback", "ERROR", "CRITICAL", "Exception", "FATAL", "Error", "Timeout", "TimedOut",
+             "Connection reset", "Temporary failure in name resolution", "Network is unreachable",
+             "Bad Gateway", "Gateway Timeout", "Service Unavailable")
+LOG_MAX_LINES = 100
+
+
+def log_hits(text: str) -> list[str]:
+    """Строки с LOG_WORDS, не больше LOG_MAX_LINES последних, каждая не длиннее 300 символов."""
+    return [ln.strip()[:300] for ln in text.splitlines() if any(w in ln for w in LOG_WORDS)][-LOG_MAX_LINES:]
+
+
+def ctr_logs(since: int, ctrs: dict | None) -> dict | None:
+    """{контейнер: [строки с ошибками]} с момента since — по всем работающим контейнерам."""
+    if not ctrs:
+        return None
+    out = {}
+    for name, info in ctrs.items():
+        if info.get("state") != "running" or not CTR_RE.match(name):
+            continue
+        try:
+            r = subprocess.run(["docker", "logs", "--since", str(int(since)), name], capture_output=True, text=True,
+                               timeout=20, errors="replace")
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        out[name] = log_hits(r.stdout + "\n" + r.stderr)
+    return out
 
 
 def parse_cmd(cmd: str) -> tuple[list[str], int | None] | None:
@@ -305,8 +367,9 @@ def status(services: list[str], since: int | None = None) -> dict:
             net = net_counters(fh.read())
     except OSError:
         net = None
+    ctrs = containers()
     return {
-        "v": 2,
+        "v": 3,
         "host": platform.node(),
         "os": f"{platform.system()} {platform.release()}",
         "time": time.time(),
@@ -319,7 +382,8 @@ def status(services: list[str], since: int | None = None) -> dict:
         "uptime": uptime,
         "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
         "services": {s: service_state(s) for s in services},
-        "containers": containers(),
+        "containers": ctrs,
+        "ctr_logs": ctr_logs(since, ctrs) if since else None,
         "ssh": ssh_log(since) if since else None,
         "ports": ports(),
         "fail2ban": fail2ban(),
@@ -435,6 +499,63 @@ def apt_upgrade(mode: str) -> dict:
                  f"{script} > /var/log/monitor-agent-apt.log 2>&1"], 30)
 
 
+# ---------- Резервные копии (главный бот забирает себе последнюю копию из каждой папки) ----------
+
+BACKUP_WATCH = "/etc/monitor-agent/backup-watch"
+BACKUP_MAX = 50 << 20  # больше 50 МБ через SSH в JSON не передаём
+
+
+def backup_dirs() -> list[str]:
+    """Папки с копиями из BACKUP_WATCH: путь в начале строки (дальше можно писать что угодно), # — комментарий."""
+    try:
+        with open(BACKUP_WATCH, encoding="utf-8") as fh:
+            lines = [ln.split("#", 1)[0].split() for ln in fh]
+    except OSError:
+        return []
+    return [os.path.normpath(p[0]) for p in lines if p and os.path.isabs(p[0])]
+
+
+def newest_backup(path: str) -> tuple[str, int, float] | None:
+    """(имя, размер, mtime) самой свежей копии; latest.* — копия последней, её не берём, если есть другие."""
+    files = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    files.append((e.name, st.st_size, st.st_mtime))
+    except OSError:
+        return None
+    files.sort(key=lambda x: x[2], reverse=True)
+    dated = [f for f in files if not f[0].startswith("latest")] or files
+    return dated[0] if dated else None
+
+
+def backups_list() -> dict:
+    return {"ok": True, "out": json.dumps([{"path": p, "newest": newest_backup(p)} for p in backup_dirs()])}
+
+
+def backup_get(n: int) -> dict:
+    """Последняя копия из n-й папки: JSON {name, size, mtime, b64} в out."""
+    dirs = backup_dirs()
+    if n >= len(dirs):
+        return {"ok": False, "out": "bad index"}
+    nb = newest_backup(dirs[n])
+    if nb is None:
+        return {"ok": False, "out": "no backups"}
+    name, size, mtime = nb
+    if size > BACKUP_MAX:
+        return {"ok": False, "out": f"too big: {size}"}
+    try:
+        fd = os.open(os.path.join(dirs[n], name), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read(BACKUP_MAX + 1)
+    except OSError as e:
+        return {"ok": False, "out": str(e)}
+    return {"ok": True, "out": json.dumps({"name": name, "size": len(data), "mtime": mtime,
+                                           "b64": base64.b64encode(data).decode()})}
+
+
 def parse_action(cmd: str) -> list[str] | None:
     """Разрешённые действия, ровно в этих видах:
         logs svc|ctr NAME N      — последние N (1–200) строк журнала службы или контейнера
@@ -445,10 +566,16 @@ def parse_action(cmd: str) -> list[str] | None:
         updates                  — пакеты, которые можно обновить (JSON в out)
         apt-upgrade security|all — установить обновления в фоне (служба monitor-agent-apt)
         reboot                   — перезагрузка через 5 секунд
+        backups                  — папки из /etc/monitor-agent/backup-watch и свежая копия в каждой (JSON)
+        backup-get N             — последняя копия из N-й папки (JSON с base64)
     """
     p = cmd.split()
     if not p:
         return None
+    if p == ["backups"]:
+        return p
+    if p[0] == "backup-get" and len(p) == 2 and p[1].isdigit() and int(p[1]) < 100:
+        return p
     if p[0] == "logs" and len(p) == 4 and p[1] in ("svc", "ctr") and p[3].isdigit() and 1 <= int(p[3]) <= 200:
         ok = SVC_RE.match(p[2]) if p[1] == "svc" else CTR_RE.match(p[2])
         return p if ok else None
@@ -470,6 +597,10 @@ def parse_action(cmd: str) -> list[str] | None:
 
 
 def action(p: list[str]) -> dict:
+    if p == ["backups"]:
+        return backups_list()
+    if p[0] == "backup-get":
+        return backup_get(int(p[1]))
     if p[0] == "logs":
         if p[1] == "svc":
             return _run(["journalctl", "-u", p[2], "-n", p[3], "--no-pager", "-o", "short-iso"], 30)

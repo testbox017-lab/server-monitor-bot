@@ -371,6 +371,7 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
             known = state.remote_known_ips.setdefault(name, {})
             for user, ip, method, fp in accepted:
                 if security.is_deploy(cfg, ip, fp):
+                    state.remote_deploy_at[name] = now  # перезапуск контейнера следом — это выкладка
                     continue
                 new = ip not in known and ip not in state.known_ips  # с этого IP уже входили на главный сервер
                 known[ip] = now
@@ -411,7 +412,139 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
                     state.log.append([now, f"{name}{SEP}port:{p}"])
                 if new_p:
                     state.remote_ports[name] = sorted(set(known_p) | set(new_p))
+        out += container_events(cfg, state, now, srv, data, muted, quiet)
     return out
+
+
+def container_events(cfg: dict, state, now: float, srv: dict, data: dict, muted: bool, quiet: bool) -> list:
+    """Перезапуски контейнеров другого сервера и ошибки в их логах — как docker_events у своего."""
+    from checks import Alert, BOOT_WINDOW, DEPLOY_WINDOW, DEFAULT_LOG_PATTERNS, docker_time, network_errors
+    name = srv["name"]
+    out: list = []
+    ctrs = data.get("containers") or {}
+    watched = watched_containers(srv, data)
+    boot = (data.get("time") or now) - float(data.get("uptime") or 0)
+    for c in watched:
+        i = ctrs.get(c) or {}
+        started = i.get("started")
+        if not started:
+            continue  # старый агент без StartedAt или контейнера нет (об этом — алерт «не работает»)
+        skey = f"{name}{SEP}{c}"
+        prev = state.remote_ctr_started.get(skey)
+        state.remote_ctr_started[skey] = started
+        if prev is None or prev == started:
+            continue
+        ts = docker_time(started)
+        if ts is not None and 0 <= ts - boot < BOOT_WINDOW:
+            state.log.append([now, f"{name}{SEP}boot:{c}"])  # поднялся вместе с сервером
+            continue
+        if now - state.remote_deploy_at.get(name, 0) < DEPLOY_WINDOW:
+            out.append(Alert(_('🚀 Деплой: {name} перезапущен с новой версией', name=c),
+                             f"{name}{SEP}deploy:{c}", "event", "journal", server=name))
+            state.log.append([now, f"{name}{SEP}deploy:{c}"])
+            continue
+        if muted:
+            continue
+        extra = _(' (автоперезапуск Docker, всего {restarts})', restarts=i["restarts"]) if i.get("restarts") else ""
+        out.append(Alert(_('🔁 Контейнер {name} перезапустился{extra}', name=c, extra=extra),
+                         f"{name}{SEP}log:{c}", "event", server=name))
+        state.log.append([now, f"{name}{SEP}restart:{c}"])
+
+    logs = data.get("ctr_logs")
+    if not cfg.get("log_alerts", True) or not isinstance(logs, dict) or muted or quiet:
+        return out
+    patterns = list(cfg.get("log_patterns") or DEFAULT_LOG_PATTERNS)
+    every = (cfg.get("log_alert_min") or 15) * 60
+    for c in watched:
+        lines = [str(x) for x in logs.get(c) or []]
+        hits = [ln for ln in lines if any(p in ln for p in patterns)]
+        skey = f"{name}{SEP}{c}"
+        if not hits or now - state.log_alert_at.get(skey, 0) < every:
+            continue
+        state.log_alert_at[skey] = now
+        sample = "\n".join(h[:200] for h in hits[:3])
+        if network_errors("\n".join(lines)):
+            state.log.append([now, f"{name}{SEP}net:{c}"])
+            out.append(Alert(_('🌐 Сетевые ошибки в логах {name}: {len} строк{when}. Похоже на сбой связи, а не '
+                               'на ошибку в коде.\n'
+                               '{sample}', name=c, len=len(hits), when="", sample=sample),
+                             f"{name}{SEP}log:{c}", "event", "quiet", server=name))
+        else:
+            state.log.append([now, f"{name}{SEP}logerr:{c}"])
+            out.append(Alert(_('⚠️ Ошибки в логах {name}: {len} строк\n'
+                               '{sample}', name=c, len=len(hits), sample=sample),
+                             f"{name}{SEP}log:{c}", "event", server=name))
+    return out
+
+
+# ---------- Копии с других серверов: последняя копия каждой папки лежит и здесь ----------
+
+LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]")
+FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,200}$")
+BACKUP_KEEP = 14
+
+
+def backup_root(cfg: dict, data_dir: Path | None) -> Path:
+    return Path(cfg.get("remote_backup_dir") or Path(data_dir or ".") / "remote-backups")
+
+
+def sync_backups(cfg: dict, data_dir: Path | None, agent=None) -> list[str]:
+    """Забрать с каждого сервера свежие копии, которых здесь ещё нет: <root>/<сервер>/<папка>/<файл>,
+    с тем же временем изменения, что там (по нему бот и backup-watch судят о свежести).
+    Хранится BACKUP_KEEP последних. Возвращает строки для журнала."""
+    import base64
+    import os
+    agent = agent or run_agent
+    log: list[str] = []
+    root = backup_root(cfg, data_dir)
+    for srv in servers(cfg):
+        name = srv["name"]
+        ok, out = agent(srv, ["backups"], 60, cfg)
+        try:
+            dirs = json.loads(out) if ok else None
+        except ValueError:
+            dirs = None
+        if not isinstance(dirs, list):
+            log.append(f"{name}: {out[:200] if not ok else 'bad answer'}")
+            continue
+        used: set[str] = set()
+        for n, d in enumerate(dirs):
+            newest = d.get("newest") if isinstance(d, dict) else None
+            if not newest:
+                continue
+            label = LABEL_RE.sub("_", os.path.basename(str(d.get("path") or "")) or "dir")[:40]
+            while label in used:
+                label += "_"
+            used.add(label)
+            fname, size, mtime = str(newest[0]), int(newest[1]), float(newest[2])
+            if not FILE_RE.match(fname):
+                log.append(f"{name}/{label}: bad file name")
+                continue
+            dest = root / name / label
+            target = dest / fname
+            if target.exists() and target.stat().st_size == size and abs(target.stat().st_mtime - mtime) < 2:
+                continue
+            ok, out = agent(srv, ["backup-get", str(n)], 300, cfg)
+            try:
+                got = json.loads(out) if ok else None
+                raw = base64.b64decode(got["b64"]) if got else None
+            except (ValueError, KeyError, TypeError):
+                raw = None
+            if raw is None or got.get("name") != fname:
+                log.append(f"{name}/{label}: {out[:200] if not ok else 'bad answer'}")
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            tmp = dest / f".{fname}.part"
+            tmp.write_bytes(raw)
+            os.chmod(tmp, 0o640)
+            os.utime(tmp, (float(got["mtime"]), float(got["mtime"])))
+            os.replace(tmp, target)
+            log.append(f"{name}/{label}: {fname} ({len(raw)} B)")
+            files = sorted((p for p in dest.iterdir() if p.is_file() and not p.name.startswith(".")),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in files[BACKUP_KEEP:]:
+                old.unlink()
+    return log
 
 
 def servers_text(cfg: dict, state=None) -> str:

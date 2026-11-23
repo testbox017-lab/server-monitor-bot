@@ -646,6 +646,8 @@ class AlertState:
     remote_fail_alert_at: dict[str, float] = field(default_factory=dict)
     remote_ports: dict[str, list] = field(default_factory=dict)  # другой сервер → известные открытые порты
     remote_upd_alert_at: dict[str, float] = field(default_factory=dict)  # другой сервер → когда писали об обновлениях
+    remote_deploy_at: dict[str, float] = field(default_factory=dict)  # другой сервер → последний вход ключом деплоя
+    remote_ctr_started: dict[str, str] = field(default_factory=dict)  # «сервер|контейнер» → StartedAt
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)

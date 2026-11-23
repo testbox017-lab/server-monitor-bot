@@ -2999,5 +2999,221 @@ class BotPackagesTest(unittest.TestCase):
         self.assertEqual(b.STATE.apt_reported, res["finished"])
 
 
+
+
+# ---------- Другие серверы (remote_servers) ----------
+
+import remote  # noqa: E402
+
+AGENT_DATA = {"v": 1, "host": "vps-1", "os": "Linux 7.0", "cpu": 12.0, "cpu_count": 4, "load": [0.1, 0.2, 0.3],
+              "ram": {"total": 8 << 30, "used": 1 << 30, "percent": 12.5}, "swap": {"total": 0, "used": 0, "percent": 0},
+              "disks": {"/": {"total": 70 << 30, "used": 3 << 30, "free": 67 << 30, "percent": 4.0}},
+              "uptime": 3600, "reboot_required": False, "services": {"ssh": "running"},
+              "containers": {"app": {"state": "running", "health": ""}}}
+
+
+def load_agent():
+    path = str(ROOT / "deploy" / "monitor-agent")
+    loader = importlib.machinery.SourceFileLoader("monitor_agent", path)
+    spec = importlib.util.spec_from_loader("monitor_agent", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class AgentTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.a = load_agent()
+
+    def test_parse_cmd(self):
+        a = self.a
+        self.assertEqual(a.parse_cmd("status"), [])
+        self.assertEqual(a.parse_cmd("status ssh,docker"), ["ssh", "docker"])
+        self.assertEqual(a.parse_cmd("status ssh,"), ["ssh"])
+        for bad in ("", "bash", "status ssh;id", "status a b", "status $(id)", "rm -rf /", "status ../x y"):
+            self.assertIsNone(a.parse_cmd(bad), bad)
+
+    def test_main_refuses_other_commands(self):
+        a = self.a
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "cat /etc/shadow"}), \
+             mock.patch("sys.stdout", out):
+            self.assertEqual(a.main(), 2)
+        self.assertIn("not allowed", out.getvalue())
+
+    def test_proc_parsers(self):
+        a = self.a
+        self.assertEqual(a.cpu_times("cpu  10 0 10 70 10 0 0 0 0 0\ncpu0 1 2 3"), (80, 100))
+        m = a.meminfo("MemTotal: 1000 kB\nMemFree: 100 kB\nMemAvailable: 250 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n")
+        self.assertEqual(m["ram"]["percent"], 75.0)
+        self.assertEqual(m["swap"]["percent"], 0.0)
+        mnt = ("/dev/sda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n/dev/sda15 /boot/efi vfat rw 0 0\n"
+               "/dev/loop0 /snap/core/1 squashfs ro 0 0\noverlay /var/lib/docker/x overlay rw 0 0\n"
+               "/dev/sdb1 /mnt/data\\040x ext4 rw 0 0\n")
+        self.assertEqual(a.mounts(mnt), ["/", "/mnt/data x"])
+
+    def test_parse_ps(self):
+        a = self.a
+        ps = "web\trunning\tUp 2 hours (healthy)\ndb\texited\tExited (1) 3 min ago\nq\trunning\tUp 1 min (unhealthy)\n"
+        self.assertEqual(a.parse_ps(ps), {"web": {"state": "running", "health": "healthy"},
+                                          "db": {"state": "exited", "health": ""},
+                                          "q": {"state": "running", "health": "unhealthy"}})
+
+
+class RemoteTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"thresholds": {"cpu": 90, "ram": 90, "disk": 90, "duration_sec": 300}, "remind_min": 0,
+                    "tz": "Europe/Kyiv",
+                    "remote_servers": [{"name": "ovh", "host": "203.0.113.5", "services": ["ssh"],
+                                        "containers": ["app"]}]}
+        self.st = checks.AlertState.load(TMP / f"rstate_{self._testMethodName}.json")
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+
+    def fetcher(self, data=None, err="Connection timed out"):
+        return lambda srv, cfg, d: (data, "") if data is not None else (None, err)
+
+    def test_servers_validated(self):
+        cfg = {"remote_servers": [{"name": "ok", "host": "h.example"}, {"name": "bad name", "host": "h"},
+                                  {"name": "x", "host": "-oProxyCommand=id"}, "junk", {"name": "y"}]}
+        self.assertEqual([s["name"] for s in remote.servers(cfg)], ["ok"])
+
+    def test_ssh_cmd_is_locked_down(self):
+        srv = {"name": "ovh", "host": "203.0.113.5", "services": ["ssh", "bad;id", "docker"]}
+        cmd = remote.ssh_cmd(srv, {}, Path("/var/lib/monitor_bot"))
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("BatchMode=yes", cmd)
+        self.assertIn("/var/lib/monitor_bot/remote_ed25519", [c.replace("\\", "/") for c in cmd])
+        self.assertEqual(cmd[-2:], ["root@203.0.113.5", "status ssh,docker"])
+
+    def test_results_from_agent(self):
+        data = json.loads(json.dumps(AGENT_DATA))
+        data["cpu"] = 97
+        data["services"]["ssh"] = "failed"
+        data["containers"]["app"] = {"state": "running", "health": "unhealthy"}
+        data["reboot_required"] = True
+        r = remote.evaluate(self.cfg, self.st, T0, None, self.fetcher(data))
+        self.assertIn("[ovh] ", r["ovh|cpu"])
+        self.assertIsNone(r["ovh|ram"])
+        self.assertIn("ssh", r["ovh|svc:ssh"])
+        self.assertIn("healthcheck", r["ovh|ctr:app"])
+        self.assertTrue(r["ovh|reboot_required"])
+        self.assertIsNone(r["ovh|down"])
+        self.assertIsNone(r["ovh|disk:/"])
+
+    def test_down_after_two_failures_keeps_old_problems(self):
+        data = json.loads(json.dumps(AGENT_DATA))
+        data["services"]["ssh"] = "failed"
+        remote.evaluate(self.cfg, self.st, T0, None, self.fetcher(data))
+        r1 = remote.evaluate(self.cfg, self.st, T0 + 60, None, self.fetcher())
+        self.assertIsNone(r1["ovh|down"])                 # одна неудача — ещё не тревога
+        self.assertTrue(r1["ovh|svc:ssh"])                 # старая проблема не «выздоровела»
+        r2 = remote.evaluate(self.cfg, self.st, T0 + 120, None, self.fetcher())
+        self.assertIn("Connection timed out", r2["ovh|down"])
+        r3 = remote.evaluate(self.cfg, self.st, T0 + 180, None, self.fetcher(AGENT_DATA))
+        self.assertIsNone(r3["ovh|down"])
+        self.assertIsNone(r3["ovh|svc:ssh"])
+        self.assertEqual(self.st.remote_fails["ovh"], 0)
+
+    def test_removed_server_forgotten(self):
+        remote.evaluate(self.cfg, self.st, T0, None, self.fetcher(AGENT_DATA))
+        self.cfg["remote_servers"] = []
+        remote.evaluate(self.cfg, self.st, T0 + 60, None, self.fetcher(AGENT_DATA))
+        self.assertNotIn("ovh", self.st.remote_last)
+
+    def test_step_alerts_carry_server_and_are_critical(self):
+        self.assertTrue(checks.is_critical("ovh|down"))
+        self.assertTrue(checks.is_critical("ovh|svc:ssh"))
+        self.assertFalse(checks.is_critical("ovh|cpu"))
+        self.assertFalse(checks.is_critical("down"))
+        self.assertTrue(checks.instant_keys("ovh|ctr:app"))
+        self.assertFalse(checks.instant_keys("ovh|cpu"))
+        self.assertEqual(checks.key_label("ovh|svc:ssh"), "ovh · ssh")
+        self.assertEqual(checks.key_label("ovh|down"), "ovh · связь")
+        self.cfg["quiet_hours"] = {"start": "00:00", "end": "23:59"}
+        with mock.patch.object(checks, "oom_kills", return_value=None):
+            a = checks.step(self.cfg, self.st, T0, results(**{"ovh|down": "[ovh] 📡 Сервер не отвечает: x",
+                                                              "ovh|cpu": "[ovh] cpu"}))
+            self.assertEqual([(x.kind, x.key, x.server) for x in a], [("alert", "ovh|down", "ovh")])
+            a = checks.step(self.cfg, self.st, T0 + 60, results(**{"ovh|down": None, "ovh|cpu": "[ovh] cpu"}))
+            self.assertEqual([(x.kind, x.server) for x in a], [("recovered", "ovh")])
+            self.assertIn("ovh · связь", a[0].text)
+
+    def test_step_real_calls_remote(self):
+        with mock.patch.object(checks, "oom_kills", return_value=None), \
+             mock.patch.object(checks, "evaluate", return_value=results()), \
+             mock.patch.object(remote, "fetch", side_effect=lambda s, c, d: (None, "refused")), \
+             mock.patch("security.events", return_value=[]), \
+             mock.patch.object(checks, "docker_events", return_value=[]), \
+             mock.patch.object(checks, "service_events", return_value=[]), \
+             mock.patch("probes.ssl_events", return_value=[]):
+            checks.step(self.cfg, self.st, T0)
+            a = checks.step(self.cfg, self.st, T0 + 60)
+        self.assertEqual([(x.key, x.server) for x in a], [("ovh|down", "ovh")])
+
+    def test_server_text(self):
+        self.assertIn("первая проверка", remote.servers_text(self.cfg))
+        remote.evaluate(self.cfg, self.st, T0, None, self.fetcher(AGENT_DATA))
+        t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0 + 30)
+        self.assertIn("<b>ovh</b>", t)
+        self.assertIn("30 с назад", t)
+        self.assertIn("служба ssh: running", t)
+        self.assertIn("app: running", t)
+        remote.evaluate(self.cfg, self.st, T0 + 60, None, self.fetcher(None, "No route <to> host"))
+        t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0 + 60)
+        self.assertIn("No route &lt;to&gt; host", t)
+        self.assertIn("Других серверов нет", remote.servers_text({}))
+
+
+class RemoteBotTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def cbs(self, markup):
+        return [x.callback_data for row in markup.inline_keyboard for x in row]
+
+    def test_alert_kb_remote_has_no_local_actions(self):
+        b = self.bot
+        for key in ("ovh|svc:cron", "ovh|ctr:weather-bot", "ovh|disk:/", "ovh|down"):
+            cbs = self.cbs(b.alert_kb(key, True))
+            self.assertIn("servers:new", cbs)
+            self.assertFalse([c for c in cbs if c.startswith(("act:", "logs:", "status"))], (key, cbs))
+
+    def test_servers_button_and_alert_header(self):
+        b = self.bot
+        self.assertNotIn("servers:new", self.cbs(b.status_kb()))
+        with mock.patch.dict(b.CFG, {"remote_servers": [{"name": "ovh", "host": "203.0.113.5"}]}):
+            self.assertIn("servers:new", self.cbs(b.status_kb()))
+            sent = []
+            alert = checks.Alert("[ovh] ❌ Служба ssh не работает (failed)", "ovh|svc:ssh", "alert", server="ovh")
+
+            async def fake_broadcast(bot, text, markup=None, silent=False):
+                sent.append(text)
+            ctx = mock.MagicMock()
+            with mock.patch.object(checks, "step", return_value=[alert]), \
+                 mock.patch.object(b, "broadcast", fake_broadcast), \
+                 mock.patch.object(b.HIST, "record"), \
+                 mock.patch.object(b, "run_autoban", mock.AsyncMock()), \
+                 mock.patch.object(b, "report_update", mock.AsyncMock()), \
+                 mock.patch.object(b, "report_apt", mock.AsyncMock()), \
+                 mock.patch.dict(b.CFG, {"heartbeat_url": ""}):
+                asyncio.run(b.monitor_job(ctx))
+            self.assertEqual(sent, ["<b>ovh</b>\n❌ Служба ssh не работает (failed)"])
+
+    def test_servers_command_and_button(self):
+        b = self.bot
+        upd = mock.MagicMock()
+        upd.effective_chat.id = 42
+        upd.effective_chat.type = "private"
+        upd.effective_message.reply_text = mock.AsyncMock()
+        asyncio.run(b.cmd_servers(upd, mock.MagicMock()))
+        self.assertIn("Других серверов нет", upd.effective_message.reply_text.await_args.args[0])
+        self.assertIn("servers", {n for n, _ in b.COMMANDS})
+
+
 if __name__ == "__main__":
     unittest.main()

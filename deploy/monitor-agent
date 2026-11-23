@@ -1,0 +1,173 @@
+#!/usr/bin/python3 -I
+"""Агент на втором (удалённом) сервере: отдаёт его состояние главному боту одним JSON.
+
+Устанавливается как /usr/local/sbin/monitor-agent (root:root, 755). Только стандартная библиотека Python.
+Главный бот заходит по SSH отдельным ключом, который в /root/.ssh/authorized_keys ограничен так:
+    command="/usr/local/sbin/monitor-agent",restrict ssh-ed25519 AAAA... monitor-bot@главный-сервер
+Поэтому по этому ключу нельзя получить оболочку или запустить что-то ещё: ssh-команда приходит
+в SSH_ORIGINAL_COMMAND, и агент понимает только:
+    status [SVC,SVC...]   — CPU, память, диски, нагрузка, аптайм, нужна ли перезагрузка,
+                            состояние перечисленных служб systemd и всех контейнеров docker
+Ничего не меняет на сервере.
+"""
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SVC_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,100}$")
+SKIP_FS = {"tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs", "cgroup", "cgroup2", "devpts",
+           "mqueue", "debugfs", "tracefs", "securityfs", "pstore", "bpf", "configfs", "fusectl",
+           "hugetlbfs", "autofs", "binfmt_misc", "efivarfs", "nsfs", "ramfs", "rpc_pipefs", "fuse.lxcfs"}
+PS_FMT = "{{.Names}}\t{{.State}}\t{{.Status}}"
+
+
+def cpu_times(text: str) -> tuple[int, int]:
+    """(простой, всего) из первой строки /proc/stat."""
+    f = [int(x) for x in text.split("\n", 1)[0].split()[1:]]
+    idle = f[3] + (f[4] if len(f) > 4 else 0)
+    return idle, sum(f[:8])
+
+
+def cpu_percent(interval: float = 1.0) -> float:
+    with open("/proc/stat") as fh:
+        i1, t1 = cpu_times(fh.read())
+    time.sleep(interval)
+    with open("/proc/stat") as fh:
+        i2, t2 = cpu_times(fh.read())
+    dt = t2 - t1
+    return round(100.0 * (1 - (i2 - i1) / dt), 1) if dt > 0 else 0.0
+
+
+def meminfo(text: str) -> dict:
+    """RAM и swap в байтах и процентах из /proc/meminfo."""
+    m = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        parts = v.split()
+        if parts and parts[0].isdigit():
+            m[k] = int(parts[0]) * 1024
+    total = m.get("MemTotal", 0)
+    avail = m.get("MemAvailable", m.get("MemFree", 0))
+    used = total - avail
+    st, sf = m.get("SwapTotal", 0), m.get("SwapFree", 0)
+    return {"ram": {"total": total, "used": used, "percent": round(100.0 * used / total, 1) if total else 0.0},
+            "swap": {"total": st, "used": st - sf, "percent": round(100.0 * (st - sf) / st, 1) if st else 0.0}}
+
+
+def mounts(text: str) -> list[str]:
+    """Точки монтирования настоящих дисков из /proc/mounts."""
+    out = []
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) < 3 or p[2] in SKIP_FS or not p[0].startswith("/"):
+            continue
+        path = p[1].replace("\\040", " ")
+        if path.startswith(("/snap/", "/boot/efi", "/run/", "/proc", "/sys", "/dev")):
+            continue
+        out.append(path)
+    return sorted(set(out))
+
+
+def disks() -> dict:
+    with open("/proc/mounts") as fh:
+        paths = mounts(fh.read())
+    res = {}
+    for p in paths:
+        try:
+            u = shutil.disk_usage(p)
+        except OSError:
+            continue
+        if u.total:
+            res[p] = {"total": u.total, "used": u.used, "free": u.free, "percent": round(100.0 * u.used / u.total, 1)}
+    return res
+
+
+def service_state(name: str) -> str:
+    try:
+        r = subprocess.run(["systemctl", "show", name, "--property=ActiveState,SubState,LoadState"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    p = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    if p.get("LoadState") == "not-found":
+        return "not-found"
+    if p.get("ActiveState") == "active":
+        return "running" if p.get("SubState") in ("running", "exited", "listening", "mounted") else p.get("SubState", "?")
+    return p.get("ActiveState", "unknown")
+
+
+def parse_ps(text: str) -> dict:
+    """{имя: {state, health}} из docker ps -a --format PS_FMT."""
+    res = {}
+    for line in text.splitlines():
+        p = line.split("\t")
+        if len(p) < 2 or not p[0]:
+            continue
+        status = p[2] if len(p) > 2 else ""
+        health = ("unhealthy" if "(unhealthy)" in status else "healthy" if "(healthy)" in status
+                  else "starting" if "(health: starting)" in status else "")
+        res[p[0]] = {"state": p[1], "health": health}
+    return res
+
+
+def containers() -> dict | None:
+    """None — docker не установлен или не отвечает."""
+    if not shutil.which("docker"):
+        return None
+    try:
+        r = subprocess.run(["docker", "ps", "-a", "--format", PS_FMT], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_ps(r.stdout) if r.returncode == 0 else None
+
+
+def parse_cmd(cmd: str) -> list[str] | None:
+    """Службы из команды «status a,b». None — команда не разрешена."""
+    p = cmd.split()
+    if not p or p[0] != "status" or len(p) > 2:
+        return None
+    names = [x for x in (p[1].split(",") if len(p) == 2 else []) if x]
+    if len(names) > 50 or not all(SVC_RE.match(x) for x in names):
+        return None
+    return names
+
+
+def status(services: list[str]) -> dict:
+    with open("/proc/meminfo") as fh:
+        mem = meminfo(fh.read())
+    with open("/proc/uptime") as fh:
+        uptime = float(fh.read().split()[0])
+    return {
+        "v": 1,
+        "host": platform.node(),
+        "os": f"{platform.system()} {platform.release()}",
+        "time": time.time(),
+        "cpu": cpu_percent(),
+        "cpu_count": os.cpu_count() or 1,
+        "load": list(os.getloadavg()),
+        **mem,
+        "disks": disks(),
+        "uptime": uptime,
+        "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
+        "services": {s: service_state(s) for s in services},
+        "containers": containers(),
+    }
+
+
+def main() -> int:
+    cmd = os.environ.get("SSH_ORIGINAL_COMMAND", " ".join(sys.argv[1:]))
+    names = parse_cmd(cmd)
+    if names is None:
+        print(json.dumps({"error": "command not allowed"}))
+        return 2
+    print(json.dumps(status(names)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

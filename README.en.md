@@ -55,6 +55,15 @@ Once a minute the bot writes CPU, RAM, disk usage and network counters to `metri
 - `/incidents`: the last 15 incidents with start time and duration, and downtime over 7 days. Incidents are always logged, even during quiet hours or when notifications are muted. Stored in `metrics.db` for 180 days.
 - **Weekly report** every Monday at 09:00: incidents and downtime by problem compared with last week, uptime of each external check, average and peak load, disk, traffic, events by type, backups, number of IPs blocked by the bot, and a 7-day chart.
 
+## Other servers
+
+One bot can watch other servers too: on every check it logs in over SSH and asks the agent `deploy/monitor-agent`
+for CPU, memory, disks, services, containers and pending reboot. Thresholds are shared with the main server.
+Alerts carry the other server's name in the header; `/servers` shows its last state. Two failed polls in a row
+raise a critical "📡 Server is not responding" alert. The agent is read-only and is reached with a key restricted
+in `/root/.ssh/authorized_keys` by `command="/usr/local/sbin/monitor-agent",restrict`. See `remote_servers` in
+`config.example.yaml` and the Russian README for step-by-step setup.
+
 ## Security
 
 - SSH login from a new IP: immediately. Password brute force (more than the threshold of failed attempts in 10 minutes): at most once an hour. The bot needs to read the sshd journal: `sudo usermod -aG systemd-journal monitor`.

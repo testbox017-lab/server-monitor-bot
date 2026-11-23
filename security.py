@@ -16,6 +16,10 @@ ACCEPTED_RE = re.compile(r"^Accepted (\S+) for (\S+) from (\S+) port \d+(?: ssh2
 # берём с конца строки, а имя — всё, что между.
 FAILED_RE = re.compile(r"^Failed \S+ for (?:invalid user )?(.*) from (\S+) port (\d+)(?: ssh2)?$")
 INVALID_RE = re.compile(r"^Invalid user (.*) from (\S+) port (\d+)$")
+# Пароли выключены — перебор ключами даёт только «Connection closed by authenticating user root 1.2.3.4
+# port 5 [preauth]» (или invalid user, или Connection reset / Disconnected from). Это тоже неудачная попытка.
+PREAUTH_RE = re.compile(r"^(?:Connection closed|Connection reset|Disconnected from) (?:by )?"
+                        r"(?:authenticating|invalid) user (.*) ([0-9A-Fa-f:.]+) port (\d+) \[preauth\]$")
 KNOWN_IP_DAYS = 30   # IP с успешным входом не попадает под автобан столько дней после последнего входа
 
 
@@ -43,6 +47,7 @@ def parse_ssh(text: str) -> tuple[list[tuple[str, str, str, str]], dict[str, int
     accepted, failed = [], {}
     failed_conns: set[tuple[str, str]] = set()   # (ip, порт) соединений, где уже была строка Failed
     invalid: list[tuple[str, str]] = []
+    preauth: list[tuple[str, str]] = []
     for line in text.splitlines():
         line = line.strip()
         m = ACCEPTED_RE.match(line)
@@ -58,9 +63,14 @@ def parse_ssh(text: str) -> tuple[list[tuple[str, str, str, str]], dict[str, int
         m = INVALID_RE.match(line)
         if m:
             invalid.append((m.group(2), m.group(3)))
+            continue
+        m = PREAUTH_RE.match(line)
+        if m:
+            preauth.append((m.group(2), m.group(3)))
     # «Invalid user» и «Failed password for invalid user» — одна и та же попытка. Отдельно считаем
     # только «Invalid user» без пароля (например, перебор только ключами).
-    for ip, port in invalid:
+    # Закрытие соединения до входа считаем, только если об этом соединении ещё не было строки
+    for ip, port in invalid + preauth:
         if (ip, port) not in failed_conns:
             failed[ip] = failed.get(ip, 0) + 1
             failed_conns.add((ip, port))

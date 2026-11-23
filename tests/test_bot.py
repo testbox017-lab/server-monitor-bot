@@ -672,6 +672,8 @@ Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
                 return mock.Mock(returncode=0, stdout=self.UFW_STATUS, stderr="")
             if cmd[0] == "ss":
                 return mock.Mock(returncode=0, stdout=peers, stderr="")
+            if cmd[0] == "loginctl":   # без logind: любое соединение считается сессией
+                return mock.Mock(returncode=1, stdout="", stderr="")
             return mock.Mock(returncode=0, stdout="Rule inserted", stderr="")
         return run, calls
 
@@ -700,8 +702,36 @@ Anywhere (v6)              DENY        2001:db8::7                # monitor-bot
     def test_ssh_peers_parse(self):
         h = self.h
         out = "0 0 5.161.0.10:22 91.240.118.7:51234\n0 0 [::ffff:5.161.0.10]:22 [::ffff:80.94.95.3]:4000\n"
-        with mock.patch.object(h, "run", return_value=mock.Mock(returncode=0, stdout=out, stderr="")):
+
+        def run(cmd, timeout=300):
+            if cmd[0] == "loginctl":
+                return mock.Mock(returncode=1, stdout="", stderr="no logind")
+            return mock.Mock(returncode=0, stdout=out, stderr="")
+        with mock.patch.object(h, "run", run):   # без logind — любое соединение считается сессией
             self.assertEqual(h.ssh_peers(), {"91.240.118.7", "80.94.95.3"})
+
+    def test_ssh_peers_only_logged_in(self):
+        """Перебор ключей ([preauth]) не прикрывается: сессией считается только вход по данным logind."""
+        h = self.h
+        ss = "0 0 5.161.0.10:22 91.240.118.7:51234\n0 0 5.161.0.10:22 202.165.25.8:4000\n"
+        sessions = {"620": "Remote=yes\nRemoteHost=91.240.118.7\nService=sshd\n",
+                    "621": "Remote=no\nRemoteHost=\nService=systemd-user\n",
+                    "700": "Remote=yes\nRemoteHost=198.51.100.1\nService=sshd\n"}   # уже отключился
+
+        def run(cmd, timeout=300):
+            if cmd[:2] == ["loginctl", "list-sessions"]:
+                return mock.Mock(returncode=0, stdout="620 0 root - 1 user - no -\n621 0 root - 2 manager-early - no -\n"
+                                                      "700 0 root - 3 user - no -\n", stderr="")
+            if cmd[:2] == ["loginctl", "show-session"]:
+                return mock.Mock(returncode=0, stdout=sessions[cmd[2]], stderr="")
+            if cmd[0] == "ss" and "-tlnp" in cmd:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if cmd[0] == "ss":
+                return mock.Mock(returncode=0, stdout=ss, stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(h, "run", run):
+            self.assertEqual(h.ssh_peers(), {"91.240.118.7"})
+            self.assertFalse(h.covers_peer(h.parse_ip("202.165.25.8"), h.ssh_peers()))
 
     def test_io_top(self):
         h = self.h
@@ -2309,6 +2339,8 @@ class ReviewFixesHelperTest(unittest.TestCase):
             if cmd[0] == "ss":
                 return mock.Mock(returncode=0, stdout="0 0 5.1.1.1:2222 91.240.118.7:5000\n"
                                                       "0 0 5.1.1.1:80 80.94.95.3:4000\n", stderr="")
+            if cmd[0] == "loginctl":
+                return mock.Mock(returncode=1, stdout="", stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(h, "run", run):
             self.assertEqual(h.sshd_ports(), {"2222"})
@@ -2325,6 +2357,21 @@ class ReviewFixesTest(unittest.TestCase):
                 "Failed password for invalid user x from 8.8.8.8 port 1 from 203.0.113.9 port 51000 ssh2\n")
         _, failed = security.parse_ssh(text)
         self.assertEqual(failed, {"203.0.113.9": 1})
+
+    def test_ssh_preauth_key_bruteforce(self):
+        """Пароли выключены: перебор ключами виден только как закрытие соединения до входа."""
+        text = ("Connection closed by authenticating user root 202.165.25.8 port 36876 [preauth]\n"
+                "Connection reset by authenticating user root 202.165.25.8 port 36880 [preauth]\n"
+                "Disconnected from authenticating user root 202.165.25.8 port 36890 [preauth]\n"
+                "Invalid user ubuntu from 202.165.25.8 port 36900\n"
+                "Connection closed by invalid user ubuntu 202.165.25.8 port 36900 [preauth]\n"   # то же соединение
+                "Failed publickey for root from 1.2.3.4 port 7 ssh2\n"
+                "Connection closed by authenticating user root 1.2.3.4 port 7 [preauth]\n"      # то же соединение
+                "Connection closed by invalid user x 8.8.8.8 port 1 203.0.113.9 port 51000 [preauth]\n"
+                "Connection closed by 198.51.100.7 port 4243 [preauth]\n"                      # без имени — не считаем
+                "Connection reset by 198.51.100.8 port 4244\n")
+        _, failed = security.parse_ssh(text)
+        self.assertEqual(failed, {"202.165.25.8": 4, "1.2.3.4": 1, "203.0.113.9": 1})
 
     def test_ssh_invalid_user_counted_once(self):
         text = ("Invalid user bob from 1.2.3.4 port 5\n"

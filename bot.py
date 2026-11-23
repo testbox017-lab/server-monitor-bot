@@ -861,7 +861,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_servers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
-        await send(update, remote.servers_text(CFG), servers_kb())
+        await send(update, remote.servers_text(CFG, STATE), servers_kb())
 
 
 async def cmd_procs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1072,7 +1072,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await edit(update, text, status_kb())
         elif cmd == "servers":
-            text = remote.servers_text(CFG)
+            text = remote.servers_text(CFG, STATE)
             if len(parts) > 1:
                 await send(update, text, servers_kb())
             else:

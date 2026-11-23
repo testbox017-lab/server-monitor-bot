@@ -65,7 +65,7 @@ def key_dir(cfg: dict, data_dir: Path | None) -> Path:
     return Path(cfg.get("remote_key_dir") or data_dir or ".")
 
 
-def ssh_cmd(srv: dict, cfg: dict, data_dir: Path | None) -> list[str]:
+def ssh_cmd(srv: dict, cfg: dict, data_dir: Path | None, since: int | None = None) -> list[str]:
     d = key_dir(cfg, data_dir)
     key = str(srv.get("key") or d / "remote_ed25519")
     services = [x for x in (srv.get("services") or []) if SVC_RE.match(str(x))]
@@ -73,13 +73,13 @@ def ssh_cmd(srv: dict, cfg: dict, data_dir: Path | None) -> list[str]:
             "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={d / 'known_hosts'}",
             "-o", "LogLevel=ERROR", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
-            f"{srv.get('user') or 'root'}@{srv['host']}", "status " + ",".join(services)]
+            f"{srv.get('user') or 'root'}@{srv['host']}", ("status " + ",".join(services) + (f" since={int(since)}" if since else "")).strip()]
 
 
-def fetch(srv: dict, cfg: dict, data_dir: Path | None) -> tuple[dict | None, str]:
+def fetch(srv: dict, cfg: dict, data_dir: Path | None, since: int | None = None) -> tuple[dict | None, str]:
     """(ответ агента, "") или (None, текст ошибки)."""
     try:
-        r = subprocess.run(ssh_cmd(srv, cfg, data_dir), capture_output=True, text=True, timeout=SSH_TIMEOUT)
+        r = subprocess.run(ssh_cmd(srv, cfg, data_dir, since), capture_output=True, text=True, timeout=SSH_TIMEOUT)
     except subprocess.TimeoutExpired:
         return None, _('нет ответа за {n} с', n=SSH_TIMEOUT)
     except OSError as e:
@@ -147,11 +147,11 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
     res: dict[str, str | None] = {}
     for srv in servers(cfg):
         name = srv["name"]
-        data, err = fetcher(srv, cfg, data_dir)
+        data, err = fetcher(srv, cfg, data_dir, state.remote_ssh_at.get(name))
         down_key = name + SEP + "down"
         if data is not None:
             with _lock:
-                LAST[name] = {"ts": now, "data": data}
+                LAST[name] = {"ts": now, "data": data, "new": True}
                 ERRORS.pop(name, None)
             state.remote_fails[name] = 0
             r = results_from(srv, cfg, data)
@@ -168,8 +168,9 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
     known = {s["name"] for s in servers(cfg)}
     for name in list(state.remote_last):  # сервер убрали из config.yaml
         if name not in known:
-            state.remote_last.pop(name, None)
-            state.remote_fails.pop(name, None)
+            for d in (state.remote_last, state.remote_fails, state.remote_ssh_at, state.remote_known_ips,
+                      state.remote_ssh_failed, state.remote_fail_alert_at, state.remote_ports):
+                d.pop(name, None)
     return res
 
 
@@ -178,7 +179,7 @@ def fmt_bytes(n: float) -> str:
     return checks.fmt_bytes(n)
 
 
-def server_text(srv: dict, cfg: dict, now: float | None = None) -> str:
+def server_text(srv: dict, cfg: dict, now: float | None = None, state=None) -> str:
     import checks
     now = now or time.time()
     name = srv["name"]
@@ -217,11 +218,85 @@ def server_text(srv: dict, cfg: dict, now: float | None = None) -> str:
             lines.append(f"  {'✅' if ok else '❌'} {html.escape(c)}: {html.escape(str(i.get('state')))}{html.escape(extra)}")
     if s.get("reboot_required"):
         lines.append(_('♻️ Серверу нужна перезагрузка после обновлений'))
+    if state is not None:
+        fails = sum(x[2] for x in state.remote_ssh_failed.get(name, []) if now - x[0] < 3600)
+        lines.append(_('🛡 Неудачных входов по SSH за час: {n}', n=fails))
+    f2b = s.get("fail2ban")
+    if f2b:
+        lines.append(_('🚫 fail2ban: заблокировано сейчас {banned}, всего {total}',
+                       banned=sum(j.get("banned", 0) for j in f2b.values()),
+                       total=sum(j.get("total", 0) for j in f2b.values())))
+    if s.get("ports"):
+        lines.append(_('🚪 Порты наружу: {ports}', ports=html.escape(", ".join(s["ports"]))))
     return "\n".join(lines)
 
 
-def servers_text(cfg: dict) -> str:
+def events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
+    """События по свежим ответам агентов: входы по SSH, подбор пароля, новые открытые порты.
+    Как у своего сервера (security.events), только с именем другого сервера в заголовке."""
+    import security
+    from checks import Alert
+    out: list = []
+    for srv in servers(cfg):
+        name = srv["name"]
+        with _lock:
+            last = LAST.get(name)
+            if not last or not last.get("new"):
+                continue
+            last["new"] = False
+        data = last["data"]
+        if data.get("time"):
+            state.remote_ssh_at[name] = int(data["time"])  # с этого момента агент пришлёт журнал в следующий раз
+        lines = data.get("ssh")
+        if cfg.get("ssh_alerts", True) and isinstance(lines, list):
+            accepted, failed = security.parse_ssh("\n".join(str(x) for x in lines))
+            known = state.remote_known_ips.setdefault(name, {})
+            for user, ip, method, fp in accepted:
+                if security.is_deploy(cfg, ip, fp):
+                    continue
+                new = ip not in known and ip not in state.known_ips  # с этого IP уже входили на главный сервер
+                known[ip] = now
+                if muted or not (new or cfg.get("ssh_alert_all_logins")):
+                    continue
+                tag = _('с нового IP') if new else ""
+                out.append(Alert(_('🔐 Вход по SSH: {user} {tag} {ip} ({method})',
+                                   user=user, tag=tag, ip=ip, method=method).replace("  ", " "),
+                                 None, "event", server=name))
+                state.log.append([now, f"{name}{SEP}ssh:{ip}"])
+            fl = state.remote_ssh_failed.setdefault(name, [])
+            fl += [[now, ip, n] for ip, n in failed.items()]
+        fl = [x for x in state.remote_ssh_failed.get(name, []) if now - x[0] < 3600]
+        state.remote_ssh_failed[name] = fl
+        recent = [x for x in fl if now - x[0] < 600]
+        total = sum(x[2] for x in recent)
+        threshold = cfg.get("ssh_fail_threshold", 30)
+        if (threshold and total >= threshold and not quiet and not muted
+                and now - state.remote_fail_alert_at.get(name, 0) >= 3600):
+            by_ip: dict[str, int] = {}
+            for __, ip, n in recent:
+                by_ip[ip] = by_ip.get(ip, 0) + n
+            top = ", ".join(f"{ip} ({n})" for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])[:3])
+            out.append(Alert(_('🛡 Подбор пароля по SSH: {total} неудачных попыток за 10 мин. Чаще всего: {top}',
+                               total=total, top=top), None, "event", server=name))
+            state.remote_fail_alert_at[name] = now
+            state.log.append([now, f"{name}{SEP}ssh_bruteforce"])
+        ports = data.get("ports")
+        if cfg.get("port_alerts", True) and isinstance(ports, list) and not muted:
+            known_p = state.remote_ports.get(name)
+            if not known_p:
+                state.remote_ports[name] = sorted(ports)  # первый ответ: запоминаем как норму
+            else:
+                new_p = sorted(set(ports) - set(known_p))
+                for p in new_p:
+                    out.append(Alert(_('🚪 Новый открытый наружу порт: {p}', p=p), None, "event", server=name))
+                    state.log.append([now, f"{name}{SEP}port:{p}"])
+                if new_p:
+                    state.remote_ports[name] = sorted(set(known_p) | set(new_p))
+    return out
+
+
+def servers_text(cfg: dict, state=None) -> str:
     srvs = servers(cfg)
     if not srvs:
         return _('Других серверов нет. Добавьте remote_servers в config.yaml (см. README).')
-    return "\n\n".join(server_text(s, cfg) for s in srvs)
+    return "\n\n".join(server_text(s, cfg, None, state) for s in srvs)

@@ -3509,5 +3509,108 @@ class RemoteCardBotTest(unittest.TestCase):
         self.assertIn("rs:ovh:do:ban:8.8.8.8", self.cbs(b.alert_kb("ovh|brute:8.8.8.8")))
 
 
+class RemoteContainersTest(unittest.TestCase):
+    """Б4: перезапуски и ошибки в логах контейнеров другого сервера, копии с него."""
+
+    def setUp(self):
+        self.cfg = {"thresholds": {}, "tz": "Europe/Kyiv", "deploy_keys": ["SHA256:dep"],
+                    "remote_servers": [{"name": "ovh", "host": "203.0.113.5", "containers_auto": True}]}
+        self.st = checks.AlertState.load(TMP / f"rctr_{self._testMethodName}.json")
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+
+    def poll(self, now, started="2026-11-23T10:00:00Z", restarts=0, uptime=86400, **extra):
+        data = dict(AGENT_DATA, time=now, uptime=uptime,
+                    containers={"app": {"state": "running", "health": "", "restarts": restarts, "started": started}},
+                    **extra)
+        remote.evaluate(self.cfg, self.st, now, None, lambda *a: (data, ""))
+        return remote.events(self.cfg, self.st, now, False, False)
+
+    def test_restart_deploy_and_boot(self):
+        self.assertEqual(self.poll(T0), [])
+        self.assertEqual(self.poll(T0 + 60), [])  # не менялся
+        ev = self.poll(T0 + 120, started="2026-11-23T11:00:00Z", restarts=1)
+        self.assertEqual([(e.key, e.server, e.send) for e in ev], [("ovh|log:app", "ovh", "loud")])
+        self.assertIn("1", ev[0].text)
+        dep = ["Accepted publickey for root from 198.51.100.7 port 2 ssh2: ED25519 SHA256:dep"]
+        ev = self.poll(T0 + 180, started="2026-11-23T11:05:00Z", ssh=dep)
+        self.assertEqual([(e.key, e.send) for e in ev], [("ovh|deploy:app", "journal")])  # и без «нового IP»
+        boot = checks.docker_time("2026-11-23T12:00:00Z")
+        ev = self.poll(boot + 100, started="2026-11-23T12:00:30Z", uptime=100)
+        self.assertEqual(ev, [])
+        self.assertIn("ovh|boot:app", [k for __, k in self.st.log])
+
+    def test_log_errors(self):
+        self.poll(T0)
+        ev = self.poll(T0 + 60, ctr_logs={"app": ["INFO ok", "ERROR boom", "Traceback (most recent call last)"]})
+        self.assertEqual([(e.key, e.send) for e in ev], [("ovh|log:app", "loud")])
+        self.assertIn("boom", ev[0].text)
+        self.assertEqual(self.poll(T0 + 120, ctr_logs={"app": ["ERROR again"]}), [])  # не чаще log_alert_min
+        ev = self.poll(T0 + 2000, ctr_logs={"app": ["ERROR aiogram TelegramNetworkError: ConnectError"]})
+        self.assertEqual([e.send for e in ev], ["quiet"])
+        self.assertEqual(self.poll(T0 + 4000, ctr_logs={"app": ["Timeout waiting, retry"]}), [])  # не по шаблонам
+
+    def test_agent_helpers(self):
+        a = load_agent()
+        self.assertEqual(a.parse_inspect("/web\t2\t2026-11-23T10:00:00Z\nbad\n"),
+                         {"web": {"restarts": 2, "started": "2026-11-23T10:00:00Z"}})
+        self.assertEqual(a.log_hits("INFO a\nERROR b\nok\nTraceback x\n"), ["ERROR b", "Traceback x"])
+        for ok in ("backups", "backup-get 0", "backup-get 12"):
+            self.assertIsNotNone(a.parse_action(ok), ok)
+        for bad in ("backups x", "backup-get", "backup-get -1", "backup-get 1000", "backup-get ../x"):
+            self.assertIsNone(a.parse_action(bad), bad)
+        d = Path(tempfile.mkdtemp())
+        (d / "latest.tar.gz").write_bytes(b"L")
+        (d / "b-1.tar.gz").write_bytes(b"one")
+        os.utime(d / "b-1.tar.gz", (T0, T0))
+        (d / "b-2.tar.gz").write_bytes(b"two!")
+        os.utime(d / "b-2.tar.gz", (T0 + 100, T0 + 100))
+        watch = d / "watch"
+        watch.write_text(f"# c\n{d} 26\nrelative/x\n")
+        with mock.patch.object(a, "BACKUP_WATCH", str(watch)):
+            self.assertEqual(a.backup_dirs(), [str(d)])
+            got = json.loads(a.action(["backup-get", "0"])["out"])
+            self.assertEqual((got["name"], got["size"], got["mtime"]), ("b-2.tar.gz", 4, T0 + 100))
+            self.assertFalse(a.action(["backup-get", "1"])["ok"])
+            lst = json.loads(a.action(["backups"])["out"])
+            self.assertEqual(lst[0]["newest"][0], "b-2.tar.gz")
+
+    def test_sync_backups(self):
+        import base64
+        root = Path(tempfile.mkdtemp())
+        cfg = dict(self.cfg, remote_backup_dir=str(root))
+        files = {"w-1.tar.gz": (b"one", T0), "w-2.tar.gz": (b"two", T0 + 100)}
+        newest = ["w-1.tar.gz"]
+        calls = []
+
+        def agent(srv, args, timeout, c):
+            calls.append(args)
+            if args == ["backups"]:
+                name = newest[0]
+                return True, json.dumps([{"path": "/var/backups/weather-bot",
+                                          "newest": [name, len(files[name][0]), files[name][1]]},
+                                         {"path": "/x/empty", "newest": None}])
+            name = newest[0]
+            return True, json.dumps({"name": name, "size": 3, "mtime": files[name][1],
+                                     "b64": base64.b64encode(files[name][0]).decode()})
+        log = remote.sync_backups(cfg, None, agent)
+        p = root / "ovh" / "weather-bot" / "w-1.tar.gz"
+        self.assertEqual((p.read_bytes(), int(p.stat().st_mtime)), (b"one", T0))
+        self.assertEqual(len(log), 1)
+        calls.clear()
+        self.assertEqual(remote.sync_backups(cfg, None, agent), [])  # уже есть — не качаем
+        self.assertEqual(calls, [["backups"]])
+        newest[0] = "w-2.tar.gz"
+        remote.sync_backups(cfg, None, agent)
+        self.assertEqual(sorted(x.name for x in p.parent.iterdir()), ["w-1.tar.gz", "w-2.tar.gz"])
+        with mock.patch.object(remote, "BACKUP_KEEP", 1):
+            files["w-3.tar.gz"] = (b"333", T0 + 200)
+            newest[0] = "w-3.tar.gz"
+            remote.sync_backups(cfg, None, agent)
+        self.assertEqual([x.name for x in p.parent.iterdir()], ["w-3.tar.gz"])
+        bad = remote.sync_backups(cfg, None, lambda *a: (False, "command not allowed"))
+        self.assertIn("command not allowed", bad[0])
+
+
 if __name__ == "__main__":
     unittest.main()

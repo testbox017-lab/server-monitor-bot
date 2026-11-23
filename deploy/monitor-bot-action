@@ -936,8 +936,35 @@ def sshd_ports() -> set[str]:
     return ports or {"22"}
 
 
+def logged_in_hosts() -> set[str] | None:
+    """IP, с которых сейчас есть вошедшие (прошедшие проверку ключа) SSH-сессии, по данным systemd-logind.
+    None — если logind недоступен: тогда считаем сессией любое соединение, как раньше."""
+    r = run(["loginctl", "list-sessions", "--no-legend"])
+    if r.returncode != 0:
+        return None
+    hosts = set()
+    for ln in r.stdout.splitlines():
+        sid = ln.split()[0] if ln.split() else ""
+        if not sid:
+            continue
+        s = run(["loginctl", "show-session", sid, "-p", "Remote", "-p", "RemoteHost", "-p", "Service"])
+        props = dict(x.split("=", 1) for x in s.stdout.splitlines() if "=" in x)
+        if props.get("Remote") == "yes" and props.get("Service", "").startswith("sshd") and props.get("RemoteHost"):
+            hosts.add(props["RemoteHost"].removeprefix("::ffff:"))
+    return hosts
+
+
 def ssh_peers() -> set[str]:
-    """IP, с которых сейчас открыты SSH-сессии: их не блокируем, чтобы не отрезать себя."""
+    """IP, с которых сейчас открыты SSH-сессии: их не блокируем, чтобы не отрезать себя.
+    Соединение, которое ещё не вошло (перебор ключей, [preauth]), сессией не считается — иначе
+    атакующий уходит от бана именно тогда, когда активен."""
+    peers = tcp_ssh_peers()
+    hosts = logged_in_hosts()
+    return peers if hosts is None else peers & hosts
+
+
+def tcp_ssh_peers() -> set[str]:
+    """IP всех установленных TCP-соединений с портом sshd."""
     ports = sshd_ports()
     r = run(["ss", "-H", "-tn", "state", "established"])
     peers = set()

@@ -44,10 +44,14 @@ class History:
         disk = root.percent if root else max((d.percent for d in disks.values()), default=None)
         net = sample.get("net")
         load = sample["load"][0] if sample.get("load") else None
+        self.record_row(now, sample["cpu"], sample["ram"].percent, disk,
+                        net.bytes_recv if net else None, net.bytes_sent if net else None, load)
+
+    def record_row(self, now: float, cpu, ram, disk, rx, tx, load) -> None:
+        """Одна точка истории готовыми числами (так пишутся и другие серверы из remote_servers)."""
+        now = int(now)
         with _lock, self._conn() as c:
-            c.execute("INSERT OR REPLACE INTO m VALUES (?,?,?,?,?,?,?)",
-                      (now, sample["cpu"], sample["ram"].percent, disk,
-                       net.bytes_recv if net else None, net.bytes_sent if net else None, load))
+            c.execute("INSERT OR REPLACE INTO m VALUES (?,?,?,?,?,?,?)", (now, cpu, ram, disk, rx, tx, load))
             if now - self._last_cleanup > 3600:
                 c.execute("DELETE FROM m WHERE ts < ?", (now - RETENTION_DAYS * 86400,))
                 self._last_cleanup = now

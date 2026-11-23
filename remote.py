@@ -63,17 +63,122 @@ def split_key(key: str) -> tuple[str | None, str]:
 
 def key_dir(cfg: dict, data_dir: Path | None) -> Path:
     return Path(cfg.get("remote_key_dir") or data_dir or ".")
-
-
-def ssh_cmd(srv: dict, cfg: dict, data_dir: Path | None, since: int | None = None) -> list[str]:
+def ssh_base(srv: dict, cfg: dict, data_dir: Path | None) -> list[str]:
     d = key_dir(cfg, data_dir)
     key = str(srv.get("key") or d / "remote_ed25519")
-    services = [x for x in (srv.get("services") or []) if SVC_RE.match(str(x))]
     return ["ssh", "-i", key, "-p", str(int(srv.get("port") or 22)),
             "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={d / 'known_hosts'}",
             "-o", "LogLevel=ERROR", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
-            f"{srv.get('user') or 'root'}@{srv['host']}", ("status " + ",".join(services) + (f" since={int(since)}" if since else "")).strip()]
+            f"{srv.get('user') or 'root'}@{srv['host']}"]
+
+
+def ssh_cmd(srv: dict, cfg: dict, data_dir: Path | None, since: int | None = None) -> list[str]:
+    services = [x for x in (srv.get("services") or []) if SVC_RE.match(str(x))]
+    return ssh_base(srv, cfg, data_dir) + [
+        ("status " + ",".join(services) + (f" since={int(since)}" if since else "")).strip()]
+
+
+# ---------- Действия (агент на том сервере проверяет каждую команду сам) ----------
+
+CFG: dict = {}             # бот подставляет свои настройки и папку данных при запуске (setup)
+DATA_DIR: Path | None = None
+CTR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+KINDS = {"rsvc", "rctr", "rban", "runban", "rreboot", "rapt"}
+
+
+def setup(cfg: dict, data_dir: Path | None) -> None:
+    global CFG, DATA_DIR
+    CFG, DATA_DIR = cfg, data_dir
+
+
+def server(name: str, cfg: dict | None = None) -> dict | None:
+    return next((s for s in servers(cfg if cfg is not None else CFG) if s["name"] == name), None)
+
+
+def run_agent(srv: dict, args: list[str], timeout: int = 180, cfg: dict | None = None) -> tuple[bool, str]:
+    """Выполнить действие агентом: (успех, вывод)."""
+    cfg = cfg if cfg is not None else CFG
+    try:
+        r = subprocess.run(ssh_base(srv, cfg, DATA_DIR) + [" ".join(args)], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, _('нет ответа за {n} с', n=timeout)
+    except OSError as e:
+        return False, str(e)
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        err = (r.stderr or r.stdout).strip().splitlines()
+        return False, (err[-1] if err else f"ssh exit {r.returncode}")[:300]
+    if "error" in data:
+        return False, str(data["error"])
+    return bool(data.get("ok")), str(data.get("out", ""))
+
+
+def agent_args(kind: str, target: str) -> list[str] | None:
+    """Команда агенту для действия из подтверждения; None — неверная цель."""
+    import security
+    if kind == "rsvc" and SVC_RE.match(target):
+        return ["restart", "svc", target]
+    if kind == "rctr" and CTR_RE.match(target):
+        return ["restart", "ctr", target]
+    if kind in ("rban", "runban") and security.public_ip(target):
+        return ["ban" if kind == "rban" else "unban", target]
+    if kind == "rapt" and target in ("security", "all"):
+        return ["apt-upgrade", target]
+    if kind == "rreboot":
+        return ["reboot"]
+    return None
+
+
+def execute(kind: str, arg: str) -> tuple[bool, str]:
+    """arg — «сервер|цель»."""
+    name, __, target = arg.partition(SEP)
+    srv = server(name)
+    if srv is None:
+        return False, _('Сервера {name} нет в remote_servers', name=name)
+    args = agent_args(kind, target)
+    if args is None:
+        return False, _('неверная цель: {target}', target=target)
+    return run_agent(srv, args)
+
+
+def logs(name: str, kind: str, target: str, tail: int) -> str:
+    srv = server(name)
+    ok_name = SVC_RE.match(target) if kind == "svc" else CTR_RE.match(target)
+    if srv is None or kind not in ("svc", "ctr") or not ok_name:
+        return _('неверная цель: {target}', target=target)
+    ok, out = run_agent(srv, ["logs", kind, target, str(max(1, min(int(tail), 200)))], timeout=60)
+    return out if ok or out else _('ошибка без вывода')
+
+
+# ---------- История ----------
+
+HISTS: dict = {}
+
+
+def history(name: str, data_dir: Path | None):
+    """history.History другого сервера: свой файл metrics-ИМЯ.db рядом с metrics.db."""
+    if data_dir is None:
+        return None
+    if name not in HISTS:
+        import history as h
+        HISTS[name] = h.History(Path(data_dir) / f"metrics-{name}.db")
+    return HISTS[name]
+
+
+def record_history(name: str, data_dir: Path | None, now: float, data: dict) -> None:
+    hist = history(name, data_dir)
+    if hist is None:
+        return
+    disks = data.get("disks") or {}
+    root = disks.get("/")
+    disk = root.get("percent") if root else max((d.get("percent", 0) for d in disks.values()), default=None)
+    net = data.get("net") or {}
+    load = (data.get("load") or [None])[0]
+    hist.record_row(now, data.get("cpu"), (data.get("ram") or {}).get("percent"), disk,
+                    net.get("rx"), net.get("tx"), load)
 
 
 def fetch(srv: dict, cfg: dict, data_dir: Path | None, since: int | None = None) -> tuple[dict | None, str]:
@@ -154,6 +259,11 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
                 LAST[name] = {"ts": now, "data": data, "new": True}
                 ERRORS.pop(name, None)
             state.remote_fails[name] = 0
+            try:
+                record_history(name, data_dir, now, data)
+            except Exception:
+                import logging
+                logging.getLogger("monitor_bot").exception("Не удалось записать историю %s", name)
             r = results_from(srv, cfg, data)
             state.remote_last[name] = r
             res.update(r)
@@ -169,7 +279,8 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
     for name in list(state.remote_last):  # сервер убрали из config.yaml
         if name not in known:
             for d in (state.remote_last, state.remote_fails, state.remote_ssh_at, state.remote_known_ips,
-                      state.remote_ssh_failed, state.remote_fail_alert_at, state.remote_ports):
+                      state.remote_ssh_failed, state.remote_fail_alert_at, state.remote_ports,
+                      state.remote_upd_alert_at):
                 d.pop(name, None)
     return res
 
@@ -206,6 +317,10 @@ def server_text(srv: dict, cfg: dict, now: float | None = None, state=None) -> s
     for path, d in (s.get("disks") or {}).items():
         lines.append(_('🗄 Диск {path}: {percent:.0f}% (свободно {fmt_bytes})',
                        path=html.escape(path), percent=d.get("percent", 0), fmt_bytes=fmt_bytes(d.get("free", 0))))
+    net = s.get("net")
+    if net:
+        lines.append(_('🌐 Сеть: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                       fmt_bytes=fmt_bytes(net.get("rx", 0)), fmt_bytes2=fmt_bytes(net.get("tx", 0))))
     for svc, st in (s.get("services") or {}).items():
         lines.append(_('{icon} служба {escape}: {escape2}', icon="✅" if st == "running" else "❌",
                        escape=html.escape(svc), escape2=html.escape(st)))
@@ -216,6 +331,9 @@ def server_text(srv: dict, cfg: dict, now: float | None = None, state=None) -> s
             ok = i.get("state") == "running" and i.get("health") != "unhealthy"
             extra = f", {i['health']}" if i.get("health") else ""
             lines.append(f"  {'✅' if ok else '❌'} {html.escape(c)}: {html.escape(str(i.get('state')))}{html.escape(extra)}")
+    upd = updates_line(name)
+    if upd:
+        lines.append(upd)
     if s.get("reboot_required"):
         lines.append(_('♻️ Серверу нужна перезагрузка после обновлений'))
     if state is not None:
@@ -277,7 +395,8 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
                 by_ip[ip] = by_ip.get(ip, 0) + n
             top = ", ".join(f"{ip} ({n})" for ip, n in sorted(by_ip.items(), key=lambda x: -x[1])[:3])
             out.append(Alert(_('🛡 Подбор пароля по SSH: {total} неудачных попыток за 10 мин. Чаще всего: {top}',
-                               total=total, top=top), None, "event", server=name))
+                               total=total, top=top), f"{name}{SEP}brute:{max(by_ip, key=by_ip.get)}", "event",
+                             server=name))
             state.remote_fail_alert_at[name] = now
             state.log.append([now, f"{name}{SEP}ssh_bruteforce"])
         ports = data.get("ports")
@@ -300,3 +419,171 @@ def servers_text(cfg: dict, state=None) -> str:
     if not srvs:
         return _('Других серверов нет. Добавьте remote_servers в config.yaml (см. README).')
     return "\n\n".join(server_text(s, cfg, None, state) for s in srvs)
+
+
+# ---------- Карточки другого сервера: как у своего (процессы, службы, сеть и диск, обновления) ----------
+
+UPDATES: dict[str, dict] = {}   # имя → {"ts": когда проверяли, "pkgs": [{name, security}]}
+UPDATES_EVERY = 6 * 3600
+
+
+def last_data(name: str) -> dict:
+    with _lock:
+        last = LAST.get(name)
+    return (last or {}).get("data") or {}
+
+
+def procs_text(name: str, by: str, n: int) -> str:
+    srv = server(name)
+    if srv is None:
+        return _('Сервера {name} нет в remote_servers', name=name)
+    n = max(1, min(int(n), 30))
+    ok, out = run_agent(srv, ["procs", "cpu" if by == "cpu" else "mem", str(n)], timeout=60)
+    try:
+        rows = json.loads(out) if ok else None
+    except ValueError:
+        rows = None
+    if rows is None:
+        return f"🖥 <b>{html.escape(name)}</b>\n❌ {html.escape(out)}"
+    total = (last_data(name).get("ram") or {}).get("total") or 0
+    title = "CPU" if by == "cpu" else "RAM"
+    lines = [f"🖥 <b>{html.escape(name)}</b>", _('🔝 <b>Топ-{n} процессов по {title}</b>', n=n, title=title),
+             _('<pre>  CPU%  RAM%    PID  Имя')]
+    for r in rows:
+        mem = 100.0 * r.get("rss", 0) / total if total else 0.0
+        lines.append(f"{r.get('cpu', 0):6.1f} {mem:5.1f} {int(r.get('pid', 0)):6d}  "
+                     f"{html.escape(str(r.get('name', '?'))[:28])}")
+    lines.append("</pre>")
+    return "\n".join(lines)
+
+
+def services_text(name: str) -> str:
+    srv = server(name)
+    s = last_data(name)
+    lines = [f"🖥 <b>{html.escape(name)}</b>", _('⚙️ <b>Службы и процессы</b>')]
+    for svc, st in (s.get("services") or {}).items():
+        lines.append(_('{icon} служба {escape}: {escape2}', icon="✅" if st == "running" else "❌",
+                       escape=html.escape(svc), escape2=html.escape(st)))
+    ctrs = s.get("containers") or {}
+    for c in (watched_containers(srv, s) if srv else list(ctrs)):
+        i = ctrs.get(c) or {}
+        st = i.get("state") or "not-found"
+        ok = st == "running" and i.get("health") != "unhealthy"
+        tail = f" ({i['health']})" if i.get("health") else ""
+        lines.append(_('{v} контейнер {escape}: {escape2}{escape3}', v='✅' if ok else '❌', escape=html.escape(c),
+                       escape2=html.escape(st), escape3=html.escape(tail)))
+    if len(lines) == 2:
+        lines.append(_('Список пуст. Добавьте services / processes в config.yaml.'))
+    return "\n".join(lines)
+
+
+def net_text(name: str, state=None, data_dir: Path | None = None, now: float | None = None) -> str:
+    from checks import fmt_bytes
+    now = now or time.time()
+    s = last_data(name)
+    lines = [f"🖥 <b>{html.escape(name)}</b>", _('🌐 <b>Сеть и диск</b>')]
+    hist = history(name, data_dir if data_dir is not None else DATA_DIR)
+    if hist is not None:
+        rows = [r for r in hist.rows(now - 600, now) if r[4] is not None and r[5] is not None]
+        if len(rows) >= 2 and rows[-1][0] > rows[-2][0] and rows[-1][4] >= rows[-2][4]:
+            dt = rows[-1][0] - rows[-2][0]
+            lines.append(_('{escape}: ↓ {fmt_bytes}/с ↑ {fmt_bytes2}/с', escape=_('сеть'),
+                           fmt_bytes=fmt_bytes((rows[-1][4] - rows[-2][4]) / dt),
+                           fmt_bytes2=fmt_bytes(max(0, rows[-1][5] - rows[-2][5]) / dt)))
+        for title, sec in ((_('за сутки'), 86400), (_('за неделю'), 7 * 86400)):
+            p = hist.peaks(sec, now)
+            if p:
+                lines.append(_('Трафик {title}: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
+                               title=title, fmt_bytes=fmt_bytes(p['rx']), fmt_bytes2=fmt_bytes(p['tx'])))
+    for path, d in (s.get("disks") or {}).items():
+        lines.append(_('🗄 Диск {path}: {percent:.0f}% (свободно {fmt_bytes})',
+                       path=html.escape(path), percent=d.get("percent", 0), fmt_bytes=fmt_bytes(d.get("free", 0))))
+    if s.get("ports"):
+        lines.append(_('🚪 Порты наружу: {ports}', ports=html.escape(", ".join(s["ports"]))))
+    f2b = s.get("fail2ban")
+    if f2b:
+        lines.append(_('🚫 fail2ban: заблокировано сейчас {banned}, всего {total}',
+                       banned=sum(j.get("banned", 0) for j in f2b.values()),
+                       total=sum(j.get("total", 0) for j in f2b.values())))
+        ips = sorted({ip for j in f2b.values() for ip in j.get("ips", [])})
+        if ips:
+            lines.append("  " + html.escape(", ".join(ips[:30])) + (_(' и др.') if len(ips) > 30 else ""))
+    if state is not None:
+        fails = sum(x[2] for x in state.remote_ssh_failed.get(name, []) if now - x[0] < 3600)
+        lines.append(_('🛡 Неудачных входов по SSH за час: {n}', n=fails))
+    return "\n".join(lines)
+
+
+def banned_ips(name: str) -> list[str]:
+    f2b = last_data(name).get("fail2ban") or {}
+    return sorted({ip for j in f2b.values() for ip in j.get("ips", [])})
+
+
+def check_updates(name: str, force: bool = False) -> list[dict] | None:
+    """Список обновлений другого сервера, не чаще раза в UPDATES_EVERY (force — сейчас). None — не узнать."""
+    srv = server(name)
+    cached = UPDATES.get(name)
+    if srv is None:
+        return None
+    if cached and not force and time.time() - cached["ts"] < UPDATES_EVERY:
+        return cached["pkgs"]
+    ok, out = run_agent(srv, ["updates"], timeout=90)
+    try:
+        pkgs = json.loads(out) if ok else None
+    except ValueError:
+        pkgs = None
+    if pkgs is not None:
+        UPDATES[name] = {"ts": time.time(), "pkgs": pkgs}
+    return pkgs
+
+
+def updates_line(name: str) -> str | None:
+    pkgs = (UPDATES.get(name) or {}).get("pkgs")
+    if pkgs is None:
+        return None
+    if not pkgs:
+        return _('📦 Обновления: нет')
+    sec = sum(bool(p.get("security")) for p in pkgs)
+    return _('📦 Обновления: {len}', len=len(pkgs)) + (f" ({_('🛡 безопасности: {n}', n=sec)})" if sec else "")
+
+
+def updates_text(name: str, force: bool = False) -> str:
+    import pkgupdates
+    pkgs = check_updates(name, force)
+    head = f"🖥 <b>{html.escape(name)}</b>\n"
+    if last_data(name).get("apt_running"):
+        head += _('установка обновлений уже идёт') + "\n"
+    if pkgs is None:
+        return head + _('📡 Нет связи: {err}', err=html.escape(ERRORS.get(name, "?")))
+    if not pkgs:
+        return head + _('📦 Обновления: нет')
+    lines = [head + (updates_line(name) or "")]
+    sec = [p["name"] for p in pkgs if p.get("security")]
+    if sec:
+        lines.append("🛡 " + html.escape(pkgupdates.names_short(sec, 30)))
+    other = [p["name"] for p in pkgs if not p.get("security")]
+    if other:
+        lines.append("📦 " + html.escape(pkgupdates.names_short(other, 30)))
+    return "\n".join(lines)
+
+
+def update_events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
+    """Раз в 6 часов: есть ли обновления безопасности на другом сервере (как у своего, не чаще раза в сутки)."""
+    from checks import Alert
+    import pkgupdates
+    out = []
+    if not cfg.get("update_alerts", True):
+        return out
+    for srv in servers(cfg):
+        name = srv["name"]
+        cached = UPDATES.get(name)
+        if name not in LAST or name in ERRORS or (cached and now - cached["ts"] < UPDATES_EVERY):
+            continue
+        pkgs = check_updates(name, force=True) or []
+        sec = [p["name"] for p in pkgs if p.get("security")]
+        if sec and not muted and not quiet and now - state.remote_upd_alert_at.get(name, 0) >= 86400:
+            state.remote_upd_alert_at[name] = now
+            out.append(Alert(_('🩹 Доступны обновления безопасности Ubuntu: {len} ({names})',
+                               len=len(sec), names=pkgupdates.names_short(sec)), f"{name}{SEP}apt:updates", "event",
+                             server=name))
+    return out

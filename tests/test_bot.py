@@ -3183,7 +3183,7 @@ class RemoteBotTest(unittest.TestCase):
         b = self.bot
         for key in ("ovh|svc:cron", "ovh|ctr:weather-bot", "ovh|disk:/", "ovh|down"):
             cbs = self.cbs(b.alert_kb(key, True))
-            self.assertIn("servers:new", cbs)
+            self.assertIn("rs:ovh:card:new", cbs)
             self.assertFalse([c for c in cbs if c.startswith(("act:", "logs:", "status"))], (key, cbs))
 
     def test_servers_button_and_alert_header(self):
@@ -3296,7 +3296,7 @@ class RemoteSecurityTest(unittest.TestCase):
         texts = [e.text for e in ev]
         self.assertTrue(any("192.0.2.9 (6)" in t for t in texts), texts)
         self.assertTrue(any("tcp/8080" in t for t in texts), texts)
-        self.assertTrue(all(e.server == "ovh" and e.key is None for e in ev))
+        self.assertTrue(all(e.server == "ovh" and e.key in (None, "ovh|brute:192.0.2.9") for e in ev), ev)
         __, ev = self.poll(T0 + 120, ssh=bad, ports=["tcp/22", "tcp/8080"])
         self.assertEqual(ev, [])  # о подборе — не чаще раза в час, порт уже известен
         t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0 + 130, self.st)
@@ -3307,6 +3307,206 @@ class RemoteSecurityTest(unittest.TestCase):
         self.poll(T0, fail2ban={"sshd": {"banned": 2, "total": 5, "ips": []}})
         t = remote.server_text(self.cfg["remote_servers"][0], self.cfg, T0, self.st)
         self.assertIn("заблокировано сейчас 2, всего 5", t)
+
+
+
+
+# ---------- Другие серверы: карточка, действия, история (этап Б3) ----------
+
+class AgentActionsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.a = load_agent()
+
+    def test_parse_action(self):
+        a = self.a
+        for ok in ("logs svc ssh 30", "logs ctr web-1 200", "restart svc cron", "restart ctr app", "ban 8.8.8.8",
+                   "unban 2a00:1450::1", "procs cpu 10", "procs mem 30", "updates", "apt-upgrade security",
+                   "apt-upgrade all", "reboot"):
+            self.assertIsNotNone(a.parse_action(ok), ok)
+        for bad in ("logs svc ssh 0", "logs svc ssh 500", "logs ctr -x 10", "restart ctr --rm", "ban 10.0.0.1",
+                    "ban 127.0.0.1", "ban x", "procs cpu 99", "apt-upgrade dist", "reboot now", "rm -rf /",
+                    "restart svc a;b", "updates x"):
+            self.assertIsNone(a.parse_action(bad), bad)
+
+    def test_ban_refuses_main_server_and_unknown_service(self):
+        a = self.a
+        with mock.patch.dict(os.environ, {"SSH_CLIENT": "8.8.8.8 5555 22"}):
+            self.assertIn("main server", a.action(["ban", "8.8.8.8"])["out"])
+        with mock.patch.object(a, "allowed_services", return_value=["cron"]):
+            self.assertIn("not allowed", a.action(["restart", "svc", "ssh"])["out"])
+
+    def test_parsers(self):
+        a = self.a
+        dev = ("Inter-|   Receive\n face |bytes\n    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n"
+               "  eth0: 1000 5 0 0 0 0 0 0 2000 6 0 0 0 0 0 0\n")
+        self.assertEqual(a.net_counters(dev), {"rx": 1000, "tx": 2000})
+        up = ("Listing...\nopenssl/noble-security 3.1 amd64 [upgradable from: 3.0]\n"
+              "vim/noble-updates 9.1 amd64 [upgradable from: 9.0]\n")
+        self.assertEqual(a.parse_upgradable(up), [{"name": "openssl", "security": True},
+                                                  {"name": "vim", "security": False}])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("cron\n# comment\ndocker  # engine\nbad;name\n")
+        with mock.patch.object(a, "ALLOWED_SERVICES", f.name):
+            self.assertEqual(a.allowed_services(), ["cron", "docker"])
+
+
+class RemoteActionsTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"thresholds": {}, "tz": "Europe/Kyiv", "remote_servers": [{"name": "ovh", "host": "203.0.113.5"}]}
+        remote.setup(self.cfg, TMP)
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+        remote.UPDATES.clear()
+        remote.HISTS.clear()
+
+    def test_agent_args_and_execute(self):
+        self.assertEqual(remote.agent_args("rsvc", "cron"), ["restart", "svc", "cron"])
+        self.assertEqual(remote.agent_args("rban", "8.8.8.8"), ["ban", "8.8.8.8"])
+        self.assertIsNone(remote.agent_args("rban", "10.0.0.1"))
+        self.assertIsNone(remote.agent_args("rctr", "-rf"))
+        self.assertEqual(remote.agent_args("rapt", "security"), ["apt-upgrade", "security"])
+        self.assertIsNone(remote.agent_args("rapt", "dist-upgrade"))
+        calls = []
+        with mock.patch.object(remote, "run_agent", side_effect=lambda srv, args, **k: calls.append(args) or (True, "ok")):
+            self.assertEqual(remote.execute("rctr", "ovh|app"), (True, "ok"))
+            self.assertFalse(remote.execute("rctr", "nope|app")[0])
+        self.assertEqual(calls, [["restart", "ctr", "app"]])
+        p = actions.Pending("rsvc", "ovh|cron")
+        self.assertIn("ovh", actions.describe(p))
+        self.assertIn("cron", actions.describe(p))
+
+    def test_history_recorded_and_net_text(self):
+        st = checks.AlertState.load(TMP / "ract_hist.json")
+        for i, rx in enumerate((1000, 61000)):
+            data = dict(AGENT_DATA, time=T0 + 60 * i, net={"rx": rx, "tx": rx // 2})
+            remote.evaluate(self.cfg, st, T0 + 60 * i, TMP, lambda *a, d=data: (d, ""))
+        rows = remote.history("ovh", TMP).rows(T0 - 1, T0 + 120)
+        self.assertEqual([r[4] for r in rows], [1000, 61000])
+        t = remote.net_text("ovh", st, TMP, T0 + 61)
+        self.assertIn("/с", t)
+
+    def test_procs_and_updates_text(self):
+        remote.LAST["ovh"] = {"ts": T0, "data": dict(AGENT_DATA), "new": False}
+        procs = json.dumps([{"pid": 7, "name": "python3", "cpu": 12.5, "rss": 1 << 30}])
+        with mock.patch.object(remote, "run_agent", return_value=(True, procs)):
+            t = remote.procs_text("ovh", "cpu", 10)
+        self.assertIn("python3", t)
+        self.assertIn("12.5  12.5", t)
+        pkgs = json.dumps([{"name": "openssl", "security": True}, {"name": "vim", "security": False}])
+        with mock.patch.object(remote, "run_agent", return_value=(True, pkgs)) as ra:
+            t = remote.updates_text("ovh")
+            remote.updates_text("ovh")  # второй раз — из кэша
+            self.assertEqual(ra.call_count, 1)
+        self.assertIn("openssl", t)
+        self.assertIn("vim", t)
+        self.assertIn("🛡", remote.updates_line("ovh"))
+
+    def test_update_events_once_a_day(self):
+        st = checks.AlertState.load(TMP / "ract_upd.json")
+        remote.LAST["ovh"] = {"ts": T0, "data": dict(AGENT_DATA), "new": False}
+        pkgs = json.dumps([{"name": "openssl", "security": True}])
+        with mock.patch.object(remote, "run_agent", return_value=(True, pkgs)):
+            ev = remote.update_events(self.cfg, st, time.time(), False, False)
+            self.assertEqual([(e.server, e.key) for e in ev], [("ovh", "ovh|apt:updates")])
+            remote.UPDATES.clear()
+            self.assertEqual(remote.update_events(self.cfg, st, time.time() + 60, False, False), [])
+
+
+class RemoteCardBotTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        cls.bot = bot
+
+    def setUp(self):
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+        remote.UPDATES.clear()
+        data = dict(AGENT_DATA, allowed_services=["cron"], fail2ban={"sshd": {"banned": 1, "total": 1, "ips": ["8.8.4.4"]}},
+                    net={"rx": 10, "tx": 20})
+        remote.LAST["ovh"] = {"ts": time.time(), "data": data, "new": False}
+        self.p = mock.patch.dict(self.bot.CFG, {"remote_servers": [{"name": "ovh", "host": "203.0.113.5",
+                                                                    "services": ["ssh"], "containers": ["app"]}]})
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def cbs(self, markup):
+        return [x.callback_data for row in markup.inline_keyboard for x in row]
+
+    def press(self, data):
+        q = mock.MagicMock()
+        q.data = data
+        q.answer = mock.AsyncMock()
+        q.edit_message_text = mock.AsyncMock()
+        q.edit_message_media = mock.AsyncMock()
+        upd = mock.MagicMock()
+        upd.callback_query = q
+        upd.effective_chat.id = 42
+        upd.effective_chat.type = "private"
+        upd.effective_message.reply_text = mock.AsyncMock()
+        upd.effective_message.reply_photo = mock.AsyncMock()
+        asyncio.run(self.bot.on_button(upd, mock.MagicMock()))
+        return q, upd
+
+    def test_card_has_same_buttons_as_main(self):
+        b = self.bot
+        cbs = self.cbs(b.servers_kb())
+        for want in ("rs:ovh:card", "rs:ovh:chart:24h", "rs:ovh:procs:cpu:10", "rs:ovh:svcs", "rs:ovh:net",
+                     "rs:ovh:upd", "rs:ovh:menu"):
+            self.assertIn(want, cbs)
+
+    def test_every_remote_button_works(self):
+        b = self.bot
+        procs = json.dumps([{"pid": 7, "name": "python3", "cpu": 1.0, "rss": 1000}])
+        pkgs = json.dumps([{"name": "openssl", "security": True}])
+
+        def agent(srv, args, **k):
+            return True, {"procs": procs, "updates": pkgs, "logs": "line <1>"}.get(args[0], "done")
+        seen, todo = set(), self.cbs(b.servers_kb())
+        with mock.patch.object(remote, "run_agent", side_effect=agent), \
+             mock.patch.object(b.history, "chart_png", return_value=b"png"):
+            while todo:
+                d = todo.pop()
+                if d in seen or not d.startswith("rs:"):
+                    continue
+                seen.add(d)
+                q, upd = self.press(d)
+                note = q.answer.await_args.args[0] if q.answer.await_args and q.answer.await_args.args else None
+                self.assertNotEqual(note, "Ошибка, подробности в журнале бота", d)
+                for call in (q.edit_message_text.await_args, upd.effective_message.reply_text.await_args,
+                             upd.effective_message.reply_photo.await_args, q.edit_message_media.await_args):
+                    if call and call.kwargs.get("reply_markup"):
+                        todo += [x for x in self.cbs(call.kwargs["reply_markup"]) if x.startswith("rs:")]
+        for want in ("rs:ovh:do:svc:cron", "rs:ovh:do:ctr:app", "rs:ovh:do:unban:8.8.4.4", "rs:ovh:do:reboot:-",
+                     "rs:ovh:do:apt:security", "rs:ovh:logs:ctr:app", "rs:ovh:chart:7d:e"):
+            self.assertIn(want, seen)
+        for d in seen:
+            self.assertLessEqual(len(d.encode()), 64, d)
+
+    def test_confirm_runs_on_remote(self):
+        b = self.bot
+        __, upd = self.press("rs:ovh:do:ctr:app")
+        kbd = upd.effective_message.reply_text.await_args.kwargs["reply_markup"]
+        yes = next(c for c in self.cbs(kbd) if c.startswith("do:"))
+        with mock.patch.object(remote, "run_agent", return_value=(True, "app")) as ra:
+            q, __ = self.press(yes)
+        ra.assert_called_once()
+        self.assertEqual(ra.call_args.args[1], ["restart", "ctr", "app"])
+        self.assertIn("✅", q.edit_message_text.await_args.args[0])
+
+    def test_alert_buttons_go_to_remote(self):
+        b = self.bot
+        cbs = self.cbs(b.alert_kb("ovh|ctr:app", True))
+        self.assertIn("rs:ovh:do:ctr:app", cbs)
+        self.assertIn("rs:ovh:logs:ctr:app", cbs)
+        self.assertIn("rs:ovh:card:new", cbs)
+        self.assertIn("rs:ovh:do:svc:cron", self.cbs(b.alert_kb("ovh|svc:cron", True)))
+        self.assertNotIn("rs:ovh:do:svc:ssh", self.cbs(b.alert_kb("ovh|svc:ssh", True)))  # не в allowed-services
+        self.assertIn("rs:ovh:do:ban:8.8.8.8", self.cbs(b.alert_kb("ovh|brute:8.8.8.8")))
 
 
 if __name__ == "__main__":

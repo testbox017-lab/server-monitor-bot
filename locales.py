@@ -1138,6 +1138,20 @@ UK = {
         "🚫 fail2ban: заблоковано зараз {banned}, усього {total}",
     "🚪 Порты наружу: {ports}":
         "🚪 Порти назовні: {ports}",
+    "🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Службы перезапускаются только из списка /etc/monitor-agent/allowed-services на том сервере.":
+        "🧰 <b>Дії</b>\nКожну дію потрібно підтвердити. Служби перезапускаються лише зі списку /etc/monitor-agent/allowed-services на тому сервері.",
+    "Сервера {name} нет в remote_servers":
+        "Сервера {name} немає в remote_servers",
+    "⏳ Установка обновлений на {name} запущена ({what}). Проверить: «📦 Обновления» в карточке сервера.":
+        "⏳ Встановлення оновлень на {name} запущено ({what}). Перевірити: «📦 Оновлення» в картці сервера.",
+    "🚫 Заблокировать <b>{ip}</b> на сервере {name} (fail2ban)?":
+        "🚫 Заблокувати <b>{ip}</b> на сервері {name} (fail2ban)?",
+    "📦 Установить на {name}: {what}?":
+        "📦 Встановити на {name}: {what}?",
+    "неверная цель: {target}":
+        "неправильна ціль: {target}",
+    "сеть":
+        "мережа",
 }
 
 EN = {
@@ -2275,4 +2289,18 @@ EN = {
         "🚫 fail2ban: banned now {banned}, total {total}",
     "🚪 Порты наружу: {ports}":
         "🚪 Public ports: {ports}",
+    "🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Службы перезапускаются только из списка /etc/monitor-agent/allowed-services на том сервере.":
+        "🧰 <b>Actions</b>\nEvery action needs confirmation. Services can be restarted only from /etc/monitor-agent/allowed-services on that server.",
+    "Сервера {name} нет в remote_servers":
+        "Server {name} is not in remote_servers",
+    "⏳ Установка обновлений на {name} запущена ({what}). Проверить: «📦 Обновления» в карточке сервера.":
+        "⏳ Installing updates on {name} started ({what}). Check: \"📦 Updates\" on the server card.",
+    "🚫 Заблокировать <b>{ip}</b> на сервере {name} (fail2ban)?":
+        "🚫 Block <b>{ip}</b> on server {name} (fail2ban)?",
+    "📦 Установить на {name}: {what}?":
+        "📦 Install on {name}: {what}?",
+    "неверная цель: {target}":
+        "invalid target: {target}",
+    "сеть":
+        "network",
 }

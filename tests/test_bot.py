@@ -3555,61 +3555,75 @@ class RemoteContainersTest(unittest.TestCase):
         self.assertEqual(a.parse_inspect("/web\t2\t2026-11-23T10:00:00Z\nbad\n"),
                          {"web": {"restarts": 2, "started": "2026-11-23T10:00:00Z"}})
         self.assertEqual(a.log_hits("INFO a\nERROR b\nok\nTraceback x\n"), ["ERROR b", "Traceback x"])
-        for ok in ("backups", "backup-get 0", "backup-get 12"):
-            self.assertIsNotNone(a.parse_action(ok), ok)
-        for bad in ("backups x", "backup-get", "backup-get -1", "backup-get 1000", "backup-get ../x"):
+        for bad in ("backups", "backup-get 0", "pull-stream"):  # забор копий — только ключом ПК (аргументом)
             self.assertIsNone(a.parse_action(bad), bad)
+
+    def test_agent_backups_and_pull_stream(self):
+        import io
+        import tarfile
+        import hashlib
+        a = load_agent()
         d = Path(tempfile.mkdtemp())
         (d / "latest.tar.gz").write_bytes(b"L")
         (d / "b-1.tar.gz").write_bytes(b"one")
         os.utime(d / "b-1.tar.gz", (T0, T0))
         (d / "b-2.tar.gz").write_bytes(b"two!")
         os.utime(d / "b-2.tar.gz", (T0 + 100, T0 + 100))
-        watch = d / "watch"
-        watch.write_text(f"# c\n{d} 26\nrelative/x\n")
-        with mock.patch.object(a, "BACKUP_WATCH", str(watch)):
-            self.assertEqual(a.backup_dirs(), [str(d)])
-            got = json.loads(a.action(["backup-get", "0"])["out"])
-            self.assertEqual((got["name"], got["size"], got["mtime"]), ("b-2.tar.gz", 4, T0 + 100))
-            self.assertFalse(a.action(["backup-get", "1"])["ok"])
-            lst = json.loads(a.action(["backups"])["out"])
-            self.assertEqual(lst[0]["newest"][0], "b-2.tar.gz")
+        watch = Path(tempfile.mkdtemp()) / "watch"
+        watch.write_text(f"# c\n{d} 30\nrelative/x\n/nonexistent/dir\n")
+        off = d / "off" / "offsite.json"
+        with mock.patch.object(a, "BACKUP_WATCH", str(watch)), mock.patch.object(a, "OFFSITE_STATUS", str(off)):
+            self.assertEqual(a.backup_dirs(), [(str(d), 30.0), ("/nonexistent/dir", 26.0)])
+            st = a.backups_status()
+            self.assertEqual((st[0]["count"], st[0]["newest"][0], st[0]["previous"][0], st[0]["max_age_h"]),
+                             (2, "b-2.tar.gz", "b-1.tar.gz", 30.0))
+            self.assertFalse(st[1]["exists"])
+            self.assertIsNone(a.offsite())
+            buf = io.BytesIO()
+            with mock.patch.dict(os.environ, {"SSH_CONNECTION": "9.9.9.9 1 2 22"}):
+                self.assertEqual(a.pull_stream(buf), 0)
+            buf.seek(0)
+            with tarfile.open(fileobj=buf) as t:
+                names = t.getnames()
+                sums = t.extractfile("SHA256SUMS").read().decode()
+            label = d.name
+            self.assertEqual(names, [f"{label}/b-2.tar.gz", "SHA256SUMS"])
+            self.assertEqual(sums, f"{hashlib.sha256(b'two!').hexdigest()}  {label}/b-2.tar.gz\n")
+            o = a.offsite()
+            self.assertEqual((o["bytes"], o["client"], len(o["files"])), (4, "9.9.9.9", 1))
+        with mock.patch.object(a, "BACKUP_WATCH", str(d / "none")):
+            self.assertEqual(a.pull_stream(io.BytesIO()), 1)
+        with mock.patch.object(sys, "argv", ["monitor-agent", "pull-stream"]), \
+                mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "reboot"}), \
+                mock.patch.object(a, "pull_stream", return_value=0) as ps, mock.patch.object(a, "action") as act:
+            self.assertEqual(a.main(), 0)
+            ps.assert_called_once()
+            act.assert_not_called()
 
-    def test_sync_backups(self):
-        import base64
-        root = Path(tempfile.mkdtemp())
-        cfg = dict(self.cfg, remote_backup_dir=str(root))
-        files = {"w-1.tar.gz": (b"one", T0), "w-2.tar.gz": (b"two", T0 + 100)}
-        newest = ["w-1.tar.gz"]
-        calls = []
+    def test_remote_backup_alerts_and_text(self):
+        cfg = dict(self.cfg, offsite_max_age_h=48)
+        bak = [{"path": "/var/backups/w", "max_age_h": 26, "exists": True, "count": 3, "total": 300,
+                "newest": ["w-1.tar.gz", 100, T0 - 3600], "previous": None}]
+        res = remote.backup_results(cfg, self.st, T0, cfg["remote_servers"][0],
+                                    {"backups": bak, "offsite": {"ts": T0 - 3600, "files": [1], "bytes": 100}})
+        self.assertEqual(res, {"ovh|bak:/var/backups/w": None, "ovh|bak:pc": None})
+        bak[0]["newest"][2] = T0 - 30 * 3600
+        res = remote.backup_results(cfg, self.st, T0, cfg["remote_servers"][0],
+                                    {"backups": bak, "offsite": {"ts": T0 - 50 * 3600, "files": [], "bytes": 0}})
+        self.assertTrue(res["ovh|bak:/var/backups/w"].startswith("[ovh] 💾"), res)
+        self.assertIn("30", res["ovh|bak:/var/backups/w"])
+        self.assertIn("monitor-bot-pull", res["ovh|bak:pc"])
+        # через общий опрос: ключ попадает в результаты
+        data = dict(AGENT_DATA, time=T0, backups=bak)
+        r = remote.evaluate(cfg, self.st, T0, None, lambda *x: (data, ""))
+        self.assertIn("ovh|bak:/var/backups/w", r)
+        text = backups.status_text(cfg, TMP, T0, watched_fn=lambda now: [], offsite_fn=lambda: None)
+        self.assertIn("🖥 <b>ovh</b>", text)
+        self.assertIn("/var/backups/w", text)
+        remote.LAST.clear()
+        self.assertNotIn("🖥 <b>ovh</b>", backups.status_text(cfg, TMP, T0, watched_fn=lambda now: [],
+                                                             offsite_fn=lambda: None))
 
-        def agent(srv, args, timeout, c):
-            calls.append(args)
-            if args == ["backups"]:
-                name = newest[0]
-                return True, json.dumps([{"path": "/var/backups/weather-bot",
-                                          "newest": [name, len(files[name][0]), files[name][1]]},
-                                         {"path": "/x/empty", "newest": None}])
-            name = newest[0]
-            return True, json.dumps({"name": name, "size": 3, "mtime": files[name][1],
-                                     "b64": base64.b64encode(files[name][0]).decode()})
-        log = remote.sync_backups(cfg, None, agent)
-        p = root / "ovh" / "weather-bot" / "w-1.tar.gz"
-        self.assertEqual((p.read_bytes(), int(p.stat().st_mtime)), (b"one", T0))
-        self.assertEqual(len(log), 1)
-        calls.clear()
-        self.assertEqual(remote.sync_backups(cfg, None, agent), [])  # уже есть — не качаем
-        self.assertEqual(calls, [["backups"]])
-        newest[0] = "w-2.tar.gz"
-        remote.sync_backups(cfg, None, agent)
-        self.assertEqual(sorted(x.name for x in p.parent.iterdir()), ["w-1.tar.gz", "w-2.tar.gz"])
-        with mock.patch.object(remote, "BACKUP_KEEP", 1):
-            files["w-3.tar.gz"] = (b"333", T0 + 200)
-            newest[0] = "w-3.tar.gz"
-            remote.sync_backups(cfg, None, agent)
-        self.assertEqual([x.name for x in p.parent.iterdir()], ["w-3.tar.gz"])
-        bad = remote.sync_backups(cfg, None, lambda *a: (False, "command not allowed"))
-        self.assertIn("command not allowed", bad[0])
 
 
 if __name__ == "__main__":

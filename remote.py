@@ -246,6 +246,26 @@ def results_from(srv: dict, cfg: dict, data: dict) -> dict[str, str | None]:
     return res
 
 
+def backup_results(cfg: dict, state, now: float, srv: dict, data: dict) -> dict[str, str | None]:
+    """Копии на другом сервере (папки его /etc/monitor-agent/backup-watch) и когда их забирал ПК — те же
+    проверки и тексты, что для своих; ключи «имя|bak:ПАПКА» и «имя|bak:pc»."""
+    import backups
+    name = srv["name"]
+    pfx = f"[{name}] "
+    res: dict[str, str | None] = {}
+    if not cfg.get("backup_alerts", True):
+        return res
+    for st in data.get("backups") or []:
+        if not isinstance(st, dict) or not st.get("path") or not st.get("max_age_h"):
+            continue
+        p = backups.folder_problem(st, state, now, f"{name}{SEP}{st['path']}")
+        res[f"{name}{SEP}bak:{st['path']}"] = pfx + p if p else None
+    if data.get("offsite") is not None:
+        p = backups.offsite_problem(cfg, data["offsite"], now)
+        res[f"{name}{SEP}bak:pc"] = pfx + p if p else None
+    return res
+
+
 def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher=None) -> dict[str, str | None]:
     """Опросить все удалённые серверы. state — checks.AlertState (remote_fails, remote_last)."""
     fetcher = fetcher or fetch
@@ -265,6 +285,7 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
                 import logging
                 logging.getLogger("monitor_bot").exception("Не удалось записать историю %s", name)
             r = results_from(srv, cfg, data)
+            r.update(backup_results(cfg, state, now, srv, data))
             state.remote_last[name] = r
             res.update(r)
             res[down_key] = None
@@ -475,76 +496,6 @@ def container_events(cfg: dict, state, now: float, srv: dict, data: dict, muted:
                                '{sample}', name=c, len=len(hits), sample=sample),
                              f"{name}{SEP}log:{c}", "event", server=name))
     return out
-
-
-# ---------- Копии с других серверов: последняя копия каждой папки лежит и здесь ----------
-
-LABEL_RE = re.compile(r"[^A-Za-z0-9_.-]")
-FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,200}$")
-BACKUP_KEEP = 14
-
-
-def backup_root(cfg: dict, data_dir: Path | None) -> Path:
-    return Path(cfg.get("remote_backup_dir") or Path(data_dir or ".") / "remote-backups")
-
-
-def sync_backups(cfg: dict, data_dir: Path | None, agent=None) -> list[str]:
-    """Забрать с каждого сервера свежие копии, которых здесь ещё нет: <root>/<сервер>/<папка>/<файл>,
-    с тем же временем изменения, что там (по нему бот и backup-watch судят о свежести).
-    Хранится BACKUP_KEEP последних. Возвращает строки для журнала."""
-    import base64
-    import os
-    agent = agent or run_agent
-    log: list[str] = []
-    root = backup_root(cfg, data_dir)
-    for srv in servers(cfg):
-        name = srv["name"]
-        ok, out = agent(srv, ["backups"], 60, cfg)
-        try:
-            dirs = json.loads(out) if ok else None
-        except ValueError:
-            dirs = None
-        if not isinstance(dirs, list):
-            log.append(f"{name}: {out[:200] if not ok else 'bad answer'}")
-            continue
-        used: set[str] = set()
-        for n, d in enumerate(dirs):
-            newest = d.get("newest") if isinstance(d, dict) else None
-            if not newest:
-                continue
-            label = LABEL_RE.sub("_", os.path.basename(str(d.get("path") or "")) or "dir")[:40]
-            while label in used:
-                label += "_"
-            used.add(label)
-            fname, size, mtime = str(newest[0]), int(newest[1]), float(newest[2])
-            if not FILE_RE.match(fname):
-                log.append(f"{name}/{label}: bad file name")
-                continue
-            dest = root / name / label
-            target = dest / fname
-            if target.exists() and target.stat().st_size == size and abs(target.stat().st_mtime - mtime) < 2:
-                continue
-            ok, out = agent(srv, ["backup-get", str(n)], 300, cfg)
-            try:
-                got = json.loads(out) if ok else None
-                raw = base64.b64decode(got["b64"]) if got else None
-            except (ValueError, KeyError, TypeError):
-                raw = None
-            if raw is None or got.get("name") != fname:
-                log.append(f"{name}/{label}: {out[:200] if not ok else 'bad answer'}")
-                continue
-            dest.mkdir(parents=True, exist_ok=True)
-            tmp = dest / f".{fname}.part"
-            tmp.write_bytes(raw)
-            os.chmod(tmp, 0o640)
-            os.utime(tmp, (float(got["mtime"]), float(got["mtime"])))
-            os.replace(tmp, target)
-            log.append(f"{name}/{label}: {fname} ({len(raw)} B)")
-            files = sorted((p for p in dest.iterdir() if p.is_file() and not p.name.startswith(".")),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in files[BACKUP_KEEP:]:
-                old.unlink()
-    return log
 
 
 def servers_text(cfg: dict, state=None) -> str:

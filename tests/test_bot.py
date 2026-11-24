@@ -319,6 +319,22 @@ class DockerEventsTest(unittest.TestCase):
             checks.update_seen_containers(st)
         self.assertEqual(st.seen_containers, ["a", "b", "c"])
 
+    def test_removed_auto_container_is_not_down(self):
+        # контейнер удалили (docker compose down / переезд на другой сервер) — это не авария
+        cfg = {"containers": ["fixed"], "containers_auto": True, "thresholds": {}}
+        st = checks.AlertState(seen_containers=["fixed", "app", "gone"])
+        with mock.patch.object(checks, "container_states", return_value={"app": "exited"}):
+            checks.update_seen_containers(st, cfg, T0)
+            self.assertEqual(checks.watched_containers(cfg, st), ["fixed", "app"])  # остановленный — следим
+            with mock.patch.object(checks, "container_info", return_value={}):
+                res = checks.evaluate(cfg, st)
+        self.assertNotIn("ctr:gone", res)
+        self.assertIn("exited", res["ctr:app"])
+        self.assertIn("not found", res["ctr:fixed"])  # из списка containers — всегда ждём
+        with mock.patch.object(checks, "container_states", return_value={"app": "running", "gone": "running"}):
+            checks.update_seen_containers(st, cfg, T0 + 60)  # пересоздали — слежка вернулась
+        self.assertEqual(checks.watched_containers(cfg, st), ["fixed", "app", "gone"])
+
     def test_container_info_parse(self):
         out = mock.Mock(stdout="/weather-bot\t2\t2026-11-15T07:00:00Z\thealthy\n/x\tbad\t\t\n")
         with mock.patch.object(checks, "docker", return_value=out):

@@ -495,11 +495,13 @@ def logs_text(name: str, tail: int = 30, service: bool = False) -> str:
 
 
 def watched_containers(cfg: dict, state: "AlertState | None" = None) -> list[str]:
-    """Контейнеры из настроек плюс (в авто-режиме) все, которые бот когда-либо видел работающими."""
+    """Контейнеры из настроек плюс (в авто-режиме) все, которые бот когда-либо видел работающими.
+    Авто-контейнер, которого больше нет в docker ps -a (его удалили, а не остановили), не проверяем:
+    удаление — не авария. Если он появится снова (пересоздали), слежка вернётся сама."""
     names = list(cfg.get("containers") or [])
     if cfg.get("containers_auto") and state is not None:
         for n in state.seen_containers:
-            if n not in names:
+            if n not in names and n not in state.seen_missing:
                 names.append(n)
     return names
 
@@ -843,10 +845,13 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     out: list[Alert] = []
     real = results is None
     forgotten: list[str] = []
+    removed: list[str] = []
     if real:
         if cfg.get("containers") or cfg.get("containers_auto"):
             docker_poll()
+        was_missing = set(state.seen_missing)
         forgotten = update_seen_containers(state, cfg, now)
+        removed = [n for n in state.seen_missing if n not in was_missing]
     results = evaluate(cfg, state) if real else dict(results)
     if real and cfg.get("remote_servers"):
         import remote
@@ -947,9 +952,13 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
         except Exception:
             import logging
             logging.getLogger("monitor_bot").exception('Ошибка проверки SSL')
-        if forgotten and cfg.get("containers_auto") and not muted:
+        if removed and cfg.get("containers_auto"):
+            # удалённый (не остановленный) контейнер — не авария: только запись в журнале инцидентов
+            out.append(Alert(_('🗑 Контейнер удалён, не слежу за ним, пока не появится снова: ') + ", ".join(removed),
+                             None, "event", "journal"))
+        if forgotten and cfg.get("containers_auto"):
             out.append(Alert(_('🗑 Контейнеры удалены больше суток назад, больше не слежу: ') + ", ".join(forgotten),
-                             None, "event"))
+                             None, "event", "journal"))
         if state.bak_events and not muted:
             out += [Alert(t, None, "event") for t in state.bak_events]
         state.bak_events = []

@@ -3625,6 +3625,53 @@ class RemoteContainersTest(unittest.TestCase):
                                                              offsite_fn=lambda: None))
 
 
+class LocalCardTest(unittest.TestCase):
+    """Карточка своего сервера показывает те же строки, что карточка другого сервера."""
+
+    def card(self, st, **kw):
+        cfg = {"services": ["ssh", "hetzner-bot"], "update_alerts": False}
+        with mock.patch.object(checks, "service_state", side_effect=lambda s: "running" if s == "ssh" else "failed"), \
+             mock.patch.object(checks, "container_stats", return_value=[]):
+            return checks.status_text(cfg, st, now=T0, **kw)
+
+    def test_security_lines(self):
+        st = checks.AlertState()
+        st.ssh_failed = [[T0 - 60, "203.0.113.5", 4], [T0 - 1800, "198.51.100.7", 2], [T0 - 4000, "203.0.113.5", 9]]
+        st.autobans = {"203.0.113.5": 0}
+        t = self.card(st, banned_fn=lambda: ["203.0.113.5", "198.51.100.0/24", "192.0.2.1"],
+                      ports_fn=lambda: {"udp/68", "tcp/443", "tcp/22"})
+        self.assertIn("✅ служба ssh: running", t)
+        self.assertIn("❌ служба hetzner-bot: failed", t)
+        self.assertIn("Неудачных входов по SSH за час: 6", t)
+        self.assertIn("Заблокировано ботом: 3 (автобан 1, вручную 2)", t)
+        self.assertIn("Порты наружу: tcp/22, tcp/443, udp/68", t)
+        self.assertNotIn("Контейнеры", t)
+        lines = t.splitlines()
+        self.assertLess(lines.index("✅ служба ssh: running"),
+                        [i for i, x in enumerate(lines) if "Неудачных входов" in x][0])
+
+    def test_no_helper_hides_bans_and_no_state_keeps_old_card(self):
+        t = self.card(checks.AlertState(), banned_fn=lambda: None, ports_fn=lambda: None)
+        self.assertIn("Неудачных входов по SSH за час: 0", t)
+        self.assertNotIn("Заблокировано", t)
+        self.assertNotIn("Порты наружу", t)
+        t = self.card(None)
+        self.assertNotIn("служба", t)
+        self.assertNotIn("Неудачных входов", t)
+
+    def test_bot_status_uses_state_and_helper(self):
+        sys.argv = ["bot.py", str(CONF)]
+        import bot
+        with mock.patch.object(bot.ACT, "_helper", return_value=(True, '["203.0.113.5"]')):
+            self.assertEqual(bot.banned_ips(), ["203.0.113.5"])
+        with mock.patch.object(bot.ACT, "_helper", return_value=(False, "нет прав")):
+            self.assertIsNone(bot.banned_ips())
+        with mock.patch.object(bot.ACT, "_helper", return_value=(True, "{oops")):
+            self.assertIsNone(bot.banned_ips())
+        with mock.patch.object(checks, "status_text", return_value="S") as f:
+            self.assertEqual(bot.status_text(), "S")
+        self.assertIs(f.call_args.args[1], bot.STATE)
+
 
 if __name__ == "__main__":
     unittest.main()

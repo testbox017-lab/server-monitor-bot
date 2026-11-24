@@ -1138,6 +1138,8 @@ UK = {
         "🚫 fail2ban: заблоковано зараз {banned}, усього {total}",
     "🚪 Порты наружу: {ports}":
         "🚪 Порти назовні: {ports}",
+    "🚫 Заблокировано ботом: {n} (автобан {auto}, вручную {manual})":
+        "🚫 Заблоковано ботом: {n} (автобан {auto}, вручну {manual})",
     "🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Службы перезапускаются только из списка /etc/monitor-agent/allowed-services на том сервере.":
         "🧰 <b>Дії</b>\nКожну дію потрібно підтвердити. Служби перезапускаються лише зі списку /etc/monitor-agent/allowed-services на тому сервері.",
     "Сервера {name} нет в remote_servers":
@@ -2289,6 +2291,8 @@ EN = {
         "🚫 fail2ban: banned now {banned}, total {total}",
     "🚪 Порты наружу: {ports}":
         "🚪 Public ports: {ports}",
+    "🚫 Заблокировано ботом: {n} (автобан {auto}, вручную {manual})":
+        "🚫 Blocked by the bot: {n} (auto-ban {auto}, manual {manual})",
     "🧰 <b>Действия</b>\nКаждое действие нужно подтвердить. Службы перезапускаются только из списка /etc/monitor-agent/allowed-services на том сервере.":
         "🧰 <b>Actions</b>\nEvery action needs confirmation. Services can be restarted only from /etc/monitor-agent/allowed-services on that server.",
     "Сервера {name} нет в remote_servers":

@@ -3361,6 +3361,12 @@ class AgentActionsTest(unittest.TestCase):
               "vim/noble-updates 9.1 amd64 [upgradable from: 9.0]\n")
         self.assertEqual(a.parse_upgradable(up), [{"name": "openssl", "security": True},
                                                   {"name": "vim", "security": False}])
+        sim = ("Calculating upgrade...\nThe following upgrades have been deferred due to phasing:\n  vim\n"
+               "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n")
+        self.assertEqual(a.parse_held(sim), {"vim": "phased"})
+        with mock.patch.object(a, "_run", side_effect=[{"ok": True, "out": up}, {"ok": True, "out": sim}]):
+            self.assertEqual(json.loads(a.upgradable()["out"]),
+                             [{"name": "openssl", "security": True}, {"name": "vim", "security": False, "held": "phased"}])
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write("cron\n# comment\ndocker  # engine\nbad;name\n")
         with mock.patch.object(a, "ALLOWED_SERVICES", f.name):
@@ -3427,6 +3433,39 @@ class RemoteActionsTest(unittest.TestCase):
             self.assertEqual([(e.server, e.key) for e in ev], [("ovh", "ovh|apt:updates")])
             remote.UPDATES.clear()
             self.assertEqual(remote.update_events(self.cfg, st, time.time() + 60, False, False), [])
+
+    def test_phased_not_installable(self):
+        remote.UPDATES.clear()
+        remote.LAST["ovh"] = {"ts": T0, "data": dict(AGENT_DATA), "new": False}
+        pkgs = json.dumps([{"name": "libsqlite3-0", "security": False, "held": "phased"}])
+        with mock.patch.object(remote, "run_agent", return_value=(True, pkgs)):
+            t = remote.updates_text("ovh")
+        self.assertIn("⏸ libsqlite3-0", t)
+        self.assertIn("поэтапно", t)
+        self.assertNotIn("📦 libsqlite3-0", t)
+        self.assertIn("отложено: 1", remote.updates_line("ovh"))
+        self.assertEqual(remote.installable(remote.UPDATES["ovh"]["pkgs"], "all"), [])
+
+    def test_list_refreshed_after_install(self):
+        st = checks.AlertState.load(TMP / "ract_upd2.json")
+        remote.UPDATES.clear()
+        now = time.time()
+        remote.LAST["ovh"] = {"ts": now, "data": dict(AGENT_DATA), "new": False}
+        old = json.dumps([{"name": "vim", "security": False}])
+        with mock.patch.object(remote, "run_agent", return_value=(True, old)):
+            remote.check_updates("ovh")
+        remote.updates_started("ovh")
+        with mock.patch.object(remote, "run_agent", return_value=(True, "[]")) as ra:
+            remote.update_events(self.cfg, st, now, False, False)
+            self.assertEqual(ra.call_count, 0)        # отчёт агента ещё старый (до запуска установки)
+            remote.LAST["ovh"] = {"ts": time.time() + 1, "data": dict(AGENT_DATA, apt_running=True), "new": False}
+            remote.update_events(self.cfg, st, now, False, False)
+            self.assertEqual(ra.call_count, 0)        # установка ещё идёт
+            remote.LAST["ovh"] = {"ts": time.time() + 2, "data": dict(AGENT_DATA), "new": False}
+            remote.update_events(self.cfg, st, now, False, False)
+            self.assertEqual(ra.call_count, 1)        # закончилась — список обновлён
+        self.assertEqual(remote.updates_line("ovh"), "📦 Обновления: нет")
+        self.assertFalse(remote.UPDATES["ovh"]["stale"])
 
 
 class RemoteCardBotTest(unittest.TestCase):

@@ -407,7 +407,8 @@ F2B_JAIL = "sshd"
 
 def _run(cmd: list[str], timeout: int) -> dict:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace",
+                           env={**os.environ, "LC_ALL": "C"})  # разбираем английский вывод apt
     except subprocess.TimeoutExpired:
         return {"ok": False, "out": "timeout"}
     except OSError as e:
@@ -477,9 +478,40 @@ def parse_upgradable(text: str) -> list[dict]:
     return out
 
 
+# Заголовки в выводе apt-get upgrade, после которых с отступом идут пакеты, которые он сейчас не поставит
+HELD_HEADERS = {"The following upgrades have been deferred due to phasing:": "phased",
+                "The following packages have been kept back:": "kept"}
+
+
+def parse_held(text: str) -> dict[str, str]:
+    """{пакет: phased|kept} из вывода apt-get -s upgrade."""
+    out: dict[str, str] = {}
+    kind = None
+    for ln in text.splitlines():
+        if ln.strip() in HELD_HEADERS:
+            kind = HELD_HEADERS[ln.strip()]
+        elif kind and ln[:1] == " ":
+            for n in ln.split():
+                out.setdefault(n.split(":")[0], kind)
+        else:
+            kind = None
+    return out
+
+
 def upgradable() -> dict:
+    """[{name, security, held?}]. held — phased (Ubuntu выпускает поэтапно, до сервера очередь не дошла) или
+    kept (apt держит): «Установить все» их не поставит, поэтому главный бот их не предлагает."""
     r = _run(["apt", "list", "--upgradable"], 60)
-    return {"ok": r["ok"], "out": json.dumps(parse_upgradable(r["out"])) if r["ok"] else r["out"]}
+    if not r["ok"]:
+        return r
+    pkgs = parse_upgradable(r["out"])
+    if pkgs:
+        sim = _run(["apt-get", "-s", "-q", "upgrade"], 60)
+        held = parse_held(sim["out"]) if sim["ok"] else {}
+        for p in pkgs:
+            if held.get(p["name"]):
+                p["held"] = held[p["name"]]
+    return {"ok": True, "out": json.dumps(pkgs)}
 
 
 APT_UNIT = "monitor-agent-apt"

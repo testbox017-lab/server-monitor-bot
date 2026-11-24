@@ -873,9 +873,23 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
           '/lang — язык / мова / language'), reply_markup=main_kb())
 
 
+def banned_ips() -> list[str] | None:
+    """IP, заблокированные ботом (через помощник). None, если помощник не ответил."""
+    ok, out = ACT._helper("banned-list", timeout=20)
+    try:
+        ips = json.loads(out) if ok else None
+    except ValueError:
+        return None
+    return ips if isinstance(ips, list) else None
+
+
+def status_text() -> str:
+    return checks.status_text(CFG, STATE, banned_ips)
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed(update):
-        await send(update, await asyncio.to_thread(checks.status_text, CFG), status_kb())
+        await send(update, await asyncio.to_thread(status_text), status_kb())
 
 
 async def cmd_servers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1085,7 +1099,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if cmd == "noop":
             pass
         elif cmd == "status":
-            text = await asyncio.to_thread(checks.status_text, CFG)
+            text = await asyncio.to_thread(status_text)
             if len(parts) > 1:  # из алерта: новое сообщение, алерт не трогаем
                 await send(update, text, status_kb())
             else:
@@ -1968,13 +1982,9 @@ async def verify_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def weekly_extra() -> list[str]:
     lines = [_('💾 Бэкапы:'), "  " + verify_line(), "  " + backups.offsite_text(CFG, time.time())]
-    ok, out = ACT._helper("banned-list", timeout=20)
-    try:
-        n = len(json.loads(out)) if ok else None
-    except ValueError:
-        n = None
-    if n is not None:
-        lines.append(_('🚫 Заблокировано IP ботом: {n}', n=n))
+    ips = banned_ips()
+    if ips is not None:
+        lines.append(_('🚫 Заблокировано IP ботом: {n}', n=len(ips)))
     lines += security.ssh_week_lines(STATE, time.time())
     return lines
 

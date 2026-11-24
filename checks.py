@@ -110,7 +110,10 @@ def collect(cfg: dict) -> dict:
     }
 
 
-def status_text(cfg: dict) -> str:
+def status_text(cfg: dict, state: "AlertState | None" = None, banned_fn=None, ports_fn=None,
+                now: float | None = None) -> str:
+    """Карточка своего сервера. С state показывает то же, что карточка другого сервера (remote.server_text):
+    службы, неудачные входы по SSH за час, блокировки бота и открытые наружу порты."""
     s = collect(cfg)
     lines = [
         f"🖥 <b>{s['host']}</b> ({s['os']})",
@@ -131,6 +134,11 @@ def status_text(cfg: dict) -> str:
         lines.append(f"🌡 {name}: {t:.0f}°C")
     lines.append(_('🌐 Сеть: ↓ {fmt_bytes} ↑ {fmt_bytes2}',
                    fmt_bytes=fmt_bytes(s['net'].bytes_recv), fmt_bytes2=fmt_bytes(s['net'].bytes_sent)))
+    if state is not None:
+        for svc in cfg.get("services", []) or []:
+            st = service_state(svc)
+            lines.append(_('{icon} служба {escape}: {escape2}', icon="✅" if st == "running" else "❌",
+                           escape=html.escape(svc), escape2=html.escape(st)))
     stats = container_stats()
     if stats:
         lines.append(_('🐳 Контейнеры:'))
@@ -139,7 +147,33 @@ def status_text(cfg: dict) -> str:
     if cfg.get("update_alerts", True):
         import pkgupdates
         lines += pkgupdates.status_lines()
+    if state is not None:
+        lines += security_lines(state, banned_fn, ports_fn, now or time.time())
     return "\n".join(lines)
+
+
+def security_lines(state: "AlertState", banned_fn=None, ports_fn=None, now: float = 0.0) -> list[str]:
+    """Строки безопасности для карточки своего сервера, в том же порядке, что у другого сервера."""
+    import security
+    lines = [_('🛡 Неудачных входов по SSH за час: {n}',
+               n=sum(x[2] for x in state.ssh_failed if now - x[0] < 3600))]
+    ips = banned_fn() if banned_fn else None
+    if ips is not None:  # None: помощника нет или он не ответил, строку не показываем
+        auto = sum(1 for ip in ips if ip in state.autobans)
+        lines.append(_('🚫 Заблокировано ботом: {n} (автобан {auto}, вручную {manual})',
+                       n=len(ips), auto=auto, manual=len(ips) - auto))
+    ports = (ports_fn or security.listening_ports)()
+    if ports:
+        lines.append(_('🚪 Порты наружу: {ports}', ports=html.escape(", ".join(sort_ports(ports)))))
+    return lines
+
+
+def sort_ports(ports) -> list[str]:
+    """tcp/22, tcp/443, udp/68: сначала по протоколу, потом по номеру."""
+    def key(p: str):
+        proto, __, num = p.partition("/")
+        return proto, int(num) if num.isdigit() else 0, num
+    return sorted(ports, key=key)
 
 
 def top_processes(n: int = 10, by: str = "cpu") -> str:

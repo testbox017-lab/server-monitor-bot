@@ -609,7 +609,7 @@ def check_updates(name: str, force: bool = False) -> list[dict] | None:
     cached = UPDATES.get(name)
     if srv is None:
         return None
-    if cached and not force and time.time() - cached["ts"] < UPDATES_EVERY:
+    if cached and not force and not cached.get("stale") and time.time() - cached["ts"] < UPDATES_EVERY:
         return cached["pkgs"]
     ok, out = run_agent(srv, ["updates"], timeout=90)
     try:
@@ -617,8 +617,30 @@ def check_updates(name: str, force: bool = False) -> list[dict] | None:
     except ValueError:
         pkgs = None
     if pkgs is not None:
-        UPDATES[name] = {"ts": time.time(), "pkgs": pkgs}
+        # пока там идёт установка, список ещё старый: перепроверим, когда она закончится
+        now = time.time()
+        UPDATES[name] = {"ts": now, "pkgs": pkgs, "stale": now if last_data(name).get("apt_running") else 0}
     return pkgs
+
+
+def updates_started(name: str) -> None:
+    """Установка запущена: список в карточке устарел. stale — с какого момента; обновим список, когда свежий
+    отчёт агента (полученный после этого момента) скажет, что установка закончилась."""
+    if name in UPDATES:
+        UPDATES[name]["stale"] = time.time()
+
+
+def updates_settled(name: str) -> bool:
+    """Установка, после которой список устарел, уже закончилась (по отчёту агента, пришедшему после неё)."""
+    stale = (UPDATES.get(name) or {}).get("stale") or 0
+    with _lock:
+        last = LAST.get(name) or {}
+    return bool(stale) and last.get("ts", 0) > stale and not (last.get("data") or {}).get("apt_running")
+
+
+def installable(pkgs: list[dict], mode: str) -> list[dict]:
+    """Что поставит установка: для «всех» — без отложенных Ubuntu (phased) и удержанных apt (kept)."""
+    return [p for p in pkgs if p.get("security")] if mode == "security" else [p for p in pkgs if not p.get("held")]
 
 
 def updates_line(name: str) -> str | None:
@@ -628,7 +650,10 @@ def updates_line(name: str) -> str | None:
     if not pkgs:
         return _('📦 Обновления: нет')
     sec = sum(bool(p.get("security")) for p in pkgs)
-    return _('📦 Обновления: {len}', len=len(pkgs)) + (f" ({_('🛡 безопасности: {n}', n=sec)})" if sec else "")
+    held_n = sum(bool(p.get("held")) for p in pkgs)
+    extra = [x for x in (_('🛡 безопасности: {n}', n=sec) if sec else "",
+                         _('⏸ отложено: {n}', n=held_n) if held_n else "") if x]
+    return _('📦 Обновления: {len}', len=len(pkgs)) + (f" ({', '.join(extra)})" if extra else "")
 
 
 def updates_text(name: str, force: bool = False) -> str:
@@ -645,9 +670,19 @@ def updates_text(name: str, force: bool = False) -> str:
     sec = [p["name"] for p in pkgs if p.get("security")]
     if sec:
         lines.append("🛡 " + html.escape(pkgupdates.names_short(sec, 30)))
-    other = [p["name"] for p in pkgs if not p.get("security")]
+    other = [p["name"] for p in pkgs if not p.get("security") and not p.get("held")]
     if other:
         lines.append("📦 " + html.escape(pkgupdates.names_short(other, 30)))
+    phased = [p["name"] for p in pkgs if p.get("held") == "phased" and not p.get("security")]
+    if phased:
+        lines.append("⏸ " + html.escape(pkgupdates.names_short(phased, 30)))
+        lines.append(_('⏸ — Ubuntu выпускает это обновление поэтапно, до этого сервера очередь ещё не дошла. '
+                       'Когда дойдёт (обычно за несколько дней), его поставит «Установить все».'))
+    kept = [p["name"] for p in pkgs if p.get("held") == "kept" and not p.get("security")]
+    if kept:
+        lines.append("⏸ " + html.escape(pkgupdates.names_short(kept, 30)))
+        lines.append(_('⏸ — apt держит обновление: ему нужны новые пакеты (часто так бывает с ядром). Ставится '
+                       'вручную: apt full-upgrade.'))
     return "\n".join(lines)
 
 
@@ -661,7 +696,13 @@ def update_events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> lis
     for srv in servers(cfg):
         name = srv["name"]
         cached = UPDATES.get(name)
-        if name not in LAST or name in ERRORS or (cached and now - cached["ts"] < UPDATES_EVERY):
+        if name not in LAST or name in ERRORS:
+            continue
+        if cached and cached.get("stale"):
+            if updates_settled(name):
+                check_updates(name, force=True)  # установка закончилась — обновляем карточку, без напоминаний
+            continue
+        if cached and now - cached["ts"] < UPDATES_EVERY:
             continue
         pkgs = check_updates(name, force=True) or []
         sec = [p["name"] for p in pkgs if p.get("security")]

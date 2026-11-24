@@ -1614,6 +1614,7 @@ async def handle_confirm(update: Update, cmd: str, token: str) -> str | None:
     ok, out = await asyncio.to_thread(ACT.execute, p)
     if p.kind == "rapt" and ok:
         srv = p.arg.split(remote.SEP, 1)[0]
+        remote.updates_started(srv)
         await edit(update, _("⏳ Установка обновлений на {name} запущена ({what}). Проверить: «📦 Обновления» в карточке сервера.",
                              name=html.escape(srv), what=pkgupdates.mode_text(p.arg.split(remote.SEP, 1)[-1])))
         return None
@@ -1698,8 +1699,9 @@ def rupd_kb(name: str) -> InlineKeyboardMarkup:
     if sec:
         rows.append([b for b in [act_btn(_('🛡 Установить обновления безопасности ({n})', n=sec),
                                          f"{p}:do:apt:security")] if b])
-    if pkgs:
-        rows.append([b for b in [act_btn(_('⬆️ Установить все ({n})', n=len(pkgs)), f"{p}:do:apt:all")] if b])
+    n_all = len(remote.installable(pkgs, "all"))
+    if n_all:
+        rows.append([b for b in [act_btn(_('⬆️ Установить все ({n})', n=n_all), f"{p}:do:apt:all")] if b])
     return InlineKeyboardMarkup([r for r in rows if r])
 
 

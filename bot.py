@@ -636,24 +636,20 @@ async def report_update(bot) -> None:
 
 
 def pkg_view() -> tuple[str, InlineKeyboardMarkup]:
-    """Доступные обновления пакетов Ubuntu и кнопки установки. Блокирующая (apt), вызывать в потоке."""
+    """Доступные обновления пакетов Ubuntu и кнопки установки. Блокирующая (apt), вызывать в потоке.
+    Окно такое же, как у серверов с агентом (rupd_view)."""
     pkgs = pkgupdates.upgradable()
     busy = pkgupdates.running()
     reboot = pkgupdates.reboot_info()
-    lines = [_('📦 <b>Обновления пакетов</b>')] + [html.escape(ln) for ln in pkgupdates.view_lines(pkgs)]
-    text = "\n".join(lines)
-    if len(text) > 3000:
-        text = text[:3000] + "\n…"
-    lines = [text]
-    age = pkgupdates.lists_age()
-    if age:
-        lines.append(_('Списки пакетов обновлены: {local_dt}', local_dt=local_dt(age)))
+    extra = []
     if reboot is not None:
-        lines.append(_('♻️ Серверу нужна перезагрузка')
+        extra.append(_('♻️ Серверу нужна перезагрузка')
                      + (f" ({html.escape(pkgupdates.names_short(reboot))})" if reboot else ""))
     if busy:
-        lines.append(_('⏳ Сейчас идёт установка обновлений, результат придёт отдельным сообщением.'))
-    rows = [[Btn(_('🔍 Проверить заново'), callback_data="pkg:refresh")]]
+        extra.append(_('⏳ Сейчас идёт установка обновлений, результат придёт отдельным сообщением.'))
+    age = pkgupdates.lists_age()
+    text = pkgupdates.view_text(host(), pkgs, local_dt(age) if age else None, extra)
+    rows = [[Btn(_('🔍 Проверить заново'), callback_data="pkg:refresh"), Btn(_('⬅️ Назад'), callback_data="status")]]
     if actions_on() and pkgs and not busy:
         sec = sum(p.security for p in pkgs)
         if sec:
@@ -663,9 +659,7 @@ def pkg_view() -> tuple[str, InlineKeyboardMarkup]:
             rows.append([Btn(_('⬆️ Установить все ({n})', n=n_all), callback_data="pkg:go:all")])
     if actions_on() and reboot is not None:
         rows.append([Btn(_('🔄 Перезагрузить сервер'), callback_data="act:reboot")])
-    lines.append(_('\n🛡 — обновление безопасности. Установка идёт через помощник с подтверждением; настройки '
-                   'пакетов не меняются, пакеты не удаляются. Сервер сам не перезагружается.'))
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return text, InlineKeyboardMarkup(rows)
 
 
 async def report_apt(bot) -> None:
@@ -1696,13 +1690,32 @@ def rupd_kb(name: str) -> InlineKeyboardMarkup:
     sec = sum(bool(x.get("security")) for x in pkgs)
     p = f"rs:{name}"
     rows = [[Btn(_('🔍 Проверить заново'), callback_data=f"{p}:upd:refresh"), rback(name)]]
-    if sec:
+    busy = remote.last_data(name).get("apt_running")
+    if sec and not busy:
         rows.append([b for b in [act_btn(_('🛡 Установить обновления безопасности ({n})', n=sec),
                                          f"{p}:do:apt:security")] if b])
     n_all = len(remote.installable(pkgs, "all"))
-    if n_all:
+    if n_all and not busy:
         rows.append([b for b in [act_btn(_('⬆️ Установить все ({n})', n=n_all), f"{p}:do:apt:all")] if b])
+    if remote.last_data(name).get("reboot_required"):
+        rows.append([b for b in [act_btn(_('🔄 Перезагрузить сервер'), f"{p}:do:reboot:-")] if b])
     return InlineKeyboardMarkup([r for r in rows if r])
+
+
+def rupd_view(name: str, force: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    """Окно обновлений другого сервера — в том же виде, что у своего (pkg_view). Блокирующая (ssh)."""
+    items = remote.check_updates(name, force)
+    s = remote.last_data(name)
+    extra = []
+    if s.get("reboot_required"):
+        extra.append(_('♻️ Серверу нужна перезагрузка'))
+    if s.get("apt_running"):
+        extra.append(_('⏳ Сейчас идёт установка обновлений.'))
+    lists_at = s.get("apt_lists_at")
+    err = remote.ERRORS.get(name, "?") if items is None else None
+    pkgs = None if items is None else pkgupdates.from_agent(items)
+    text = pkgupdates.view_text(name, pkgs, local_dt(lists_at) if lists_at else None, extra, err)
+    return text, rupd_kb(name)
 
 
 def rbanned_view(name: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1777,7 +1790,7 @@ async def handle_remote(update: Update, parts: list[str]) -> str | None:
                                                             rback(name)]))
     elif sub == "upd":
         force = len(parts) > 3 and parts[3] == "refresh"
-        await show(update, await asyncio.to_thread(remote.updates_text, name, force), rupd_kb(name))
+        await show(update, *(await asyncio.to_thread(rupd_view, name, force)))
     elif sub == "logs" and len(parts) > 4:
         kind, target = parts[3], ":".join(parts[4:])
         out = await asyncio.to_thread(remote.logs, name, kind, target, 30)

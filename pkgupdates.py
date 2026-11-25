@@ -6,6 +6,7 @@ apt-upgrade security|all. Установка идёт в отдельной сл
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -174,17 +175,27 @@ def last_result(path: Path | None = None) -> dict | None:
 
 def pkg_line(p: Pkg) -> str:
     old = f"{p.old} → " if p.old else ""
-    return f"{'🛡' if p.security else '⏸' if p.held else '•'} {p.name} {old}{p.new}"
+    ver = f" {old}{p.new}" if p.new else ""  # агент другого сервера версий не присылает
+    return f"{'🛡' if p.security else '⏸' if p.held else '•'} {p.name}{ver}"
+
+
+def from_agent(items: list[dict]) -> list[Pkg]:
+    """Список от агента другого сервера ([{name, security, held?}]) в том же виде, что у своего."""
+    out = [Pkg(str(x.get("name", "?")), "", "", "-security" if x.get("security") else "", x.get("held") or "")
+           for x in items]
+    return sorted(out, key=lambda p: (not p.security, bool(p.held), p.name))
 
 
 def view_lines(pkgs: list[Pkg] | None) -> list[str]:
     """Текст списка (без HTML-разметки, экранирует вызывающий)."""
     if pkgs is None:
         return [_('Не удалось получить список: apt недоступен или не ответил')]
-    if not pkgs:
-        return [_('✅ Все пакеты обновлены')]
-    sec = sum(p.security for p in pkgs)
-    lines = [_('Доступно обновлений: {len}, из них безопасности: {sec}', len=len(pkgs), sec=sec)]
+    if not installable(pkgs, "all") and not any(p.security for p in pkgs):
+        # ставить нечего: остались только отложенные Ubuntu или удержанные apt — для нас это «всё обновлено»
+        lines = [_('✅ Все пакеты обновлены')]
+    else:
+        sec = sum(p.security for p in pkgs)
+        lines = [_('Доступно обновлений: {len}, из них безопасности: {sec}', len=len(pkgs), sec=sec)]
     lines += [pkg_line(p) for p in pkgs[:LIST_MAX]]
     if len(pkgs) > LIST_MAX:
         lines.append(_('…и ещё {n}', n=len(pkgs) - LIST_MAX))
@@ -195,6 +206,28 @@ def view_lines(pkgs: list[Pkg] | None) -> list[str]:
         lines.append(_('⏸ — apt держит обновление: ему нужны новые пакеты (часто так бывает с ядром). Ставится '
                        'вручную: apt full-upgrade.'))
     return lines
+
+
+def view_text(server: str, pkgs: list[Pkg] | None, lists_at: str | None = None, extra: list[str] | None = None,
+              error: str | None = None) -> str:
+    """Окно «Обновления пакетов» — одно и то же для своего сервера и для серверов с агентом (HTML).
+    lists_at — когда обновлялись списки пакетов (уже в местном времени), extra — готовые строки (перезагрузка,
+    идёт установка), error — нет связи с сервером."""
+    head = [f"🖥 <b>{html.escape(server)}</b>", _('📦 <b>Обновления пакетов</b>')]
+    if error is not None:
+        body = _('📡 Нет связи: {err}', err=html.escape(error))
+    else:
+        body = "\n".join(html.escape(ln) for ln in view_lines(pkgs))
+        if len(body) > 3000:
+            body = body[:3000] + "\n…"
+    lines = head + [body]
+    if lists_at and error is None:
+        lines.append(_('Списки пакетов обновлены: {local_dt}', local_dt=lists_at))
+    lines += extra or []
+    if pkgs and (installable(pkgs, "all") or any(p.security for p in pkgs)):
+        lines.append(_('\n🛡 — обновление безопасности. Установка идёт только после подтверждения; настройки '
+                       'пакетов не меняются, пакеты не удаляются. Сервер сам не перезагружается.'))
+    return "\n".join(lines)
 
 
 def names_short(names: list[str], n: int = 8) -> str:

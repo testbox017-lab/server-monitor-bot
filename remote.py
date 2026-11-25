@@ -656,36 +656,6 @@ def updates_line(name: str) -> str | None:
     return _('📦 Обновления: {len}', len=len(pkgs)) + (f" ({', '.join(extra)})" if extra else "")
 
 
-def updates_text(name: str, force: bool = False) -> str:
-    import pkgupdates
-    pkgs = check_updates(name, force)
-    head = f"🖥 <b>{html.escape(name)}</b>\n"
-    if last_data(name).get("apt_running"):
-        head += _('установка обновлений уже идёт') + "\n"
-    if pkgs is None:
-        return head + _('📡 Нет связи: {err}', err=html.escape(ERRORS.get(name, "?")))
-    if not pkgs:
-        return head + _('📦 Обновления: нет')
-    lines = [head + (updates_line(name) or "")]
-    sec = [p["name"] for p in pkgs if p.get("security")]
-    if sec:
-        lines.append("🛡 " + html.escape(pkgupdates.names_short(sec, 30)))
-    other = [p["name"] for p in pkgs if not p.get("security") and not p.get("held")]
-    if other:
-        lines.append("📦 " + html.escape(pkgupdates.names_short(other, 30)))
-    phased = [p["name"] for p in pkgs if p.get("held") == "phased" and not p.get("security")]
-    if phased:
-        lines.append("⏸ " + html.escape(pkgupdates.names_short(phased, 30)))
-        lines.append(_('⏸ — Ubuntu выпускает это обновление поэтапно, до этого сервера очередь ещё не дошла. '
-                       'Когда дойдёт (обычно за несколько дней), его поставит «Установить все».'))
-    kept = [p["name"] for p in pkgs if p.get("held") == "kept" and not p.get("security")]
-    if kept:
-        lines.append("⏸ " + html.escape(pkgupdates.names_short(kept, 30)))
-        lines.append(_('⏸ — apt держит обновление: ему нужны новые пакеты (часто так бывает с ядром). Ставится '
-                       'вручную: apt full-upgrade.'))
-    return "\n".join(lines)
-
-
 def update_events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
     """Раз в 6 часов: есть ли обновления безопасности на другом сервере (как у своего, не чаще раза в сутки)."""
     from checks import Alert

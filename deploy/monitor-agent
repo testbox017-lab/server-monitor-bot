@@ -393,6 +393,7 @@ def status(services: list[str], since: int | None = None) -> dict:
         "fail2ban": fail2ban(),
         "allowed_services": allowed_services(),
         "apt_running": apt_running(),
+        "apt_lists_at": apt_lists_at(),
         "backups": backups_status(),
         "offsite": offsite(),
     }
@@ -512,6 +513,16 @@ def upgradable() -> dict:
             if held.get(p["name"]):
                 p["held"] = held[p["name"]]
     return {"ok": True, "out": json.dumps(pkgs)}
+
+
+def apt_lists_at() -> float | None:
+    """Когда последний раз обновлялись списки пакетов (как у главного бота), None — неизвестно."""
+    for p in ("/var/lib/apt/periodic/update-success-stamp", "/var/lib/apt/lists"):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            continue
+    return None
 
 
 APT_UNIT = "monitor-agent-apt"

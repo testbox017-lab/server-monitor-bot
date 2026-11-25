@@ -2728,6 +2728,10 @@ class PackageUpdatesTest(unittest.TestCase):
     def test_view_lines(self):
         self.assertIn("apt", pkgupdates.view_lines(None)[0])
         self.assertEqual(pkgupdates.view_lines([]), ["✅ Все пакеты обновлены"])
+        only_phased = [pkgupdates.Pkg("libsqlite3-0", "2", "1", "resolute-updates", "phased")]
+        lines = pkgupdates.view_lines(only_phased)
+        self.assertEqual(lines[:2], ["✅ Все пакеты обновлены", "⏸ libsqlite3-0 1 → 2"])
+        self.assertEqual(pkgupdates.pkg_line(pkgupdates.from_agent([{"name": "vim"}])[0]), "• vim")
         many = [pkgupdates.Pkg(f"p{i:02}", "2", "1", "noble-updates") for i in range(pkgupdates.LIST_MAX + 5)]
         lines = pkgupdates.view_lines(many)
         self.assertEqual(lines[0], f"Доступно обновлений: {len(many)}, из них безопасности: 0")
@@ -3417,8 +3421,8 @@ class RemoteActionsTest(unittest.TestCase):
         self.assertIn("12.5  12.5", t)
         pkgs = json.dumps([{"name": "openssl", "security": True}, {"name": "vim", "security": False}])
         with mock.patch.object(remote, "run_agent", return_value=(True, pkgs)) as ra:
-            t = remote.updates_text("ovh")
-            remote.updates_text("ovh")  # второй раз — из кэша
+            t = pkgupdates.view_text("ovh", pkgupdates.from_agent(remote.check_updates("ovh")))
+            remote.check_updates("ovh")  # второй раз — из кэша
             self.assertEqual(ra.call_count, 1)
         self.assertIn("openssl", t)
         self.assertIn("vim", t)
@@ -3439,10 +3443,11 @@ class RemoteActionsTest(unittest.TestCase):
         remote.LAST["ovh"] = {"ts": T0, "data": dict(AGENT_DATA), "new": False}
         pkgs = json.dumps([{"name": "libsqlite3-0", "security": False, "held": "phased"}])
         with mock.patch.object(remote, "run_agent", return_value=(True, pkgs)):
-            t = remote.updates_text("ovh")
+            t = pkgupdates.view_text("ovh", pkgupdates.from_agent(remote.check_updates("ovh")))
+        self.assertIn("✅ Все пакеты обновлены", t)              # ставить нечего — как у своего сервера
         self.assertIn("⏸ libsqlite3-0", t)
         self.assertIn("поэтапно", t)
-        self.assertNotIn("📦 libsqlite3-0", t)
+        self.assertNotIn("🛡 — обновление безопасности", t)
         self.assertIn("отложено: 1", remote.updates_line("ovh"))
         self.assertEqual(remote.installable(remote.UPDATES["ovh"]["pkgs"], "all"), [])
 
@@ -3491,6 +3496,25 @@ class RemoteCardBotTest(unittest.TestCase):
 
     def cbs(self, markup):
         return [x.callback_data for row in markup.inline_keyboard for x in row]
+
+    def test_updates_window_same_as_local(self):
+        """Когда ставить нечего, окно обновлений своего сервера и сервера с агентом выглядит одинаково."""
+        b = self.bot
+        remote.LAST["ovh"]["data"]["apt_lists_at"] = 1_700_000_000
+        with mock.patch.object(remote, "run_agent", return_value=(True, "[]")):
+            rtext, rkb = b.rupd_view("ovh")
+        with mock.patch.object(pkgupdates, "upgradable", return_value=[]), \
+                mock.patch.object(pkgupdates, "running", return_value=False), \
+                mock.patch.object(pkgupdates, "reboot_info", return_value=None), \
+                mock.patch.object(pkgupdates, "lists_age", return_value=1_700_000_000), \
+                mock.patch.object(b, "host", return_value="ovh"):
+            ltext, lkb = b.pkg_view()
+        self.assertEqual(rtext, ltext)
+        self.assertIn("✅ Все пакеты обновлены", rtext)
+        self.assertIn("Списки пакетов обновлены", rtext)
+        self.assertEqual([[x.text for x in r] for r in rkb.inline_keyboard],
+                         [[x.text for x in r] for r in lkb.inline_keyboard])
+        self.assertEqual(self.cbs(lkb), ["pkg:refresh", "status"])
 
     def press(self, data):
         q = mock.MagicMock()

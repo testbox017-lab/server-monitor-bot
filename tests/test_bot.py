@@ -33,6 +33,10 @@ T0 = 1_800_000_000
 backups.OFFSITE_STATUS = TMP / "no-offsite-status.json"  # тесты не читают настоящий файл сервера
 # На сервере помощник установлен, и docker пошёл бы через sudo. Тесты не должны зависеть от этого.
 checks.HELPER = str(TMP / "no-helper")
+# Упавшие службы и NTP настоящего сервера (тесты идут и на нём) не должны попадать в проверки
+REAL_FAILED_UNITS, REAL_TIME_SYNCED = checks.failed_units, checks.time_synced
+checks.failed_units = lambda: None
+checks.time_synced = lambda: None
 import actions  # noqa: E402
 import pkgupdates  # noqa: E402
 # На сервере есть настоящие /run/monitor-bot-apt.json и замок установки: тесты их читать не должны
@@ -3750,6 +3754,135 @@ class LocalCardTest(unittest.TestCase):
         with mock.patch.object(checks, "status_text", return_value="S") as f:
             self.assertEqual(bot.status_text(), "S")
         self.assertIs(f.call_args.args[1], bot.STATE)
+
+
+class HealthTest(unittest.TestCase):
+    """Упавшие службы systemd и часы (NTP, расхождение с другим сервером)."""
+    CFG = {"thresholds": {"duration_sec": 300}, "remind_min": 0, "tz": "Europe/Kyiv", "services": ["ssh"],
+           "failed_units_ignore": ["cloud-init*", "cloud-final*"]}
+
+    def setUp(self):
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+
+    def test_parse_failed_units(self):
+        text = ("● hetzner-bot.service loaded failed failed Hetzner bot\n"
+                "cloud-final.service loaded failed failed Cloud-init final\n"
+                "bad;id loaded failed failed x\n")
+        self.assertEqual(checks.parse_failed_units(text), ["hetzner-bot.service", "cloud-final.service"])
+        r = mock.Mock(returncode=0, stdout="x.service loaded failed failed X\n")
+        with mock.patch.object(checks.shutil, "which", return_value="/usr/bin/systemctl"), \
+             mock.patch.object(checks, "IS_WINDOWS", False), \
+             mock.patch.object(checks.subprocess, "run", return_value=r) as run:
+            self.assertEqual(REAL_FAILED_UNITS(), ["x.service"])
+        self.assertIn("--state=failed", run.call_args.args[0])
+        with mock.patch.object(checks.shutil, "which", return_value=None):
+            self.assertIsNone(REAL_FAILED_UNITS())
+
+    def test_ignored_units(self):
+        self.assertTrue(checks.failed_ignored("cloud-init-main.service", {}))       # по умолчанию
+        self.assertTrue(checks.failed_ignored("ssh.service", {}, ["ssh"]))          # уже есть svc:ssh
+        self.assertFalse(checks.failed_ignored("hetzner-bot.service", {}, ["ssh"]))
+        self.assertFalse(checks.failed_ignored("cloud-init-main.service", {"failed_units_ignore": []}))
+
+    def test_failed_unit_alert_and_recovery(self):
+        st = checks.AlertState()
+        with mock.patch.object(checks, "failed_units", return_value=["hetzner-bot.service", "ssh.service",
+                                                                     "cloud-init-main.service"]):
+            r = checks.evaluate(self.CFG, st)
+        self.assertEqual([k for k in r if k.startswith("failed:")], ["failed:hetzner-bot.service"])
+        r = {k: v for k, v in r.items() if k.startswith("failed:")}
+        out = checks.step(self.CFG, st, T0, results=r)
+        self.assertEqual([a.key for a in out], ["failed:hetzner-bot.service"])  # сразу, без duration
+        self.assertIn("hetzner-bot.service", out[0].text)
+        with mock.patch.object(checks, "failed_units", return_value=None):  # не удалось узнать — не «выздоровела»
+            r = {k: v for k, v in checks.evaluate(self.CFG, st).items() if k.startswith("failed:")}
+        self.assertTrue(r["failed:hetzner-bot.service"])
+        self.assertEqual(checks.step(self.CFG, st, T0 + 60, results=r), [])
+        with mock.patch.object(checks, "failed_units", return_value=[]):     # reset-failed / перезапустили
+            r = {k: v for k, v in checks.evaluate(self.CFG, st).items() if k.startswith("failed:")}
+        self.assertIsNone(r["failed:hetzner-bot.service"])
+        out = checks.step(self.CFG, st, T0 + 120, results=r)
+        self.assertEqual([a.kind for a in out], ["recovered"])
+        with mock.patch.object(checks, "failed_units", return_value=[]):
+            self.assertNotIn("failed:hetzner-bot.service", checks.evaluate(self.CFG, st))
+        with mock.patch.object(checks, "failed_units", side_effect=AssertionError("не должно вызываться")):
+            self.assertNotIn("failed:x", checks.evaluate(dict(self.CFG, failed_units_alerts=False), st))
+
+    def test_failed_unit_not_loud_at_night(self):
+        self.assertFalse(checks.is_critical("failed:x.service"))
+
+    def test_time_synced(self):
+        def run(stdout, code=0):
+            return mock.patch.object(checks.subprocess, "run", return_value=mock.Mock(returncode=code, stdout=stdout))
+        with mock.patch.object(checks.shutil, "which", return_value="/usr/bin/timedatectl"), \
+             mock.patch.object(checks, "IS_WINDOWS", False):
+            with run("NTPSynchronized=yes\n"):
+                self.assertTrue(REAL_TIME_SYNCED())
+            with run("NTPSynchronized=no\n"):
+                self.assertFalse(REAL_TIME_SYNCED())
+            with run("", 1):
+                self.assertIsNone(REAL_TIME_SYNCED())
+
+    def test_time_alert_waits_half_hour(self):
+        st = checks.AlertState()
+        with mock.patch.object(checks, "time_synced", return_value=False):
+            r = {"time": checks.evaluate(self.CFG, st)["time"]}
+        self.assertIn("NTP", r["time"])
+        self.assertEqual(checks.step(self.CFG, st, T0, results=r), [])
+        self.assertEqual(checks.step(self.CFG, st, T0 + 600, results=r), [])           # 10 мин — ещё рано
+        out = checks.step(self.CFG, st, T0 + checks.TIME_GRACE_SEC, results=r)
+        self.assertEqual([a.key for a in out], ["time"])
+        with mock.patch.object(checks, "time_synced", return_value=None):
+            self.assertIsNone(checks.evaluate(self.CFG, st)["time"])
+
+    def remote_eval(self, st, data, now=T0):
+        cfg = dict(self.CFG, remote_servers=[{"name": "ovh", "host": "203.0.113.5", "services": ["ssh"]}])
+        return remote.evaluate(cfg, st, now, None, lambda *a: (data, ""))
+
+    def test_remote_failed_units_and_ntp(self):
+        st = checks.AlertState(path=None)
+        data = json.loads(json.dumps(AGENT_DATA))
+        r = self.remote_eval(st, data)  # старый агент: таких полей нет — проверок нет
+        self.assertFalse([k for k in r if "failed:" in k or k in ("ovh|time", "ovh|clock")])
+        data.update(failed_units=["weather-watch.service", "ssh.service", "cloud-final.service"], ntp_synced=False,
+                    time=time.time())
+        r = self.remote_eval(st, data)
+        self.assertEqual([k for k in r if "failed:" in k], ["ovh|failed:weather-watch.service"])
+        self.assertTrue(r["ovh|failed:weather-watch.service"].startswith("[ovh] "))
+        self.assertIn("NTP", r["ovh|time"])
+        self.assertIsNone(r["ovh|clock"])
+        data.update(failed_units=[], ntp_synced=True)
+        r = self.remote_eval(st, data)
+        self.assertIsNone(r["ovh|failed:weather-watch.service"])   # → «Восстановлено»
+        self.assertIsNone(r["ovh|time"])
+        r = self.remote_eval(st, data)
+        self.assertNotIn("ovh|failed:weather-watch.service", r)    # и потом забыта
+
+    def test_remote_clock_skew(self):
+        st = checks.AlertState(path=None)
+        data = json.loads(json.dumps(AGENT_DATA))
+        data["time"] = time.time() - 600
+        self.assertIn("отстают на", self.remote_eval(st, data)["ovh|clock"])
+        data["time"] = time.time() + 600
+        self.assertIn("спешат на", self.remote_eval(st, data)["ovh|clock"])
+        self.assertEqual(checks.key_label("ovh|clock"), "ovh · часы сервера")
+
+    def test_agent_reports_failed_units_and_ntp(self):
+        a = load_agent()
+        r = mock.Mock(returncode=0, stdout="● x.service loaded failed failed X\nbad;id loaded failed failed\n")
+        with mock.patch.object(a.subprocess, "run", return_value=r):
+            self.assertEqual(a.failed_units(), ["x.service"])
+        with mock.patch.object(a.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="NTPSynchronized=no\n")):
+            self.assertIs(a.ntp_synced(), False)
+        with mock.patch.object(a.subprocess, "run", side_effect=OSError):
+            self.assertIsNone(a.failed_units())
+            self.assertIsNone(a.ntp_synced())
+
+    def test_no_real_ip_in_remote_docstring(self):
+        import re
+        ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", remote.__doc__)
+        self.assertTrue(all(ip.startswith(("203.0.113.", "198.51.100.", "192.0.2.")) for ip in ips), ips)
 
 
 if __name__ == "__main__":

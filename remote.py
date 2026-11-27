@@ -3,7 +3,7 @@
 В config.yaml:
     remote_servers:
       - name: ovh                 # как сервер называется в сообщениях
-        host: 57.129.160.122
+        host: 203.0.113.5
         user: root                # ключ на том сервере ограничен command="/usr/local/sbin/monitor-agent",restrict
         key: /var/lib/monitor_bot/remote_ed25519
         services: [ssh]
@@ -246,6 +246,33 @@ def results_from(srv: dict, cfg: dict, data: dict) -> dict[str, str | None]:
     return res
 
 
+def health_results(srv: dict, cfg: dict, data: dict, prev: dict, t0: float, t1: float) -> dict[str, str | None]:
+    """Упавшие службы systemd, синхронизация и расхождение часов. Старый агент не присылает failed_units
+    и ntp_synced — тогда эти проверки просто пропускаются. t0/t1 — когда начали и закончили опрос."""
+    import checks
+    name = srv["name"]
+    pfx = f"[{name}] "
+    res: dict[str, str | None] = {}
+    if cfg.get("failed_units_alerts", True) and isinstance(data.get("failed_units"), list):
+        units = [str(u) for u in data["failed_units"] if checks.valid_service(str(u))]
+        ign = srv.get("failed_units_ignore")
+        res.update(checks.failed_results(cfg, units, {k: v for k, v in prev.items() if v}, name + SEP, pfx,
+                                         watched=[str(x) for x in srv.get("services") or []], ignore=ign))
+    if cfg.get("time_alerts", True):
+        if "ntp_synced" in data:
+            res[name + SEP + "time"] = checks.time_problem(data.get("ntp_synced"), pfx)
+        ts = data.get("time")
+        if isinstance(ts, (int, float)):
+            skew = ts - t1 if ts > t1 else (t0 - ts if ts < t0 else 0)
+            if skew <= checks.CLOCK_SKEW_SEC:
+                res[name + SEP + "clock"] = None
+            elif ts > t1:
+                res[name + SEP + "clock"] = pfx + _('🕒 Часы сервера спешат на {n} с относительно главного', n=int(skew))
+            else:
+                res[name + SEP + "clock"] = pfx + _('🕒 Часы сервера отстают на {n} с от главного', n=int(skew))
+    return res
+
+
 def backup_results(cfg: dict, state, now: float, srv: dict, data: dict) -> dict[str, str | None]:
     """Копии на другом сервере (папки его /etc/monitor-agent/backup-watch) и когда их забирал ПК — те же
     проверки и тексты, что для своих; ключи «имя|bak:ПАПКА» и «имя|bak:pc»."""
@@ -272,7 +299,9 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
     res: dict[str, str | None] = {}
     for srv in servers(cfg):
         name = srv["name"]
+        t0 = time.time()
         data, err = fetcher(srv, cfg, data_dir, state.remote_ssh_at.get(name))
+        t1 = time.time()
         down_key = name + SEP + "down"
         if data is not None:
             with _lock:
@@ -285,6 +314,7 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
                 import logging
                 logging.getLogger("monitor_bot").exception("Не удалось записать историю %s", name)
             r = results_from(srv, cfg, data)
+            r.update(health_results(srv, cfg, data, state.remote_last.get(name) or {}, t0, t1))
             r.update(backup_results(cfg, state, now, srv, data))
             state.remote_last[name] = r
             res.update(r)

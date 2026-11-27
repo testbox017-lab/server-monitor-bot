@@ -80,6 +80,7 @@ CPU/RAM/swap/диски/температура/inode, службы systemd, пр
 | `deploy/pc/*.ps1` | Выгрузка копий на ПК: `pull-backups.ps1`, `install-task.ps1`, `set-backup-path.ps1`, `pull-common.ps1` |
 | `tests/test_bot.py`, `tests/test_i18n.py` | unittest; `test_i18n` падает на строке без `_()` или без перевода |
 | `.github/workflows/tests.yml` | CI: тесты на Python 3.12 и 3.14 для каждого PR и push в `main` |
+| `.github/dependabot.yml` | Dependabot: PR с обновлениями pip (раз в неделю) и GitHub Actions (раз в месяц) |
 
 ## Запуск и тесты
 
@@ -87,7 +88,7 @@ CPU/RAM/swap/диски/температура/inode, службы systemd, пр
 python -m venv venv && venv/bin/pip install -r requirements.txt
 cp config.example.yaml config.yaml     # вписать token и allowed_chats (chat_id бот покажет на /start)
 python bot.py config.yaml
-python -m unittest discover tests      # сейчас 244 теста, ~20 с
+python -m unittest discover tests      # сейчас 254 теста, ~25 с
 ```
 
 Правила для тестов (выучены на ошибках):
@@ -159,13 +160,19 @@ python -m unittest discover tests      # сейчас 244 теста, ~20 с
 - #39 — карточка Hetzner как у OVH; #40 — убранный авто-контейнер не авария; #41 — phasing-пакеты и на втором
   сервере; #42 — одно окно обновлений для обоих серверов.
 - 2026-11-26 — аватарка бота (поставлена через @BotFather).
+- #43 — этот CLAUDE.md. #44 — алерт об упавших (failed) службах systemd вне `services` (ключ `failed:ИМЯ`,
+  cloud-init в исключениях), часы: NTP (`time`, через 30 мин) и расхождение со вторым сервером (`имя|clock`),
+  Dependabot, пример IP в `remote.py`. Агент шлёт `failed_units`/`ntp_synced` (v4); со старым агентом эти
+  проверки для OVH пропускаются, расхождение часов работает и так.
 
 ## Что осталось
 
 - **1 декабря 2026**: удалить на Hetzner архив `/root/migrated-to-ovh-2026-11-23.tgz` (только с согласия пользователя).
 - Старые копии `/opt/monitor_bot.bak-*`, `/usr/local/sbin/monitor-bot-action.bak-*`, `/usr/local/sbin/monitor-agent.bak-*`
   на серверах можно удалить после подтверждения пользователя (для кода бота есть кнопка «🧽 Удалить старые копии кода»).
-- Новых этапов не запланировано — следующую задачу выбирает пользователь.
+- Идеи из обсуждения 2026-11-27, следующие по очереди: предупреждать о портах Docker, открытых наружу в обход ufw;
+  алерт об изменении `authorized_keys`/sudoers/новых пользователях (нужен помощник и агент); устаревшие образы
+  контейнеров; ужесточение `monitor-bot.service` (ProtectSystem и т.п.); разбить `bot.py` на модули.
 
 ## Известные проблемы и особенности
 
@@ -178,6 +185,4 @@ python -m unittest discover tests      # сейчас 244 теста, ~20 с
 - Если упадёт весь главный сервер, бот ничего не пришлёт — для этого `heartbeat_url`.
 - Со старым помощником новые кнопки отвечают «помощник на сервере не обновлён» — это значит, что после мержа нужна
   ручная замена помощника.
-- В docstring `remote.py` в примере конфига стоит реальный IP второго сервера — стоит заменить на пример
-  (`203.0.113.5`, как в `config.example.yaml`).
 - `bot.py` и `locales.py` большие (по ~2 тыс. строк): ищите по имени обработчика/строки, а не читайте целиком.

@@ -95,6 +95,11 @@ port_alerts: true           # новый открытый наружу порт
 update_alerts: true         # обновления безопасности Ubuntu (список и установка: /updates)
 update_alerts_all: false    # сообщать и об обычных обновлениях пакетов
 
+# Состояние системы
+failed_units_alerts: true   # любая служба systemd упала (failed), даже если её нет в services
+failed_units_ignore: ["cloud-init*", "cloud-final*", "cloud-config*"]   # эти не считать (шаблоны имён)
+time_alerts: true           # часы не синхронизируются по NTP; часы другого сервера расходятся больше 2 мин
+
 # Умные алерты (переключаются и кнопками в «Настройки → 🧠 Умные алерты»)
 anomaly_alerts: true        # CPU/RAM намного выше обычного для этого часа (нужно 3 дня истории)
 ram_trend_alerts: true      # память ровно растёт 6 ч и скоро закончится

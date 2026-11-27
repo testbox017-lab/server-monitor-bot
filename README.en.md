@@ -71,6 +71,8 @@ in `/root/.ssh/authorized_keys` by `command="/usr/local/sbin/monitor-agent",rest
 
 - SSH login from a new IP: immediately. Password brute force (more than the threshold of failed attempts in 10 minutes): at most once an hour. The bot needs to read the sshd journal: `sudo usermod -aG systemd-journal monitor`.
 - A new port open to the outside (not localhost). Ports open on first start are remembered as normal.
+- A container port published to the outside (not on 127.0.0.1): Docker bypasses ufw, so neither ufw rules nor IP bans close it. The bot reports each such port once (including ones already open), suggesting to publish it on 127.0.0.1. Turn off with `docker_port_alerts: false`.
+- Server access changed: an SSH key added to or removed from `authorized_keys` (fingerprint and comment only, the bot never sees the keys), a new user who can log in, another uid 0, someone added to the sudo/admin/wheel/docker groups, a sudoers file changed. Sent during quiet hours too. The first snapshot is remembered as normal. The main server is checked every `access_check_min` minutes with the helper command `access-audit`, the other server with every agent reply. Turn off with `access_alerts: false`.
 - Ubuntu security updates: checked every 6 hours, reminder at most once a day.
 - **If the whole server goes down, the bot can't tell you**, so there is `heartbeat_url`: the bot pings an external service (for example healthchecks.io) on every check, and that service notifies you when the pings stop.
 

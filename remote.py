@@ -331,7 +331,7 @@ def evaluate(cfg: dict, state, now: float, data_dir: Path | None = None, fetcher
         if name not in known:
             for d in (state.remote_last, state.remote_fails, state.remote_ssh_at, state.remote_known_ips,
                       state.remote_ssh_failed, state.remote_fail_alert_at, state.remote_ports,
-                      state.remote_upd_alert_at):
+                      state.remote_upd_alert_at, state.remote_access, state.remote_docker_exposed):
                 d.pop(name, None)
     return res
 
@@ -464,6 +464,8 @@ def events(cfg: dict, state, now: float, muted: bool, quiet: bool) -> list:
                 if new_p:
                     state.remote_ports[name] = sorted(set(known_p) | set(new_p))
         out += container_events(cfg, state, now, srv, data, muted, quiet)
+        import access
+        out += access.remote_events(cfg, state, now, name, data, muted, quiet)
     return out
 
 

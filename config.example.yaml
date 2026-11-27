@@ -98,6 +98,9 @@ update_alerts_all: false    # сообщать и об обычных обнов
 # Состояние системы
 failed_units_alerts: true   # любая служба systemd упала (failed), даже если её нет в services
 failed_units_ignore: ["cloud-init*", "cloud-final*", "cloud-config*"]   # эти не считать (шаблоны имён)
+access_alerts: true         # изменились ключи SSH (authorized_keys), пользователи со входом, sudo/docker, sudoers
+access_check_min: 10        # как часто проверять (свой сервер — через помощник, другой — в каждом ответе агента)
+docker_port_alerts: true    # порт контейнера опубликован наружу: Docker обходит ufw, бан IP его не закрывает
 time_alerts: true           # часы не синхронизируются по NTP; часы другого сервера расходятся больше 2 мин
 
 # Умные алерты (переключаются и кнопками в «Настройки → 🧠 Умные алерты»)

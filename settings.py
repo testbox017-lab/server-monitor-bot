@@ -53,6 +53,9 @@ DEFAULTS = {
     "update_alerts_all": False,     # сообщать и об обычных обновлениях (не только безопасности)
     "failed_units_alerts": True,    # любая служба systemd в состоянии failed (не только из services)
     "failed_units_ignore": ["cloud-init*", "cloud-final*", "cloud-config*"],  # их не считать (шаблоны)
+    "access_alerts": True,          # изменились ключи SSH, пользователи, sudo/docker, файлы sudoers
+    "access_check_min": 10,         # как часто проверять доступ своего сервера (вызов помощника через sudo)
+    "docker_port_alerts": True,     # порт контейнера открыт наружу мимо ufw (опубликован не на 127.0.0.1)
     "time_alerts": True,            # часы не синхронизируются по NTP / часы другого сервера расходятся
     "autoban": True,                # сам блокировать IP, который подбирает пароль SSH
     "autoban_threshold": 10,        # неудачных попыток с одного IP за 10 мин

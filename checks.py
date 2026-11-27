@@ -1,6 +1,7 @@
 """Сбор метрик сервера и логика алертов. Работает на Linux и Windows."""
 from __future__ import annotations
 
+import fnmatch
 import html
 import json
 import os
@@ -573,6 +574,84 @@ def reboot_required() -> bool:
 
 # ---------- Время ----------
 
+# Эти службы падают после каждой перезагрузки и это безвредно (cloud-init на Hetzner, см. CLAUDE.md)
+FAILED_IGNORE_DEFAULT = ["cloud-init*", "cloud-final*", "cloud-config*"]
+TIME_GRACE_SEC = 1800   # часы не синхронизированы дольше — тогда алерт (после загрузки NTP нужно время)
+CLOCK_SKEW_SEC = 120    # часы другого сервера расходятся с нашими больше — алерт
+
+
+def failed_units() -> list[str] | None:
+    """Службы systemd в состоянии failed (любые, не только из services). None — узнать не удалось.
+    Без sudo: systemctl list-units доступен любому пользователю."""
+    if IS_WINDOWS or not shutil.which("systemctl"):
+        return None
+    try:
+        r = subprocess.run(["systemctl", "list-units", "--state=failed", "--plain", "--no-legend", "--no-pager"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return parse_failed_units(r.stdout)
+
+
+def parse_failed_units(text: str) -> list[str]:
+    out = []
+    for line in text.splitlines():
+        f = line.split()
+        if f and f[0] in ("●", "*"):
+            f = f[1:]
+        if f and valid_service(f[0]) and f[0] not in out:
+            out.append(f[0])
+    return out
+
+
+def failed_ignored(unit: str, cfg: dict, watched: list[str] | None = None) -> bool:
+    """Не сообщать: служба в списке исключений или уже проверяется как «svc:» из services."""
+    pats = cfg.get("failed_units_ignore")
+    pats = FAILED_IGNORE_DEFAULT if pats is None else pats
+    base = unit[:-8] if unit.endswith(".service") else unit
+    for w in watched or []:
+        if w in (unit, base):
+            return True
+    return any(fnmatch.fnmatchcase(unit, str(p)) or fnmatch.fnmatchcase(base, str(p)) for p in pats or [])
+
+
+def failed_results(cfg: dict, units: list[str] | None, prev: dict[str, str], prefix: str = "",
+                   label: str = "", watched: list[str] | None = None, ignore: list[str] | None = None
+                   ) -> dict[str, str | None]:
+    """{prefix+"failed:служба": текст} по упавшим службам. prev — ключ прошлой проверки → текст проблемы:
+    о службе, которая больше не failed (перезапустили, reset-failed), пишем «Восстановлено», а не забываем
+    молча. units=None (узнать не удалось) — прежние проблемы остаются как были."""
+    old = {k: v for k, v in prev.items() if k.startswith(prefix + "failed:")}
+    if units is None:
+        return {k: v or label + _('❌ Служба {svc} упала (failed)', svc=k.split("failed:", 1)[1]) for k, v in old.items()}
+    res: dict[str, str | None] = {}
+    ign = {"failed_units_ignore": ignore} if ignore is not None else cfg
+    for u in units:
+        if not failed_ignored(u, ign, watched):
+            res[prefix + "failed:" + u] = label + _('❌ Служба {svc} упала (failed)', svc=u)
+    for k in old:
+        res.setdefault(k, None)
+    return res
+
+
+def time_synced() -> bool | None:
+    """Синхронизированы ли часы (NTP). None — не знаем (нет timedatectl, Windows, контейнер без systemd)."""
+    if IS_WINDOWS or not shutil.which("timedatectl"):
+        return None
+    try:
+        r = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    v = r.stdout.strip().partition("=")[2] if r.returncode == 0 else ""
+    return {"yes": True, "no": False}.get(v)
+
+
+def time_problem(synced: bool | None, label: str = "") -> str | None:
+    return label + _('🕒 Часы сервера не синхронизируются (NTP): время может уходить') if synced is False else None
+
+
 def tz(cfg: dict) -> ZoneInfo:
     try:
         return ZoneInfo(cfg.get("tz") or "Europe/Kyiv")
@@ -748,6 +827,8 @@ def key_label(key: str) -> str:
         return _('необычная нагрузка ') + smart.NAMES.get(key[5:], key[5:])
     if key == "bak:pc":
         return _('копии на ПК')
+    if key in ("time", "clock"):
+        return _('часы сервера')
     return key.split(":", 1)[-1]
 
 
@@ -800,6 +881,12 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
             else:
                 res[f"ctr:{c}"] = None
     res["reboot_required"] = _('♻️ Серверу нужна перезагрузка после обновлений') if reboot_required() else None
+    if cfg.get("failed_units_alerts", True):
+        prev = ({k: state.problems.get(k) or "" for k in set(state.since) | set(state.active)}
+                if state is not None else {})
+        res.update(failed_results(cfg, failed_units(), prev, watched=cfg.get("services")))
+    if cfg.get("time_alerts", True):
+        res["time"] = time_problem(time_synced())
     if state is not None:
         import backups
         try:
@@ -820,7 +907,18 @@ def evaluate(cfg: dict, state: "AlertState | None" = None) -> dict[str, str | No
 def instant_keys(key: str) -> bool:
     """Падение службы/процесса/контейнера сообщаем сразу, ресурсы только после duration."""
     k = local_key(key)
-    return k.startswith(CRITICAL_PREFIXES) or k == "reboot_required" or (k == "down" and k != key)
+    return (k.startswith(CRITICAL_PREFIXES) or k.startswith("failed:") or k == "reboot_required"
+            or (k == "down" and k != key))
+
+
+def need_duration(key: str, duration: float) -> float:
+    """Сколько проблема должна держаться до алерта (для неинстантных ключей)."""
+    k = local_key(key)
+    if key.startswith("anom:"):
+        return smart.anomaly_duration(duration)
+    if k in ("time", "clock"):
+        return max(duration, TIME_GRACE_SEC)
+    return duration
 
 
 @dataclass
@@ -872,7 +970,7 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
     for key, problem in results.items():
         if problem:
             state.since.setdefault(key, now)
-            need = smart.anomaly_duration(duration) if key.startswith("anom:") else duration
+            need = need_duration(key, duration)
             if not (instant_keys(key) or now - state.since[key] >= need):
                 continue
             _journal(inc, "open", key, (MAINT_MARK if maint else "") + problem, state.since[key])  # даже в тихие часы

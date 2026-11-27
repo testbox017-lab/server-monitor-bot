@@ -51,6 +51,9 @@ DEFAULTS = {
     "port_alerts": True,            # новый открытый наружу порт
     "update_alerts": True,          # обновления безопасности Ubuntu
     "update_alerts_all": False,     # сообщать и об обычных обновлениях (не только безопасности)
+    "failed_units_alerts": True,    # любая служба systemd в состоянии failed (не только из services)
+    "failed_units_ignore": ["cloud-init*", "cloud-final*", "cloud-config*"],  # их не считать (шаблоны)
+    "time_alerts": True,            # часы не синхронизируются по NTP / часы другого сервера расходятся
     "autoban": True,                # сам блокировать IP, который подбирает пароль SSH
     "autoban_threshold": 10,        # неудачных попыток с одного IP за 10 мин
     "autoban_hours": 24,            # на сколько (0 = навсегда)

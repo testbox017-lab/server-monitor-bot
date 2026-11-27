@@ -40,6 +40,9 @@ Once a minute the bot writes CPU, RAM, disk usage and network counters to `metri
 - Resources (CPU, RAM, disk, temperature): when the breach lasts longer than the configured time.
 - Services, Docker containers, processes: immediately.
 - Server reboot, OOM killer, "reboot required after updates".
+- Any systemd unit in the failed state, even if it is not in `services` (cloud-init is ignored, see
+  `failed_units_ignore`). Clock not synchronized via NTP for over 30 minutes; the second server's clock
+  differs from the main one by more than 2 minutes.
 - Docker: container stopped or restarted (including Docker's own auto-restart), healthcheck `unhealthy`, errors in logs (`Traceback`, `ERROR`, `CRITICAL`, `Exception`, `FATAL`, at most once per 15 min). Per-container CPU and RAM in "Status", a "📜 Logs" button under the alert.
 - External checks: a site, port, ping or DNS fails 2 checks in a row (also sent during quiet hours). TLS certificates of https sites: warnings 14, 7, 3 and 1 day before expiry and on the day.
 - Unusual load: CPU or RAM far above what is normal for this hour for 15 minutes (baseline from 14 days of history, at least 3 days needed), even when far below the threshold.

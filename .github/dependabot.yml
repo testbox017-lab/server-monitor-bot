@@ -1,0 +1,18 @@
+# Dependabot раз в неделю открывает PR с обновлениями зависимостей; CI (tests.yml) их проверяет.
+# Мержит пользователь сам; на сервер обновление попадает обычной кнопкой «Обновление бота».
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

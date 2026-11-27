@@ -8,7 +8,8 @@
 в SSH_ORIGINAL_COMMAND, и агент понимает только:
     status [SVC,SVC...] [since=TS]
                           — CPU, память, диски, нагрузка, аптайм, нужна ли перезагрузка, состояние
-                            перечисленных служб systemd и всех контейнеров docker, открытые порты,
+                            перечисленных служб systemd и всех контейнеров docker, упавшие (failed)
+                            службы, синхронизация часов (NTP), открытые порты,
                             блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
                             с момента TS (без входов самого бота по ключу агента)
                             и строки с ошибками из логов работающих контейнеров (ctr_logs); всегда —
@@ -112,6 +113,35 @@ def service_state(name: str) -> str:
     if p.get("ActiveState") == "active":
         return "running" if p.get("SubState") in ("running", "exited", "listening", "mounted") else p.get("SubState", "?")
     return p.get("ActiveState", "unknown")
+
+
+def failed_units() -> list | None:
+    """Службы systemd в состоянии failed. None — узнать не удалось."""
+    try:
+        r = subprocess.run(["systemctl", "list-units", "--state=failed", "--plain", "--no-legend", "--no-pager"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if f and f[0] in ("●", "*"):
+            f = f[1:]
+        if f and SVC_RE.match(f[0]) and f[0] not in out:
+            out.append(f[0])
+    return out[:50]
+
+
+def ntp_synced() -> bool | None:
+    """Синхронизированы ли часы по NTP (timedatectl). None — не знаем."""
+    try:
+        r = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    v = r.stdout.strip().partition("=")[2] if r.returncode == 0 else ""
+    return {"yes": True, "no": False}.get(v)
 
 
 def parse_ps(text: str) -> dict:
@@ -373,7 +403,7 @@ def status(services: list[str], since: int | None = None) -> dict:
         net = None
     ctrs = containers()
     return {
-        "v": 3,
+        "v": 4,
         "host": platform.node(),
         "os": f"{platform.system()} {platform.release()}",
         "time": time.time(),
@@ -386,6 +416,8 @@ def status(services: list[str], since: int | None = None) -> dict:
         "uptime": uptime,
         "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
         "services": {s: service_state(s) for s in services},
+        "failed_units": failed_units(),
+        "ntp_synced": ntp_synced(),
         "containers": ctrs,
         "ctr_logs": ctr_logs(since, ctrs) if since else None,
         "ssh": ssh_log(since) if since else None,

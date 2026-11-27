@@ -165,7 +165,7 @@ python -m unittest discover tests      # сейчас 264 теста, ~25 с
   cloud-init в исключениях), часы: NTP (`time`, через 30 мин) и расхождение со вторым сервером (`имя|clock`),
   Dependabot, пример IP в `remote.py`. Агент шлёт `failed_units`/`ntp_synced` (v4); со старым агентом эти
   проверки для OVH пропускаются, расхождение часов работает и так.
-- #45 — `access.py`: изменения доступа (норма в `state.access`/`remote_access`; помощник `access-audit`,
+- #51 — `access.py`: изменения доступа (норма в `state.access`/`remote_access`; помощник `access-audit`,
   агент v5 поле `access`) и порты контейнеров наружу мимо ufw (`docker-poll` отдаёт `ports`, агент — `ports`
   у контейнера; сообщаем один раз на порт). Со старым помощником/агентом проверки молча пропускаются.
 

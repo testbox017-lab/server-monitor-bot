@@ -63,6 +63,7 @@ CPU/RAM/swap/диски/температура/inode, службы systemd, пр
 | `remote.py` | Другие серверы: SSH к агенту, разбор JSON, алерты с ключами `имя|…`, карточка, действия, обновления |
 | `actions.py` | Действия над сервером, всё root-ное — через `sudo monitor-bot-action` |
 | `backups.py` | Копия бота, свежесть чужих бэкапов, отправка в Telegram, проверка копий |
+| `access.py` | Изменения доступа (ключи SSH, пользователи, sudo/docker, sudoers) и порты Docker в обход ufw |
 | `security.py` | Входы SSH, подбор пароля, автобан, порты, обновления безопасности, heartbeat |
 | `pkgupdates.py` | Список обновлений apt (phasing — «⏸ отложено»), установка через помощник, общее окно `view_text` |
 | `updater.py` | Версия (`VERSION`), проверка `main` на GitHub, запуск обновления через помощник |
@@ -88,7 +89,7 @@ CPU/RAM/swap/диски/температура/inode, службы systemd, пр
 python -m venv venv && venv/bin/pip install -r requirements.txt
 cp config.example.yaml config.yaml     # вписать token и allowed_chats (chat_id бот покажет на /start)
 python bot.py config.yaml
-python -m unittest discover tests      # сейчас 254 теста, ~25 с
+python -m unittest discover tests      # сейчас 264 теста, ~25 с
 ```
 
 Правила для тестов (выучены на ошибках):
@@ -164,15 +165,17 @@ python -m unittest discover tests      # сейчас 254 теста, ~25 с
   cloud-init в исключениях), часы: NTP (`time`, через 30 мин) и расхождение со вторым сервером (`имя|clock`),
   Dependabot, пример IP в `remote.py`. Агент шлёт `failed_units`/`ntp_synced` (v4); со старым агентом эти
   проверки для OVH пропускаются, расхождение часов работает и так.
+- #51 — `access.py`: изменения доступа (норма в `state.access`/`remote_access`; помощник `access-audit`,
+  агент v5 поле `access`) и порты контейнеров наружу мимо ufw (`docker-poll` отдаёт `ports`, агент — `ports`
+  у контейнера; сообщаем один раз на порт). Со старым помощником/агентом проверки молча пропускаются.
 
 ## Что осталось
 
 - **1 декабря 2026**: удалить на Hetzner архив `/root/migrated-to-ovh-2026-11-23.tgz` (только с согласия пользователя).
 - Старые копии `/opt/monitor_bot.bak-*`, `/usr/local/sbin/monitor-bot-action.bak-*`, `/usr/local/sbin/monitor-agent.bak-*`
   на серверах можно удалить после подтверждения пользователя (для кода бота есть кнопка «🧽 Удалить старые копии кода»).
-- Идеи из обсуждения 2026-11-27, следующие по очереди: предупреждать о портах Docker, открытых наружу в обход ufw;
-  алерт об изменении `authorized_keys`/sudoers/новых пользователях (нужен помощник и агент); устаревшие образы
-  контейнеров; ужесточение `monitor-bot.service` (ProtectSystem и т.п.); разбить `bot.py` на модули.
+- Идеи из обсуждения 2026-11-27, ещё не взятые: устаревшие образы контейнеров; ужесточение `monitor-bot.service`
+  (ProtectSystem и т.п.); разбить `bot.py` на модули.
 
 ## Известные проблемы и особенности
 

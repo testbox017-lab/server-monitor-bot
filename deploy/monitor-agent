@@ -9,7 +9,8 @@
     status [SVC,SVC...] [since=TS]
                           — CPU, память, диски, нагрузка, аптайм, нужна ли перезагрузка, состояние
                             перечисленных служб systemd и всех контейнеров docker, упавшие (failed)
-                            службы, синхронизация часов (NTP), открытые порты,
+                            службы, синхронизация часов (NTP), опубликованные порты контейнеров, кто имеет
+                            доступ (отпечатки ключей SSH, пользователи, sudo/docker, хеши sudoers), открытые порты,
                             блокировки fail2ban; с since — строки sshd о входах и неудачных попытках
                             с момента TS (без входов самого бота по ключу агента)
                             и строки с ошибками из логов работающих контейнеров (ctr_logs); всегда —
@@ -29,6 +30,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -38,6 +40,7 @@ SKIP_FS = {"tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs", "cgroup"
            "mqueue", "debugfs", "tracefs", "securityfs", "pstore", "bpf", "configfs", "fusectl",
            "hugetlbfs", "autofs", "binfmt_misc", "efivarfs", "nsfs", "ramfs", "rpc_pipefs", "fuse.lxcfs"}
 PS_FMT = "{{.Names}}\t{{.State}}\t{{.Status}}"
+PORTS_FMT = "{{.Names}}\t{{.Ports}}"
 
 
 def cpu_times(text: str) -> tuple[int, int]:
@@ -197,6 +200,14 @@ def containers() -> dict | None:
                     res[n].update(extra)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        try:
+            rp = subprocess.run(["docker", "ps", "--format", PORTS_FMT], capture_output=True, text=True, timeout=20)
+            for line in rp.stdout.splitlines():
+                n, _sep, ports = line.partition("\t")
+                if n in res:
+                    res[n]["ports"] = ports[:1000]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     return res
 
 
@@ -249,6 +260,118 @@ def parse_cmd(cmd: str) -> tuple[list[str], int | None] | None:
     if len(names) > 50 or not all(SVC_RE.match(x) for x in names):
         return None
     return names, since
+
+
+# ---------- Кто имеет доступ (access-audit) ----------
+# Только отпечатки ключей, имена и хеши файлов: сами ключи и содержимое sudoers не выдаются.
+
+KEY_TYPES = ("ssh-ed25519", "ssh-rsa", "ssh-dss", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com")
+PRIV_GROUPS = ("sudo", "admin", "wheel", "docker")   # группа docker даёт root
+NOLOGIN = ("nologin", "false", "sync", "shutdown", "halt")
+AUDIT_MAX = 1 << 20
+
+
+def _read_nofollow(path: str) -> str | None:
+    """Прочитать обычный файл, не переходя по символической ссылке (её мог подложить пользователь)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read(AUDIT_MAX).decode("utf-8", "replace")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _fp(blob_b64: str) -> str | None:
+    try:
+        raw = base64.b64decode(blob_b64, validate=True)
+    except ValueError:
+        return None
+    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+
+def parse_authorized_keys(text: str) -> list[dict]:
+    """[{type, fp, comment, opts}] — opts: параметры перед ключом (command=…, restrict), обрезанные."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        for i, w in enumerate(parts[:-1]):
+            if w in KEY_TYPES:
+                fp = _fp(parts[i + 1])
+                if fp:
+                    opts = line.split(w, 1)[0].strip() if i else ""
+                    comment = " ".join(parts[i + 2:])
+                    out.append({"type": w, "fp": fp, "comment": comment[:80], "opts": opts[:200]})
+                break
+    return out
+
+
+def parse_passwd(text: str) -> list[tuple[str, int, int, str, str]]:
+    rows = []
+    for line in text.splitlines():
+        f = line.split(":")
+        if len(f) >= 7 and f[2].isdigit() and f[3].isdigit():
+            rows.append((f[0], int(f[2]), int(f[3]), f[5], f[6]))
+    return rows
+
+
+def parse_groups(text: str) -> dict[str, tuple[int, list[str]]]:
+    out = {}
+    for line in text.splitlines():
+        f = line.split(":")
+        if len(f) >= 4 and f[2].isdigit():
+            out[f[0]] = (int(f[2]), [m for m in f[3].split(",") if m])
+    return out
+
+
+def access_audit(root: str = "/") -> dict:
+    """Ключи SSH, пользователи с оболочкой, uid 0, члены sudo/admin/wheel/docker и хеши файлов sudoers."""
+    j = lambda *p: os.path.join(root, *p)  # noqa: E731 — root подменяют тесты
+    users = parse_passwd(_read_nofollow(j("etc/passwd")) or "")
+    groups = parse_groups(_read_nofollow(j("etc/group")) or "")
+    login = sorted(u for u, uid, _g, _h, sh in users if not sh.rstrip("/").endswith(NOLOGIN) and sh)
+    keys: dict[str, list] = {}
+    for u, uid, _g, home, sh in users:
+        if uid != 0 and u not in login:
+            continue
+        if not home.startswith("/") or ".." in home.split("/"):
+            continue
+        found = []
+        for name in ("authorized_keys", "authorized_keys2"):
+            text = _read_nofollow(j(home.lstrip("/"), ".ssh", name))
+            if text:
+                found += parse_authorized_keys(text)
+        if found:
+            keys[u] = found[:100]
+    priv: dict[str, list] = {}
+    for g in PRIV_GROUPS:
+        if g in groups:
+            gid, members = groups[g]
+            m = set(members) | {u for u, _uid, ugid, _h, _s in users if ugid == gid}
+            if m:
+                priv[g] = sorted(m)
+    sudoers = {}
+    paths = [j("etc/sudoers")]
+    try:
+        paths += sorted(j("etc/sudoers.d", n) for n in os.listdir(j("etc/sudoers.d")))
+    except OSError:
+        pass
+    for p in paths[:100]:
+        text = _read_nofollow(p)
+        if text is not None:
+            sudoers["/" + os.path.relpath(p, root)] = hashlib.sha256(text.encode()).hexdigest()[:16]
+    return {"keys": keys, "login_users": login[:200], "uid0": sorted(u for u, uid, *_r in users if uid == 0),
+            "groups": priv, "sudoers": sudoers}
 
 
 # ---------- SSH ----------
@@ -403,7 +526,7 @@ def status(services: list[str], since: int | None = None) -> dict:
         net = None
     ctrs = containers()
     return {
-        "v": 4,
+        "v": 5,
         "host": platform.node(),
         "os": f"{platform.system()} {platform.release()}",
         "time": time.time(),
@@ -417,6 +540,7 @@ def status(services: list[str], since: int | None = None) -> dict:
         "reboot_required": os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"),
         "services": {s: service_state(s) for s in services},
         "failed_units": failed_units(),
+        "access": access_audit(),
         "ntp_synced": ntp_synced(),
         "containers": ctrs,
         "ctr_logs": ctr_logs(since, ctrs) if since else None,

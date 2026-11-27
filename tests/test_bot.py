@@ -37,6 +37,11 @@ checks.HELPER = str(TMP / "no-helper")
 REAL_FAILED_UNITS, REAL_TIME_SYNCED = checks.failed_units, checks.time_synced
 checks.failed_units = lambda: None
 checks.time_synced = lambda: None
+import access  # noqa: E402
+# Доступ и порты Docker настоящего сервера тоже не читаем
+REAL_LOCAL_SNAPSHOT, REAL_LOCAL_EXPOSED = access.local_snapshot, access.local_exposed
+access.local_snapshot = lambda helper=None: None
+access.local_exposed = lambda: None
 import actions  # noqa: E402
 import pkgupdates  # noqa: E402
 # На сервере есть настоящие /run/monitor-bot-apt.json и замок установки: тесты их читать не должны
@@ -2657,11 +2662,16 @@ class Part4Test(unittest.TestCase):
         self.assertTrue(h.covers_peer(h.parse_ip("8.8.8.8"), {"8.8.8.8"}))
         ps = mock.Mock(returncode=0, stdout="w\trunning\nbad name\texited\n", stderr="")
         insp = mock.Mock(returncode=0, stdout="/w\t0\tx\t\t\n", stderr="")
+        prt = mock.Mock(returncode=0, stdout="w\t0.0.0.0:8080->80/tcp\n", stderr="")
         out = io.StringIO()
-        with mock.patch.object(h.subprocess, "run", side_effect=[ps, insp]) as run, mock.patch("sys.stdout", out):
+        with mock.patch.object(h.subprocess, "run", side_effect=[ps, insp, prt]) as run, \
+             mock.patch("sys.stdout", out):
             h.docker_poll()
         self.assertEqual(run.call_args_list[1].args[0], ["docker", "inspect", "--format", h.INSPECT_FMT, "w"])
+        self.assertEqual(run.call_args_list[2].args[0], ["docker", "ps", "--format", h.PORTS_FMT])
         self.assertEqual(json.loads(out.getvalue())["inspect"], "/w\t0\tx\t\t\n")
+        self.assertEqual(json.loads(out.getvalue())["ports"], "w\t0.0.0.0:8080->80/tcp\n")
+        self.assertEqual(h.PORTS_FMT, checks.PORTS_FMT)
 
     def test_weekly_partial_period_and_deploys(self):
         import incidents
@@ -3883,6 +3893,207 @@ class HealthTest(unittest.TestCase):
         import re
         ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", remote.__doc__)
         self.assertTrue(all(ip.startswith(("203.0.113.", "198.51.100.", "192.0.2.")) for ip in ips), ips)
+
+
+KEY1 = "AAAAC3NzaC1lZDI1NTE5AAAAIGq1n3cKTx0Z1mJ1Yq3nY3m1sYp6d7A8m1Qw9mVQyX0a"
+KEY2 = "AAAAC3NzaC1lZDI1NTE5AAAAIB0x9lM7t1pK2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q"
+
+
+def make_root(tmp: Path, extra_key: bool = False) -> Path:
+    (tmp / "etc/sudoers.d").mkdir(parents=True, exist_ok=True)
+    (tmp / "root/.ssh").mkdir(parents=True, exist_ok=True)
+    (tmp / "home/ubuntu/.ssh").mkdir(parents=True, exist_ok=True)
+    (tmp / "home/svc/.ssh").mkdir(parents=True, exist_ok=True)
+    (tmp / "etc/passwd").write_text(
+        "root:x:0:0:root:/root:/bin/bash\nubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n"
+        "svc:x:999:999::/home/svc:/usr/sbin/nologin\nmonitor:x:998:998::/nonexistent:/usr/sbin/nologin\n")
+    (tmp / "etc/group").write_text("root:x:0:\nsudo:x:27:ubuntu\ndocker:x:120:\nubuntu:x:1000:\n")
+    (tmp / "etc/sudoers").write_text("root ALL=(ALL) ALL\n")
+    (tmp / "etc/sudoers.d/monitor-bot").write_text("monitor ALL=(root) NOPASSWD: /usr/local/sbin/x *\n")
+    (tmp / "root/.ssh/authorized_keys").write_text(
+        f'# comment\ncommand="/usr/local/sbin/monitor-agent",restrict ssh-ed25519 {KEY1} bot@main\n'
+        + (f"ssh-ed25519 {KEY2} intruder\n" if extra_key else ""))
+    (tmp / "home/svc/.ssh/authorized_keys").write_text(f"ssh-ed25519 {KEY2} svc\n")   # без оболочки — не считаем
+    target = tmp / "secret"
+    target.write_text(f"ssh-ed25519 {KEY2} via-symlink\n")
+    link = tmp / "home/ubuntu/.ssh/authorized_keys"
+    if not link.exists():
+        link.symlink_to(target)
+    return tmp
+
+
+class AccessTest(unittest.TestCase):
+    """Изменения доступа (ключи SSH, пользователи, sudo) и порты Docker в обход ufw."""
+
+    def setUp(self):
+        remote.LAST.clear()
+        remote.ERRORS.clear()
+
+    def test_audit_in_helper_and_agent(self):
+        root = make_root(Path(tempfile.mkdtemp()))
+        h, a = load_helper(), load_agent()
+        snap = h.access_audit(str(root))
+        self.assertEqual(snap, a.access_audit(str(root)))     # один и тот же код в помощнике и агенте
+        self.assertEqual(snap["login_users"], ["root", "ubuntu"])
+        self.assertEqual(snap["uid0"], ["root"])
+        self.assertEqual(snap["groups"], {"sudo": ["ubuntu"]})
+        self.assertEqual(sorted(snap["sudoers"]), ["/etc/sudoers", "/etc/sudoers.d/monitor-bot"])
+        self.assertEqual(list(snap["keys"]), ["root"])         # symlink не читаем, у svc нет оболочки
+        k = snap["keys"]["root"][0]
+        self.assertTrue(k["fp"].startswith("SHA256:"))
+        self.assertEqual(k["comment"], "bot@main")
+        self.assertIn("restrict", k["opts"])
+        self.assertNotIn(KEY1, json.dumps(snap))                # сами ключи не выдаются
+        self.assertEqual(k["fp"], a.key_fingerprint(KEY1))     # отпечаток как в журнале sshd
+
+    def test_helper_command_registered(self):
+        h = load_helper()
+        self.assertIn("access-audit", h.__doc__)
+        out = io.StringIO()
+        with mock.patch.object(h, "access_audit", return_value={"keys": {}}), mock.patch("sys.stdout", out):
+            h.main(["access-audit"])
+        self.assertEqual(json.loads(out.getvalue()), {"keys": {}})
+        with self.assertRaises(SystemExit), mock.patch("sys.stdout", io.StringIO()):
+            h.main(["access-audit", "x"])
+
+    def test_diff_and_events(self):
+        h = load_helper()
+        tmp = Path(tempfile.mkdtemp())
+        old = h.access_audit(str(make_root(tmp)))
+        new = h.access_audit(str(make_root(Path(tempfile.mkdtemp()), extra_key=True)))
+        new["groups"]["docker"] = ["mallory"]
+        new["login_users"].append("mallory")
+        new["uid0"].append("toor")
+        new["sudoers"]["/etc/sudoers.d/monitor-bot"] = "changed"
+        new["sudoers"]["/etc/sudoers.d/evil"] = "x"
+        lines = access.diff(old, new)
+        text = "\n".join(lines)
+        self.assertIn("➕ ключ SSH для root: ssh-ed25519", text)
+        self.assertIn("«intruder»", text)
+        self.assertIn("mallory в группе docker", text)
+        self.assertIn("новый пользователь со входом: mallory", text)
+        self.assertIn("uid 0", text)
+        self.assertIn("изменён файл sudo: /etc/sudoers.d/monitor-bot", text)
+        self.assertIn("новый файл sudo: /etc/sudoers.d/evil", text)
+        self.assertEqual(access.diff(old, old), [])
+        cfg = {}
+        ev, base = access.access_events(cfg, None, old, T0, False)       # первый снимок — норма
+        self.assertEqual((ev, base), ([], old))
+        ev, base = access.access_events(cfg, old, new, T0, True)          # уведомления выключены — ждём
+        self.assertEqual((ev, base), ([], old))
+        log = []
+        ev, base = access.access_events(cfg, old, new, T0, False, "ovh", log)
+        self.assertEqual(base, new)
+        self.assertEqual(ev[0].key, "ovh|access")
+        self.assertEqual(ev[0].server, "ovh")
+        self.assertIn("Изменился доступ", ev[0].text)
+        self.assertEqual(log, [[T0, "ovh|access"]])
+        self.assertEqual(access.access_events({"access_alerts": False}, old, new, T0, False), ([], old))
+        bad = dict(new, keys={"root": [{"fp": "SHA256:x", "comment": "<b>"}]})
+        self.assertIn("&lt;b&gt;", access.access_events(cfg, old, bad, T0, False)[0][0].text)
+
+    def test_local_check_interval(self):
+        st = checks.AlertState()
+        calls = []
+        snap = {"keys": {}, "sudoers": {"/etc/sudoers": "a"}}
+
+        def fn():
+            calls.append(1)
+            return dict(snap)
+        cfg = {"access_check_min": 10}
+        self.assertEqual(access.events(cfg, st, T0, False, False, fn), [])
+        self.assertEqual(access.events(cfg, st, T0 + 60, False, False, fn), [])
+        self.assertEqual(len(calls), 1)
+        snap["sudoers"] = {"/etc/sudoers": "b"}
+        out = access.events(cfg, st, T0 + 600, False, True, fn)   # и в тихие часы
+        self.assertEqual([a.key for a in out], ["access"])
+        self.assertEqual(st.access["sudoers"], {"/etc/sudoers": "b"})
+
+    def test_local_snapshot_old_helper(self):
+        helper = TMP / "fake-helper"
+        helper.write_text("")
+        r = mock.Mock(returncode=2, stdout="unknown command", stderr="")
+        access._helper["unsupported_until"] = 0.0
+        with mock.patch.object(access.subprocess, "run", return_value=r) as run, \
+             mock.patch.object(checks, "IS_WINDOWS", False), mock.patch.object(os, "geteuid", return_value=998, create=True):
+            self.assertIsNone(REAL_LOCAL_SNAPSHOT(str(helper)))
+            self.assertIsNone(REAL_LOCAL_SNAPSHOT(str(helper)))     # не дёргаем старый помощник каждый раз
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], ["sudo", "-n", str(helper), "access-audit"])
+        access._helper["unsupported_until"] = 0.0
+        ok = mock.Mock(returncode=0, stdout=json.dumps({"keys": {}, "sudoers": {}}), stderr="")
+        with mock.patch.object(access.subprocess, "run", return_value=ok), \
+             mock.patch.object(checks, "IS_WINDOWS", False), mock.patch.object(os, "geteuid", return_value=998, create=True):
+            self.assertEqual(REAL_LOCAL_SNAPSHOT(str(helper)), {"keys": {}, "sudoers": {}})
+        self.assertIsNone(REAL_LOCAL_SNAPSHOT(str(TMP / "no-such-helper")))
+
+    def test_public_ports(self):
+        self.assertEqual(access.public_ports(
+            "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 127.0.0.1:5432->5432/tcp, 80/tcp, [::1]:9000->9000/tcp, "
+            ":::53->53/udp, 203.0.113.5:443->443/tcp"), ["8080/tcp", "53/udp", "443/tcp"])
+        self.assertEqual(access.public_ports(""), [])
+        self.assertEqual(access.parse_ports("web\t0.0.0.0:80->80/tcp\ndb\t127.0.0.1:5432->5432/tcp\nq\t\n"),
+                         {"web": ["80/tcp"]})
+
+    def test_port_events(self):
+        cfg = {}
+        ev, known = access.port_events(cfg, [], {"web": ["80/tcp"]}, T0, False, False)
+        self.assertEqual([a.key for a in ev], ["dport:web"])
+        self.assertIn("127.0.0.1:80:", ev[0].text)
+        self.assertEqual(known, ["web 80/tcp"])
+        ev, known = access.port_events(cfg, known, {"web": ["80/tcp"]}, T0 + 60, False, False)
+        self.assertEqual(ev, [])
+        ev, known2 = access.port_events(cfg, known, {"web": ["80/tcp", "443/tcp"]}, T0, False, True)  # ночь
+        self.assertEqual((ev, known2), ([], known))
+        ev, known = access.port_events(cfg, known, {"web": ["80/tcp", "443/tcp"]}, T0, False, False)
+        self.assertEqual(len(ev), 1)
+        self.assertIn("443/tcp", ev[0].text)
+        self.assertNotIn("80/tcp,", ev[0].text)
+        ev, known = access.port_events(cfg, known, {}, T0, False, False)       # закрыли
+        self.assertEqual((ev, known), ([], []))
+        self.assertEqual(access.port_events(cfg, ["x 1/tcp"], None, T0, False, False), ([], ["x 1/tcp"]))
+        self.assertEqual(access.port_events({"docker_port_alerts": False}, [], {"w": ["1/tcp"]}, T0, False, False),
+                         ([], []))
+
+    def test_local_exposed_from_poll(self):
+        with mock.patch.dict(checks._poll, ts=time.time(), states={}, info={}, ports="web\t0.0.0.0:80->80/tcp\n"):
+            self.assertEqual(REAL_LOCAL_EXPOSED(), {"web": ["80/tcp"]})
+        with mock.patch.dict(checks._poll, ts=time.time(), states={}, info={}, ports=None), \
+             mock.patch.object(checks, "docker_via_helper", return_value=True):
+            self.assertIsNone(REAL_LOCAL_EXPOSED())             # старый помощник: не знаем
+
+    def test_step_runs_access_events(self):
+        cfg = {"thresholds": {}, "containers": ["web"], "remind_min": 0, "tz": "UTC"}
+        st = checks.AlertState()
+        with mock.patch.object(access, "local_exposed", return_value={"web": ["80/tcp"]}), \
+             mock.patch.object(checks, "docker_poll", return_value=False), \
+             mock.patch.object(checks, "container_states", return_value={"web": "running"}), \
+             mock.patch.object(checks, "container_info", return_value={}), \
+             mock.patch.object(checks, "evaluate", return_value={}):
+            out = checks.step(cfg, st, T0)
+        self.assertIn("dport:web", [a.key for a in out])
+
+    def test_remote_access_and_ports(self):
+        cfg = {"thresholds": {}, "remind_min": 0, "tz": "UTC",
+               "remote_servers": [{"name": "ovh", "host": "203.0.113.5"}]}
+        st = checks.AlertState()
+        data = json.loads(json.dumps(AGENT_DATA))
+
+        def poll(d):
+            remote.evaluate(cfg, st, T0, None, lambda *a: (json.loads(json.dumps(d)), ""))
+            return [a for a in remote.events(cfg, st, T0, False, False) if a.key and ("access" in a.key or "dport" in a.key)]
+        self.assertEqual(poll(data), [])                       # старый агент: ни доступа, ни портов
+        self.assertEqual(st.remote_access, {})
+        data["access"] = {"keys": {"root": [{"type": "ssh-ed25519", "fp": "SHA256:aaa", "comment": "me"}]},
+                          "sudoers": {}, "login_users": ["root"]}
+        data["containers"]["app"]["ports"] = "0.0.0.0:8080->80/tcp"
+        out = poll(data)
+        self.assertEqual([a.key for a in out], ["ovh|dport:app"])   # доступ: первый снимок — норма
+        data["access"]["keys"]["root"].append({"type": "ssh-rsa", "fp": "SHA256:bbb", "comment": "new"})
+        out = poll(data)
+        self.assertEqual([a.key for a in out], ["ovh|access"])
+        self.assertEqual(out[0].server, "ovh")
+        self.assertIn("SHA256:bbb", out[0].text)
 
 
 if __name__ == "__main__":

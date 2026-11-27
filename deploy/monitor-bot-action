@@ -25,7 +25,11 @@
     apt-upgrade MODE       — установить обновления пакетов: MODE = security (только из -security) или all
                              (apt-get upgrade, без удаления пакетов). Идёт в отдельной службе systemd,
                              результат в /run/monitor-bot-apt.json, полный вывод в /var/log/monitor-bot-apt.log
-    docker-poll            — docker ps -a и docker inspect всех контейнеров одним вызовом (JSON)
+    docker-poll            — docker ps -a, docker inspect и опубликованные порты всех контейнеров одним
+                             вызовом (JSON)
+    access-audit           — кто имеет доступ: отпечатки ключей SSH в authorized_keys, пользователи с оболочкой,
+                             uid 0, члены групп sudo/admin/wheel/docker, хеши файлов sudoers (JSON, без самих
+                             ключей и содержимого)
     banned-list            — IP, запрещённые ботом (JSON)
     pull-stream            — для ПК: tar с последними копиями (бот + папки backup-watch) в stdout.
                              Вызывается через command= в /root/.ssh/authorized_keys, отмечает время в
@@ -42,6 +46,7 @@
 Обновление ставит только код бота. Сам помощник, sudoers и файл службы не обновляются автоматически:
 так код с GitHub не может расширить права бота. Если они изменились, бот об этом напишет.
 """
+import base64
 import filecmp
 import grp
 import gzip
@@ -99,6 +104,7 @@ PS_FMT = "{{.Names}}\t{{.State}}"
 INSPECT_FMT = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
                "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
 STATS_FMT = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+PORTS_FMT = "{{.Names}}\t{{.Ports}}"
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 # Процессы, которые нельзя останавливать: ядро системы, доступ по SSH, Docker и менеджеры пакетов
 # (остановка apt/dpkg посреди установки ломает пакеты)
@@ -1044,7 +1050,8 @@ def docker_poll() -> None:
     names = [ln.split("\t", 1)[0] for ln in ps.stdout.splitlines() if "\t" in ln]
     names = [n for n in names if CONTAINER_RE.match(n)][:200]
     inspect = dk(["inspect", "--format", INSPECT_FMT, *names]).stdout if names else ""
-    print(json.dumps({"ps": ps.stdout, "inspect": inspect}))
+    pr = dk(["ps", "--format", PORTS_FMT])
+    print(json.dumps({"ps": ps.stdout, "inspect": inspect, "ports": pr.stdout if pr.returncode == 0 else None}))
 
 
 def docker_names(names: list[str]) -> list[str]:
@@ -1078,6 +1085,118 @@ def docker_cmd(args: list[str]) -> None:
     sys.stdout.buffer.write(r.stdout)
     sys.stderr.buffer.write(r.stderr)
     sys.exit(r.returncode)
+
+
+# ---------- Кто имеет доступ (access-audit) ----------
+# Только отпечатки ключей, имена и хеши файлов: сами ключи и содержимое sudoers не выдаются.
+
+KEY_TYPES = ("ssh-ed25519", "ssh-rsa", "ssh-dss", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com")
+PRIV_GROUPS = ("sudo", "admin", "wheel", "docker")   # группа docker даёт root
+NOLOGIN = ("nologin", "false", "sync", "shutdown", "halt")
+AUDIT_MAX = 1 << 20
+
+
+def _read_nofollow(path: str) -> str | None:
+    """Прочитать обычный файл, не переходя по символической ссылке (её мог подложить пользователь)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read(AUDIT_MAX).decode("utf-8", "replace")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _fp(blob_b64: str) -> str | None:
+    try:
+        raw = base64.b64decode(blob_b64, validate=True)
+    except ValueError:
+        return None
+    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+
+def parse_authorized_keys(text: str) -> list[dict]:
+    """[{type, fp, comment, opts}] — opts: параметры перед ключом (command=…, restrict), обрезанные."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        for i, w in enumerate(parts[:-1]):
+            if w in KEY_TYPES:
+                fp = _fp(parts[i + 1])
+                if fp:
+                    opts = line.split(w, 1)[0].strip() if i else ""
+                    comment = " ".join(parts[i + 2:])
+                    out.append({"type": w, "fp": fp, "comment": comment[:80], "opts": opts[:200]})
+                break
+    return out
+
+
+def parse_passwd(text: str) -> list[tuple[str, int, int, str, str]]:
+    rows = []
+    for line in text.splitlines():
+        f = line.split(":")
+        if len(f) >= 7 and f[2].isdigit() and f[3].isdigit():
+            rows.append((f[0], int(f[2]), int(f[3]), f[5], f[6]))
+    return rows
+
+
+def parse_groups(text: str) -> dict[str, tuple[int, list[str]]]:
+    out = {}
+    for line in text.splitlines():
+        f = line.split(":")
+        if len(f) >= 4 and f[2].isdigit():
+            out[f[0]] = (int(f[2]), [m for m in f[3].split(",") if m])
+    return out
+
+
+def access_audit(root: str = "/") -> dict:
+    """Ключи SSH, пользователи с оболочкой, uid 0, члены sudo/admin/wheel/docker и хеши файлов sudoers."""
+    j = lambda *p: os.path.join(root, *p)  # noqa: E731 — root подменяют тесты
+    users = parse_passwd(_read_nofollow(j("etc/passwd")) or "")
+    groups = parse_groups(_read_nofollow(j("etc/group")) or "")
+    login = sorted(u for u, uid, _g, _h, sh in users if not sh.rstrip("/").endswith(NOLOGIN) and sh)
+    keys: dict[str, list] = {}
+    for u, uid, _g, home, sh in users:
+        if uid != 0 and u not in login:
+            continue
+        if not home.startswith("/") or ".." in home.split("/"):
+            continue
+        found = []
+        for name in ("authorized_keys", "authorized_keys2"):
+            text = _read_nofollow(j(home.lstrip("/"), ".ssh", name))
+            if text:
+                found += parse_authorized_keys(text)
+        if found:
+            keys[u] = found[:100]
+    priv: dict[str, list] = {}
+    for g in PRIV_GROUPS:
+        if g in groups:
+            gid, members = groups[g]
+            m = set(members) | {u for u, _uid, ugid, _h, _s in users if ugid == gid}
+            if m:
+                priv[g] = sorted(m)
+    sudoers = {}
+    paths = [j("etc/sudoers")]
+    try:
+        paths += sorted(j("etc/sudoers.d", n) for n in os.listdir(j("etc/sudoers.d")))
+    except OSError:
+        pass
+    for p in paths[:100]:
+        text = _read_nofollow(p)
+        if text is not None:
+            sudoers["/" + os.path.relpath(p, root)] = hashlib.sha256(text.encode()).hexdigest()[:16]
+    return {"keys": keys, "login_users": login[:200], "uid0": sorted(u for u, uid, *_r in users if uid == 0),
+            "groups": priv, "sudoers": sudoers}
 
 
 def reboot() -> None:
@@ -1133,6 +1252,8 @@ def main(argv: list[str]) -> None:
         apt_upgrade_run(args[0])
     elif cmd == "docker-poll" and not args:
         docker_poll()
+    elif cmd == "access-audit" and not args:
+        print(json.dumps(access_audit()))
     else:
         die("unknown command")
 

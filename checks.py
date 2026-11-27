@@ -304,7 +304,8 @@ def docker_poll() -> bool:
         states, info = parse_ps(data["ps"]), parse_inspect(data["inspect"])
     except (ValueError, KeyError, TypeError):
         return False
-    _poll.update(ts=time.time(), states=states, info=info)
+    ports = data.get("ports") if isinstance(data, dict) else None   # старый помощник портов не отдаёт
+    _poll.update(ts=time.time(), states=states, info=info, ports=ports if isinstance(ports, str) else None)
     return True
 
 
@@ -319,6 +320,7 @@ PS_FMT = "{{.Names}}\t{{.State}}"
 INSPECT_FMT = ("{{.Name}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}"
                "\t{{if .State.Health}}{{json .State.Health.Log}}{{end}}")
 STATS_FMT = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+PORTS_FMT = "{{.Names}}\t{{.Ports}}"   # только напрямую или в docker-poll помощника (через «docker ARGS» нельзя)
 HELPER = "/usr/local/sbin/monitor-bot-action"
 DOCKER_DIRECT_RETRY = 600
 _docker_mode = {"direct_until": 0.0}
@@ -763,6 +765,11 @@ class AlertState:
     remote_upd_alert_at: dict[str, float] = field(default_factory=dict)  # другой сервер → когда писали об обновлениях
     remote_deploy_at: dict[str, float] = field(default_factory=dict)  # другой сервер → последний вход ключом деплоя
     remote_ctr_started: dict[str, str] = field(default_factory=dict)  # «сервер|контейнер» → StartedAt
+    access: dict = field(default_factory=dict)                 # норма доступа: ключи SSH, пользователи, sudo
+    access_checked: float = 0.0
+    docker_exposed: list[str] = field(default_factory=list)    # «контейнер порт», о которых уже писали
+    remote_access: dict[str, dict] = field(default_factory=dict)  # другой сервер → норма доступа
+    remote_docker_exposed: dict[str, list] = field(default_factory=dict)
 
     path: Path | None = field(default=None, repr=False, compare=False)
     load_error: str = field(default="", repr=False, compare=False)  # state.json был повреждён (текст для бота)
@@ -1044,6 +1051,12 @@ def step(cfg: dict, state: AlertState, now: float | None = None,
                 logging.getLogger("monitor_bot").exception('Ошибка проверки безопасности других серверов')
         out += docker_events(cfg, state, now, recovered, muted, quiet)
         out += service_events(cfg, state, now, recovered, muted, quiet)
+        import access
+        try:
+            out += access.events(cfg, state, now, muted, quiet)
+        except Exception:  # не должно ломать основную проверку
+            import logging
+            logging.getLogger("monitor_bot").exception('Ошибка проверки доступа')
         import probes
         try:
             out += probes.ssl_events(cfg, state, now, muted, quiet)
